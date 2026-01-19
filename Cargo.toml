@@ -781,6 +781,12 @@ notify-types = { git = "https://github.com/zed-industries/notify.git", rev = "b4
 windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
 calloop = { git = "https://github.com/zed-industries/calloop" }
 
+# Patch blade to use local version with Android fixes
+[patch.'https://github.com/kvark/blade']
+blade-graphics = { path = "../blade/blade-graphics" }
+blade-macros = { path = "../blade/blade-macros" }
+blade-util = { path = "../blade/blade-util" }
+
 [profile.dev]
 split-debuginfo = "unpacked"
 # https://github.com/rust-lang/cargo/issues/16104

@@ -144,7 +144,7 @@ struct BladePipelines {
     paths: gpu::RenderPipeline,
     underlines: gpu::RenderPipeline,
     mono_sprites: gpu::RenderPipeline,
-    subpixel_sprites: gpu::RenderPipeline,
+    subpixel_sprites: Option<gpu::RenderPipeline>,
     poly_sprites: gpu::RenderPipeline,
     surfaces: gpu::RenderPipeline,
 }
@@ -157,8 +157,107 @@ impl BladePipelines {
             "Initializing Blade pipelines for surface {:?}",
             surface_info
         );
+
+        // Check if dual source blending is supported
+        let caps = gpu.capabilities();
+        let supports_dual_source_blending = caps.dual_source_blending;
+        log::info!(
+            "Dual source blending support: {}",
+            supports_dual_source_blending
+        );
+
+        // If dual source blending is not supported, remove the enable directive and related code
+        let shader_source = include_str!("shaders.wgsl");
+        let shader_source = if !supports_dual_source_blending {
+            log::warn!("Dual source blending not supported - disabling subpixel text rendering");
+
+            // Remove:
+            // 1. The "enable dual_source_blending;" line
+            // 2. SubpixelSpriteFragmentOutput struct (uses @blend_src attribute)
+            // 3. vs_subpixel_sprite and fs_subpixel_sprite functions (with their @vertex/@fragment attributes)
+
+            let mut result = shader_source.to_string();
+
+            // Remove enable directive
+            if let Some(start) = result.find("enable dual_source_blending") {
+                if let Some(end) = result[start..].find(';') {
+                    let end_pos = start + end + 1;
+                    // Also remove the newline after the semicolon if present
+                    let end_pos = if result.as_bytes().get(end_pos) == Some(&b'\n') {
+                        end_pos + 1
+                    } else {
+                        end_pos
+                    };
+                    result.replace_range(start..end_pos, "");
+                }
+            }
+
+            // Helper function to find and remove a block (struct or function with attributes)
+            fn remove_block(source: &mut String, start_pattern: &str) -> bool {
+                if let Some(start) = source.find(start_pattern) {
+                    // Look backwards for any attributes (lines starting with @)
+                    let mut actual_start = start;
+                    let before = &source[..start];
+                    let mut lines_before: Vec<&str> = before.lines().collect();
+
+                    // Remove empty lines and find attributes working backwards
+                    while let Some(line) = lines_before.pop() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() || trimmed.starts_with("//") {
+                            continue;
+                        }
+                        if trimmed.starts_with('@') {
+                            // This is an attribute line, include it in removal
+                            actual_start = source[..start].rfind(line).unwrap();
+                        } else {
+                            // Not an attribute, stop looking backwards
+                            break;
+                        }
+                    }
+
+                    // Find the matching closing brace
+                    let mut brace_count = 0;
+                    let mut found_open = false;
+                    let mut end = actual_start;
+
+                    for (idx, ch) in source[actual_start..].char_indices() {
+                        if ch == '{' {
+                            brace_count += 1;
+                            found_open = true;
+                        } else if ch == '}' {
+                            brace_count -= 1;
+                            if found_open && brace_count == 0 {
+                                end = actual_start + idx + 1;
+                                // Also consume the newline after the closing brace if present
+                                if source.as_bytes().get(end) == Some(&b'\n') {
+                                    end += 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    if found_open && brace_count == 0 {
+                        source.replace_range(actual_start..end, "");
+                        return true;
+                    }
+                }
+                false
+            }
+
+            // Remove the three blocks (order matters - remove from end to start to avoid offset issues)
+            // But we'll remove one at a time and the function returns a new string each time
+            remove_block(&mut result, "struct SubpixelSpriteFragmentOutput");
+            remove_block(&mut result, "fn vs_subpixel_sprite");
+            remove_block(&mut result, "fn fs_subpixel_sprite");
+
+            result
+        } else {
+            shader_source.to_string()
+        };
+
         let shader = gpu.create_shader(gpu::ShaderDesc {
-            source: include_str!("shaders.wgsl"),
+            source: &shader_source,
         });
         shader.check_struct_size::<GlobalParams>();
         shader.check_struct_size::<SurfaceParams>();
@@ -288,31 +387,36 @@ impl BladePipelines {
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
             }),
-            subpixel_sprites: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
-                name: "subpixel-sprites",
-                data_layouts: &[&ShaderSubpixelSpritesData::layout()],
-                vertex: shader.at("vs_subpixel_sprite"),
-                vertex_fetches: &[],
-                primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                fragment: Some(shader.at("fs_subpixel_sprite")),
-                color_targets: &[gpu::ColorTargetState {
-                    format: surface_info.format,
-                    blend: Some(gpu::BlendState {
-                        color: gpu::BlendComponent {
-                            src_factor: gpu::BlendFactor::Src1,
-                            dst_factor: gpu::BlendFactor::OneMinusSrc1,
-                            operation: gpu::BlendOperation::Add,
-                        },
-                        alpha: gpu::BlendComponent::OVER,
-                    }),
-                    write_mask: gpu::ColorWrites::COLOR,
-                }],
-                multisample_state: gpu::MultisampleState::default(),
-            }),
+            subpixel_sprites: if supports_dual_source_blending {
+                Some(gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                    name: "subpixel-sprites",
+                    data_layouts: &[&ShaderSubpixelSpritesData::layout()],
+                    vertex: shader.at("vs_subpixel_sprite"),
+                    vertex_fetches: &[],
+                    primitive: gpu::PrimitiveState {
+                        topology: gpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    fragment: Some(shader.at("fs_subpixel_sprite")),
+                    color_targets: &[gpu::ColorTargetState {
+                        format: surface_info.format,
+                        blend: Some(gpu::BlendState {
+                            color: gpu::BlendComponent {
+                                src_factor: gpu::BlendFactor::Src1,
+                                dst_factor: gpu::BlendFactor::OneMinusSrc1,
+                                operation: gpu::BlendOperation::Add,
+                            },
+                            alpha: gpu::BlendComponent::OVER,
+                        }),
+                        write_mask: gpu::ColorWrites::COLOR,
+                    }],
+                    multisample_state: gpu::MultisampleState::default(),
+                }))
+            } else {
+                log::info!("Skipping subpixel sprites pipeline - dual source blending not supported");
+                None
+            },
             poly_sprites: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
                 name: "poly-sprites",
                 data_layouts: &[&ShaderPolySpritesData::layout()],
@@ -351,7 +455,9 @@ impl BladePipelines {
         gpu.destroy_render_pipeline(&mut self.paths);
         gpu.destroy_render_pipeline(&mut self.underlines);
         gpu.destroy_render_pipeline(&mut self.mono_sprites);
-        gpu.destroy_render_pipeline(&mut self.subpixel_sprites);
+        if let Some(ref mut pipeline) = self.subpixel_sprites {
+            gpu.destroy_render_pipeline(pipeline);
+        }
         gpu.destroy_render_pipeline(&mut self.poly_sprites);
         gpu.destroy_render_pipeline(&mut self.surfaces);
     }
@@ -683,6 +789,7 @@ impl BladeRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+
         self.command_encoder.start();
         self.atlas.before_frame(&mut self.command_encoder);
 
@@ -704,16 +811,18 @@ impl BladeRenderer {
             pad: 0,
         };
 
+        let clear_color = if self.surface_config.transparent {
+            gpu::TextureColor::TransparentBlack
+        } else {
+            gpu::TextureColor::White
+        };
+
         let mut pass = self.command_encoder.render(
             "main",
             gpu::RenderTargetSet {
                 colors: &[gpu::RenderTarget {
                     view: frame.texture_view(),
-                    init_op: gpu::InitOp::Clear(if self.surface_config.transparent {
-                        gpu::TextureColor::TransparentBlack
-                    } else {
-                        gpu::TextureColor::White
-                    }),
+                    init_op: gpu::InitOp::Clear(clear_color),
                     finish_op: gpu::FinishOp::Store,
                 }],
                 depth_stencil: None,
@@ -863,24 +972,31 @@ impl BladeRenderer {
                     texture_id,
                     sprites,
                 } => {
-                    let tex_info = self.atlas.get_texture_info(texture_id);
-                    let instance_buf =
-                        unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
-                    let mut encoder = pass.with(&self.pipelines.subpixel_sprites);
-                    encoder.bind(
-                        0,
-                        &ShaderSubpixelSpritesData {
-                            globals,
-                            gamma_ratios: self.rendering_parameters.gamma_ratios,
-                            subpixel_enhanced_contrast: self
-                                .rendering_parameters
-                                .subpixel_enhanced_contrast,
-                            t_sprite: tex_info.raw_view,
-                            s_sprite: self.atlas_sampler,
-                            b_subpixel_sprites: instance_buf,
-                        },
-                    );
-                    encoder.draw(0, 4, 0, sprites.len() as u32);
+                    // Skip if subpixel rendering is not supported
+                    if let Some(ref subpixel_pipeline) = self.pipelines.subpixel_sprites {
+                        let tex_info = self.atlas.get_texture_info(texture_id);
+                        let instance_buf =
+                            unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
+                        let mut encoder = pass.with(subpixel_pipeline);
+                        encoder.bind(
+                            0,
+                            &ShaderSubpixelSpritesData {
+                                globals,
+                                gamma_ratios: self.rendering_parameters.gamma_ratios,
+                                subpixel_enhanced_contrast: self
+                                    .rendering_parameters
+                                    .subpixel_enhanced_contrast,
+                                t_sprite: tex_info.raw_view,
+                                s_sprite: self.atlas_sampler,
+                                b_subpixel_sprites: instance_buf,
+                            },
+                        );
+                        encoder.draw(0, 4, 0, sprites.len() as u32);
+                    } else {
+                        // Subpixel rendering not supported - this should not happen
+                        // if is_subpixel_rendering_supported() is correctly implemented
+                        log::warn!("SubpixelSprites batch received but pipeline not available");
+                    }
                 }
                 PrimitiveBatch::Surfaces(surfaces) => {
                     let mut _encoder = pass.with(&self.pipelines.surfaces);

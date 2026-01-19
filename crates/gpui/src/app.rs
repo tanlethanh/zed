@@ -647,8 +647,19 @@ pub struct App {
 }
 
 impl App {
+    /// Creates a new GPUI app with the given platform and configuration.
+    ///
+    /// This is a low-level API primarily used for platform-specific integrations
+    /// where the standard `Application::new().run()` pattern doesn't work
+    /// (e.g., Android where the OS controls the event loop).
+    ///
+    /// # Arguments
+    /// * `platform` - The platform implementation
+    /// * `liveness` - Arc for tracking app lifetime
+    /// * `asset_source` - Asset loading implementation
+    /// * `http_client` - HTTP client implementation
     #[allow(clippy::new_ret_no_self)]
-    pub(crate) fn new_app(
+    pub fn new_app(
         platform: Rc<dyn Platform>,
         liveness: Arc<()>,
         asset_source: Arc<dyn AssetSource>,

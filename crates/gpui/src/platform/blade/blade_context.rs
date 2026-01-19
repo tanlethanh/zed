@@ -9,6 +9,10 @@ pub struct BladeContext {
 }
 
 impl BladeContext {
+    pub fn gpu_context(&self) -> &Arc<gpu::Context> {
+        &self.gpu
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let device_id_forced = match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)
@@ -21,17 +25,32 @@ impl BladeContext {
                 None
             }
         };
+
+        // On Android, we need to be more lenient with device selection
+        #[cfg(target_os = "android")]
+        log::info!("Initializing Blade graphics context for Android...");
+
         let gpu = Arc::new(
             unsafe {
                 gpu::Context::init(gpu::ContextDesc {
                     presentation: true,
-                    validation: false,
+                    validation: false, // Disable validation on Android for compatibility
+                    #[cfg(target_os = "android")]
+                    device_id: 0, // Let Blade auto-select on Android
+                    #[cfg(not(target_os = "android"))]
                     device_id: device_id_forced.unwrap_or(0),
                     ..Default::default()
                 })
             }
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            .map_err(|e| {
+                log::error!("Failed to initialize Blade GPU context: {:?}", e);
+                anyhow::anyhow!("{e:?}")
+            })?,
         );
+
+        #[cfg(target_os = "android")]
+        log::info!("✓ Blade GPU context initialized successfully");
+
         Ok(Self { gpu })
     }
 

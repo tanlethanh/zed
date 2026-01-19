@@ -8,12 +8,16 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod mac;
 
+#[cfg(target_os = "android")]
+mod android;
+
 #[cfg(any(
     all(
         any(target_os = "linux", target_os = "freebsd"),
         any(feature = "x11", feature = "wayland")
     ),
-    all(target_os = "macos", feature = "macos-blade")
+    all(target_os = "macos", feature = "macos-blade"),
+    target_os = "android"
 ))]
 mod blade;
 
@@ -75,6 +79,10 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
+#[cfg(target_os = "android")]
+pub use android::AndroidPlatform;
+#[cfg(target_os = "android")]
+pub(crate) use android::*;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) use linux::*;
 #[cfg(target_os = "macos")]
@@ -136,6 +144,14 @@ pub(crate) fn current_platform(_headless: bool, liveness: std::sync::Weak<()>) -
     )
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn current_platform(_headless: bool, liveness: std::sync::Weak<()>) -> Rc<dyn Platform> {
+    // On Android, the platform is initialized from JNI with the JavaVM and Activity
+    // This function should not be called directly - instead, use AndroidPlatform::new()
+    // For now, panic as this needs to be initialized from JNI
+    panic!("AndroidPlatform must be initialized from JNI with JavaVM and Activity");
+}
+
 /// Return which compositor we're guessing we'll use.
 /// Does not attempt to connect to the given compositor
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -167,7 +183,15 @@ pub fn guess_compositor() -> &'static str {
     }
 }
 
-pub(crate) trait Platform: 'static {
+/// Platform trait defining the interface between GPUI and the underlying OS.
+///
+/// This trait is implemented by platform-specific code (e.g., AndroidPlatform,
+/// MacPlatform, LinuxClient) and provides GPUI with access to system services.
+///
+/// Made public to support custom app initialization patterns (e.g., on Android
+/// where the OS controls the event loop instead of GPUI's `Application::new().run()`).
+#[allow(missing_docs)]
+pub trait Platform: 'static {
     fn background_executor(&self) -> BackgroundExecutor;
     fn foreground_executor(&self) -> ForegroundExecutor;
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
