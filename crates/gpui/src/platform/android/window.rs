@@ -151,7 +151,10 @@ impl AndroidWindowState {
             ),
         };
 
-        let renderer = BladeRenderer::new(context, &raw_window, config)?;
+        // CRITICAL: Use new_with_atlas to share the same atlas instance between the window
+        // and renderer. The GPUI Window captures sprite_atlas() during construction BEFORE
+        // the renderer exists, so the renderer must use the same atlas.
+        let renderer = BladeRenderer::new_with_atlas(context, &raw_window, config, self.atlas.clone())?;
 
         self.native_window = Some(native_window);
         self.raw_window = Some(raw_window);
@@ -191,7 +194,8 @@ impl AndroidWindowState {
                     ),
                 };
 
-                let renderer = BladeRenderer::new(context, raw_window, config)?;
+                // Use the same shared atlas when recreating the renderer
+                let renderer = BladeRenderer::new_with_atlas(context, raw_window, config, self.atlas.clone())?;
                 self.renderer = Some(renderer);
             }
 

@@ -19,7 +19,7 @@ use crate::{
     PlatformWindow, RequestFrameOptions, RunnableVariant, Task, WindowAppearance, WindowParams, px,
 };
 
-use super::{AndroidDispatcher, AndroidKeyboardLayout, AndroidQueueReceiver, AndroidWindow, AndroidWindowState};
+use super::{AndroidDispatcher, AndroidKeyboardLayout, AndroidQueueReceiver, AndroidWindow, AndroidWindowState, CosmicTextSystem};
 
 pub(crate) const DOUBLE_CLICK_DISTANCE: crate::Pixels = px(5.0);
 
@@ -75,23 +75,15 @@ impl AndroidCommon {
         activity: Arc<Mutex<GlobalRef>>,
     ) -> (Self, AndroidQueueReceiver<RunnableVariant>) {
         let (main_sender, main_receiver) = AndroidQueueReceiver::new();
-
-        // Use CosmicTextSystem for text rendering (pure Rust, works on Android)
-        // For now, use the stub NoopTextSystem until we properly integrate CosmicTextSystem
-        let text_system = Arc::new(crate::NoopTextSystem);
-
-        let callbacks = PlatformHandlers::default();
-
+        let text_system = Arc::new(CosmicTextSystem::new());
         let dispatcher = Arc::new(AndroidDispatcher::new(main_sender));
 
-        let background_executor = BackgroundExecutor::new(dispatcher.clone());
-
         let common = AndroidCommon {
-            background_executor,
+            background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher, liveness),
             text_system,
             appearance: WindowAppearance::Light,
-            callbacks,
+            callbacks: PlatformHandlers::default(),
             quit_requested: false,
             menus: Vec::new(),
             jvm,
@@ -114,27 +106,17 @@ pub struct AndroidPlatform {
 
 impl AndroidPlatform {
     /// Creates a new AndroidPlatform instance.
-    ///
-    /// # Arguments
-    /// * `liveness` - Weak reference for tracking app lifetime
-    /// * `jvm` - The Android JavaVM instance
-    /// * `activity` - Global reference to the Android Activity
     pub fn new(liveness: SyncWeak<()>, jvm: JavaVM, activity: GlobalRef) -> Self {
-        log::info!("AndroidPlatform::new() called");
-
         let jvm = Arc::new(jvm);
         let activity = Arc::new(Mutex::new(activity));
-
-        log::info!("Creating AndroidCommon...");
         let (common, main_receiver) = AndroidCommon::new(liveness, jvm.clone(), activity.clone());
 
-        // Load Android system fonts
-        log::info!("Loading system fonts...");
-        Self::load_system_fonts(&common.text_system);
+        // Load essential fonts synchronously for fast startup
+        Self::load_essential_fonts(&common.text_system);
 
-        log::info!(
-            "✓ AndroidPlatform created successfully (BladeContext will be created when first window opens)"
-        );
+        // Load remaining system fonts in background
+        let text_system_bg = common.text_system.clone();
+        std::thread::spawn(move || Self::load_system_fonts(&text_system_bg));
 
         Self {
             common: RefCell::new(common),
@@ -147,75 +129,54 @@ impl AndroidPlatform {
     }
 
     /// Attach a native window to the most recently created AndroidWindow
-    /// This is called after the native surface is created
     pub fn attach_native_window(&self, native_window: ndk::native_window::NativeWindow) -> Result<()> {
-        log::info!("Attaching native window to AndroidWindow...");
         let windows = self.windows.borrow();
+        let window = windows
+            .last()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| anyhow!("No windows available to attach surface"))?;
 
-        if let Some(window_weak) = windows.last() {
-            if let Some(window) = window_weak.upgrade() {
-                let blade_context = self.ensure_blade_context()?;
-                window.borrow_mut().handle_surface_created(native_window, &blade_context)?;
-                log::info!("✓ Native window attached successfully!");
-                Ok(())
-            } else {
-                Err(anyhow!("Window has been dropped"))
-            }
-        } else {
-            Err(anyhow!("No windows available to attach surface"))
+        let blade_context = self.ensure_blade_context()?;
+        window.borrow_mut().handle_surface_created(native_window, &blade_context)
+    }
+
+    /// Detach native window from the most recently created AndroidWindow
+    pub fn detach_native_window(&self) {
+        if let Some(window) = self.windows.borrow().last().and_then(|w| w.upgrade()) {
+            window.borrow_mut().handle_surface_destroyed();
         }
     }
 
     /// Handle surface size change for the most recently created window
     pub fn handle_surface_resize(&self, width: u32, height: u32) -> Result<()> {
-        log::info!("Handling surface resize to {}x{}", width, height);
         let windows = self.windows.borrow();
+        let window = windows
+            .last()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| anyhow!("No windows available for surface resize"))?;
 
-        if let Some(window_weak) = windows.last() {
-            if let Some(window) = window_weak.upgrade() {
-                let blade_context = self.ensure_blade_context()?;
-                window.borrow_mut().handle_surface_changed(width, height, &blade_context)?;
-                log::info!("✓ Surface resize completed");
-                Ok(())
-            } else {
-                Err(anyhow!("Window has been dropped"))
-            }
-        } else {
-            Err(anyhow!("No windows available for surface resize"))
-        }
+        let blade_context = self.ensure_blade_context()?;
+        window.borrow_mut().handle_surface_changed(width, height, &blade_context)
     }
 
     /// Request a frame to be rendered on all windows
-    /// This should be called from the platform's event loop (e.g., Choreographer callback)
     pub fn request_frame_for_all_windows(&self) {
-        log::debug!("request_frame_for_all_windows called");
-
-        // Step 1: Collect window references and extract callbacks
-        type CallbackTuple = (usize, Rc<RefCell<AndroidWindowState>>, Box<dyn FnMut(RequestFrameOptions)>);
-        let mut callbacks: Vec<CallbackTuple> = Vec::new();
-        {
+        // Collect callbacks while borrowing windows
+        let callbacks: Vec<_> = {
             let windows = self.windows.borrow();
-            log::debug!("Found {} windows", windows.len());
+            windows
+                .iter()
+                .filter_map(|w| w.upgrade())
+                .filter_map(|window| {
+                    window.borrow_mut().take_request_frame_callback().map(|cb| (window.clone(), cb))
+                })
+                .collect()
+        };
 
-            for (i, window_weak) in windows.iter().enumerate() {
-                if let Some(window) = window_weak.upgrade() {
-                    if let Some(callback) = window.borrow_mut().take_request_frame_callback() {
-                        log::debug!("Extracted callback for window {}", i);
-                        callbacks.push((i, window.clone(), callback));
-                    } else {
-                        log::warn!("Window {} has no request_frame callback", i);
-                    }
-                }
-            }
-        } // Drop windows borrow here
-
-        // Step 2: Call all callbacks without holding any borrows
-        for (i, window, mut callback) in callbacks {
-            log::debug!("Calling request_frame callback for window {}", i);
+        // Call callbacks and return them
+        for (window, mut callback) in callbacks {
             callback(RequestFrameOptions::default());
-            // Step 3: Put callback back
             window.borrow_mut().put_request_frame_callback(callback);
-            log::debug!("Frame requested for window {}", i);
         }
 
         // Clean up dead window references
@@ -229,79 +190,53 @@ impl AndroidPlatform {
             return Ok(ctx.clone());
         }
 
-        log::info!("Creating BladeContext for Android (first window)...");
-        log::info!("Device: Android with Vulkan support");
-        log::info!("Note: Vulkan device enumeration on Android...");
+        let ctx = BladeContext::new()
+            .or_else(|_| {
+                // Retry with lenient settings
+                unsafe { std::env::set_var("BLADE_PERMISSIVE", "1") };
+                BladeContext::new()
+            })
+            .map_err(|e| anyhow!("Failed to create BladeContext: {:?}", e))?;
 
-        // Try to create BladeContext with detailed error reporting
-        let ctx = match BladeContext::new() {
-            Ok(ctx) => {
-                log::info!("✓ BladeContext created successfully!");
-                log::info!(
-                    "  GPU capabilities: dual_source_blending={}",
-                    ctx.supports_dual_source_blending()
-                );
-                Arc::new(ctx)
-            }
-            Err(e) => {
-                log::error!("Failed to create BladeContext: {:?}", e);
-                log::error!("This usually means:");
-                log::error!("  1. No Vulkan-capable GPU found");
-                log::error!("  2. Vulkan drivers not properly installed");
-                log::error!("  3. Device doesn't support required Vulkan features");
-                log::error!("");
-                log::error!("Attempting workaround: using lenient device selection...");
-
-                // Try one more time with environment variable hint
-                unsafe {
-                    std::env::set_var("BLADE_PERMISSIVE", "1");
-                }
-
-                match BladeContext::new() {
-                    Ok(ctx) => {
-                        log::warn!("✓ BladeContext created with lenient settings");
-                        Arc::new(ctx)
-                    }
-                    Err(e2) => {
-                        log::error!("Failed again: {:?}", e2);
-                        log::error!("===========================================");
-                        log::error!("CRITICAL: Cannot initialize GPU rendering");
-                        log::error!("===========================================");
-                        return Err(anyhow!(
-                            "Failed to create BladeContext after retry: {:?}",
-                            e2
-                        ));
-                    }
-                }
-            }
-        };
-
+        let ctx = Arc::new(ctx);
         *blade_context = Some(ctx.clone());
         Ok(ctx)
     }
 
-    fn load_system_fonts(text_system: &Arc<dyn PlatformTextSystem>) {
-        // Android system fonts are located in /system/fonts/
-        let font_dirs = vec![
-            PathBuf::from("/system/fonts"),
-            PathBuf::from("/vendor/fonts"),
+    /// Load essential fonts synchronously for fast startup
+    fn load_essential_fonts(text_system: &Arc<dyn PlatformTextSystem>) {
+        const ESSENTIAL_FONTS: &[&str] = &[
+            "/system/fonts/Roboto-Regular.ttf",
+            "/system/fonts/DroidSans.ttf",
+            "/system/fonts/DroidSans-Bold.ttf",
+            "/system/fonts/DroidSansMono.ttf",
+            "/system/fonts/MiSansC_3.005.ttf",
+            "/system/fonts/NotoColorEmoji.ttf",
         ];
 
-        for font_dir in font_dirs {
-            if let Ok(entries) = std::fs::read_dir(&font_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_file() {
-                            if let Some(extension) = entry.path().extension() {
-                                if extension == "ttf" || extension == "otf" || extension == "ttc" {
-                                    if let Ok(font_data) = std::fs::read(entry.path()) {
-                                        text_system
-                                            .add_fonts(vec![std::borrow::Cow::Owned(font_data)])
-                                            .log_err();
-                                    }
-                                }
-                            }
-                        }
+        for path in ESSENTIAL_FONTS {
+            if let Ok(data) = std::fs::read(path) {
+                let _ = text_system.add_fonts(vec![std::borrow::Cow::Owned(data)]);
+            }
+        }
+    }
+
+    /// Load all system fonts (called in background thread)
+    fn load_system_fonts(text_system: &Arc<dyn PlatformTextSystem>) {
+        const FONT_DIRS: &[&str] = &["/system/fonts", "/vendor/fonts"];
+        const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc"];
+
+        for dir in FONT_DIRS {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_font = path.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| FONT_EXTENSIONS.contains(&ext));
+
+                if is_font {
+                    if let Ok(data) = std::fs::read(&path) {
+                        let _ = text_system.add_fonts(vec![std::borrow::Cow::Owned(data)]);
                     }
                 }
             }
@@ -335,33 +270,19 @@ impl AndroidClient for AndroidPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        log::info!("Creating AndroidWindow...");
-
-        // Ensure BladeContext is created
         let blade_context = self.ensure_blade_context()?;
+        let scale = 3.0; // TODO: Get from DisplayMetrics via JNI
 
-        // Use the bounds from options
-        let bounds = options.bounds;
-
-        // Scale factor - on Android this comes from the display metrics
-        // For now, use a default of 3.0 (typical for high-DPI Android devices)
-        let scale = 3.0;
-
-        // Create the AndroidWindow
         let window = AndroidWindow::new(
             handle,
-            bounds,
+            options.bounds,
             scale,
             self.jvm.clone(),
             self.activity.clone(),
             &blade_context,
         )?;
 
-        // Store a weak reference to the window for frame requests
         self.windows.borrow_mut().push(Rc::downgrade(&window.state));
-
-        log::info!("✓ AndroidWindow created successfully!");
-
         Ok(Box::new(window))
     }
 

@@ -153,21 +153,35 @@ impl BladePipelines {
     fn new(gpu: &gpu::Context, surface_info: gpu::SurfaceInfo, path_sample_count: u32) -> Self {
         use gpu::ShaderData as _;
 
+        let pipeline_start = std::time::Instant::now();
+
         log::info!(
             "Initializing Blade pipelines for surface {:?}",
             surface_info
         );
 
         // Check if dual source blending is supported
+        let caps_start = std::time::Instant::now();
         let caps = gpu.capabilities();
         let supports_dual_source_blending = caps.dual_source_blending;
+        log::info!(
+            "[PIPELINE TIMING] Capability check: {:?}",
+            caps_start.elapsed()
+        );
         log::info!(
             "Dual source blending support: {}",
             supports_dual_source_blending
         );
 
         // If dual source blending is not supported, remove the enable directive and related code
+        let shader_load_start = std::time::Instant::now();
         let shader_source = include_str!("shaders.wgsl");
+        log::info!(
+            "[PIPELINE TIMING] Shader load: {:?}",
+            shader_load_start.elapsed()
+        );
+
+        let shader_modify_start = std::time::Instant::now();
         let shader_source = if !supports_dual_source_blending {
             log::warn!("Dual source blending not supported - disabling subpixel text rendering");
 
@@ -255,10 +269,19 @@ impl BladePipelines {
         } else {
             shader_source.to_string()
         };
+        log::info!(
+            "[PIPELINE TIMING] Shader modification: {:?}",
+            shader_modify_start.elapsed()
+        );
 
+        let shader_create_start = std::time::Instant::now();
         let shader = gpu.create_shader(gpu::ShaderDesc {
             source: &shader_source,
         });
+        log::info!(
+            "[PIPELINE TIMING] Shader module creation: {:?}",
+            shader_create_start.elapsed()
+        );
         shader.check_struct_size::<GlobalParams>();
         shader.check_struct_size::<SurfaceParams>();
         shader.check_struct_size::<Quad>();
@@ -281,7 +304,7 @@ impl BladePipelines {
             write_mask: gpu::ColorWrites::default(),
         }];
 
-        Self {
+        let pipelines = Self {
             quads: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
                 name: "quads",
                 data_layouts: &[&ShaderQuadsData::layout()],
@@ -445,7 +468,14 @@ impl BladePipelines {
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
             }),
-        }
+        };
+
+        log::info!(
+            "[PIPELINE TIMING] Total pipeline creation: {:?}",
+            pipeline_start.elapsed()
+        );
+
+        pipelines
     }
 
     fn destroy(&mut self, gpu: &gpu::Context) {
@@ -497,6 +527,20 @@ impl BladeRenderer {
         window: &I,
         config: BladeSurfaceConfig,
     ) -> anyhow::Result<Self> {
+        let atlas = Arc::new(BladeAtlas::new(&context.gpu));
+        Self::new_with_atlas(context, window, config, atlas)
+    }
+
+    /// Create a new BladeRenderer using an existing atlas.
+    /// This is used on Android where the atlas must be shared with the platform window
+    /// because the GPUI Window captures a reference to the atlas during construction
+    /// before the renderer is created.
+    pub fn new_with_atlas<I: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle>(
+        context: &BladeContext,
+        window: &I,
+        config: BladeSurfaceConfig,
+        atlas: Arc<BladeAtlas>,
+    ) -> anyhow::Result<Self> {
         let surface_config = gpu::SurfaceConfig {
             size: config.size,
             usage: gpu::TextureUsage::TARGET,
@@ -525,7 +569,6 @@ impl BladeRenderer {
             min_chunk_size: 0x1000,
             alignment: 0x40, // Vulkan `minStorageBufferOffsetAlignment` on Intel Xe
         });
-        let atlas = Arc::new(BladeAtlas::new(&context.gpu));
         let atlas_sampler = context.gpu.create_sampler(gpu::SamplerDesc {
             name: "path rasterization sampler",
             mag_filter: gpu::FilterMode::Linear,

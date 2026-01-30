@@ -63,6 +63,32 @@ pub struct TextSystem {
 
 impl TextSystem {
     pub(crate) fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
+        // Use platform-specific fallback fonts
+        #[cfg(target_os = "android")]
+        let fallback_font_stack = smallvec![
+            // Android-specific fonts
+            font("Roboto"),
+            font("DroidSans"),
+            font("Noto Sans"),
+            font("MiSans"),        // Xiaomi/MIUI
+            font("HarmonyOS Sans"), // Huawei
+        ];
+
+        #[cfg(not(target_os = "android"))]
+        let fallback_font_stack = smallvec![
+            // TODO: Remove this when Linux have implemented setting fallbacks.
+            font(".ZedMono"),
+            font(".ZedSans"),
+            font("Helvetica"),
+            font("Segoe UI"),     // Windows
+            font("Ubuntu"),       // Gnome (Ubuntu)
+            font("Adwaita Sans"), // Gnome 47
+            font("Cantarell"),    // Gnome
+            font("Noto Sans"),    // KDE
+            font("DejaVu Sans"),
+            font("Arial"), // macOS, Windows
+        ];
+
         TextSystem {
             platform_text_system,
             font_metrics: RwLock::default(),
@@ -70,19 +96,7 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
-            fallback_font_stack: smallvec![
-                // TODO: Remove this when Linux have implemented setting fallbacks.
-                font(".ZedMono"),
-                font(".ZedSans"),
-                font("Helvetica"),
-                font("Segoe UI"),     // Windows
-                font("Ubuntu"),       // Gnome (Ubuntu)
-                font("Adwaita Sans"), // Gnome 47
-                font("Cantarell"),    // Gnome
-                font("Noto Sans"),    // KDE
-                font("DejaVu Sans"),
-                font("Arial"), // macOS, Windows
-            ],
+            fallback_font_stack,
         }
     }
 
