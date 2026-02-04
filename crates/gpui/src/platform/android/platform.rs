@@ -14,9 +14,10 @@ use util::ResultExt;
 use crate::platform::blade::BladeContext;
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, RequestFrameOptions, RunnableVariant, Task, WindowAppearance, WindowParams, px,
+    DispatchEventResult, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, RequestFrameOptions, RunnableVariant, Task,
+    WindowAppearance, WindowParams, px,
 };
 
 use super::{AndroidDispatcher, AndroidKeyboardLayout, AndroidQueueReceiver, AndroidWindow, AndroidWindowState, CosmicTextSystem};
@@ -181,6 +182,16 @@ impl AndroidPlatform {
 
         // Clean up dead window references
         self.windows.borrow_mut().retain(|w| w.strong_count() > 0);
+    }
+
+    /// Dispatch a platform input event to the most recently created window
+    pub fn dispatch_input(&self, input: PlatformInput) -> DispatchEventResult {
+        let windows = self.windows.borrow();
+        if let Some(window) = windows.last().and_then(|w| w.upgrade()) {
+            window.borrow_mut().handle_input(input)
+        } else {
+            DispatchEventResult::default()
+        }
     }
 
     /// Get or create the BladeContext

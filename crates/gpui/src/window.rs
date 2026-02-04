@@ -1372,9 +1372,12 @@ impl Window {
     }
 }
 
+/// Result of dispatching a platform input event to a window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DispatchEventResult {
+pub struct DispatchEventResult {
+    /// Whether the event should continue propagating.
     pub propagate: bool,
+    /// Whether the default browser/platform behavior was prevented.
     pub default_prevented: bool,
 }
 
