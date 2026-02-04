@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::{Rc, Weak as RcWeak},
     sync::{Arc, Mutex, Weak as SyncWeak},
@@ -103,6 +103,7 @@ pub struct AndroidPlatform {
     activity: Arc<Mutex<GlobalRef>>,
     blade_context: RefCell<Option<Arc<BladeContext>>>,
     windows: RefCell<Vec<RcWeak<RefCell<AndroidWindowState>>>>,
+    display_scale: Cell<f32>,
 }
 
 impl AndroidPlatform {
@@ -126,7 +127,14 @@ impl AndroidPlatform {
             activity,
             blade_context: RefCell::new(None),
             windows: RefCell::new(Vec::new()),
+            display_scale: Cell::new(3.0),
         }
+    }
+
+    /// Set the display scale factor (from DisplayMetrics density).
+    /// Must be called before opening any windows.
+    pub fn set_display_scale(&self, scale: f32) {
+        self.display_scale.set(scale);
     }
 
     /// Attach a native window to the most recently created AndroidWindow
@@ -157,7 +165,18 @@ impl AndroidPlatform {
             .ok_or_else(|| anyhow!("No windows available for surface resize"))?;
 
         let blade_context = self.ensure_blade_context()?;
-        window.borrow_mut().handle_surface_changed(width, height, &blade_context)
+
+        // handle_surface_changed returns pending resize info so the callback
+        // can be fired after the mutable borrow is released.
+        let resize_info = window.borrow_mut().handle_surface_changed(width, height, &blade_context)?;
+        if let Some((size, scale)) = resize_info {
+            let mut callback = window.borrow_mut().take_resize_callback();
+            if let Some(ref mut cb) = callback {
+                cb(size, scale);
+            }
+            window.borrow_mut().restore_resize_callback(callback);
+        }
+        Ok(())
     }
 
     /// Request a frame to be rendered on all windows
@@ -282,7 +301,7 @@ impl AndroidClient for AndroidPlatform {
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
         let blade_context = self.ensure_blade_context()?;
-        let scale = 3.0; // TODO: Get from DisplayMetrics via JNI
+        let scale = self.display_scale.get();
 
         let window = AndroidWindow::new(
             handle,

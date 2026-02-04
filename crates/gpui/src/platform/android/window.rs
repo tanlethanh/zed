@@ -163,8 +163,10 @@ impl AndroidWindowState {
         Ok(())
     }
 
-    /// Handle surface changed event (resize/rotation)
-    pub fn handle_surface_changed(&mut self, width: u32, height: u32, context: &BladeContext) -> Result<()> {
+    /// Handle surface changed event (resize/rotation).
+    /// Returns the new size and scale so the caller can invoke the resize
+    /// callback *after* releasing the mutable borrow on the window state.
+    pub fn handle_surface_changed(&mut self, width: u32, height: u32, context: &BladeContext) -> Result<Option<(Size<Pixels>, f32)>> {
         log::info!("AndroidWindow: surface changed to {}x{}", width, height);
 
         let new_bounds = Bounds {
@@ -175,10 +177,16 @@ impl AndroidWindowState {
             },
         };
 
-        if new_bounds != self.bounds {
+        let bounds_changed = new_bounds != self.bounds;
+        if bounds_changed {
             self.bounds = new_bounds;
+        }
 
-            // Recreate the renderer with new size
+        // Recreate the renderer only if dimensions actually changed.
+        // After a background/foreground cycle, handle_surface_created already
+        // created a renderer with the current bounds — skip the duplicate
+        // creation to avoid ERROR_NATIVE_WINDOW_IN_USE_KHR.
+        if bounds_changed {
             if let Some(ref raw_window) = self.raw_window {
                 let size = gpu::Extent {
                     width,
@@ -198,14 +206,27 @@ impl AndroidWindowState {
                 let renderer = BladeRenderer::new_with_atlas(context, raw_window, config, self.atlas.clone())?;
                 self.renderer = Some(renderer);
             }
-
-            // Notify resize callback
-            if let Some(ref mut callback) = self.callbacks.resize {
-                callback(new_bounds.size, self.scale);
-            }
         }
 
-        Ok(())
+        // Return resize info so the caller can fire the callback after
+        // dropping the mutable borrow (avoids RefCell double-borrow panic).
+        let has_callback = self.callbacks.resize.is_some();
+        Ok(if has_callback {
+            Some((new_bounds.size, self.scale))
+        } else {
+            None
+        })
+    }
+
+    /// Take the resize callback out of the state temporarily.
+    /// The caller must put it back via `restore_resize_callback` after invoking.
+    pub fn take_resize_callback(&mut self) -> Option<Box<dyn FnMut(Size<Pixels>, f32)>> {
+        self.callbacks.resize.take()
+    }
+
+    /// Restore a previously taken resize callback.
+    pub fn restore_resize_callback(&mut self, callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>) {
+        self.callbacks.resize = callback;
     }
 
     /// Handle surface destroyed event
@@ -292,7 +313,17 @@ impl AndroidWindow {
         height: u32,
         context: &BladeContext,
     ) -> Result<()> {
-        self.state.borrow_mut().handle_surface_changed(width, height, context)
+        let resize_info = self.state.borrow_mut().handle_surface_changed(width, height, context)?;
+        if let Some((size, scale)) = resize_info {
+            // Take the callback out so we can invoke it without holding a
+            // mutable borrow (the callback reads window state via borrow()).
+            let mut callback = self.state.borrow_mut().take_resize_callback();
+            if let Some(ref mut cb) = callback {
+                cb(size, scale);
+            }
+            self.state.borrow_mut().restore_resize_callback(callback);
+        }
+        Ok(())
     }
 
     pub fn handle_surface_destroyed(&self) {
