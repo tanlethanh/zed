@@ -181,6 +181,16 @@ impl AndroidPlatform {
 
     /// Request a frame to be rendered on all windows
     pub fn request_frame_for_all_windows(&self) {
+        self.request_frame_with_options(false);
+    }
+
+    /// Request a frame with force_render option
+    /// When force_render is true, windows will redraw even if not marked dirty
+    pub fn request_frame_forced(&self) {
+        self.request_frame_with_options(true);
+    }
+
+    fn request_frame_with_options(&self, force_render: bool) {
         // Collect callbacks while borrowing windows
         let callbacks: Vec<_> = {
             let windows = self.windows.borrow();
@@ -195,7 +205,10 @@ impl AndroidPlatform {
 
         // Call callbacks and return them
         for (window, mut callback) in callbacks {
-            callback(RequestFrameOptions::default());
+            callback(RequestFrameOptions {
+                require_presentation: false,
+                force_render,
+            });
             window.borrow_mut().put_request_frame_callback(callback);
         }
 
@@ -203,14 +216,31 @@ impl AndroidPlatform {
         self.windows.borrow_mut().retain(|w| w.strong_count() > 0);
     }
 
-    /// Dispatch a platform input event to the most recently created window
+    /// Dispatch a platform input event to the most recently created window.
+    ///
+    /// This method extracts the input callback before invoking it to avoid reentrancy issues.
+    /// During callback execution, GPUI may call PlatformWindow methods like `take_input_handler`
+    /// which need to borrow the window state. If we held a borrow while invoking the callback,
+    /// those calls would panic with "RefCell already borrowed".
     pub fn dispatch_input(&self, input: PlatformInput) -> DispatchEventResult {
-        let windows = self.windows.borrow();
-        if let Some(window) = windows.last().and_then(|w| w.upgrade()) {
-            window.borrow_mut().handle_input(input)
+        let window = {
+            let windows = self.windows.borrow();
+            windows.last().and_then(|w| w.upgrade())
+        };
+
+        let Some(window) = window else {
+            return DispatchEventResult::default();
+        };
+
+        // Extract callback to release the borrow before invoking
+        let mut callback = window.borrow_mut().take_input_callback();
+        let result = if let Some(ref mut cb) = callback {
+            cb(input)
         } else {
             DispatchEventResult::default()
-        }
+        };
+        window.borrow_mut().restore_input_callback(callback);
+        result
     }
 
     /// Get or create the BladeContext

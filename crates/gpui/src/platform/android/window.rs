@@ -229,6 +229,17 @@ impl AndroidWindowState {
         self.callbacks.resize = callback;
     }
 
+    /// Take the input callback out of the state temporarily.
+    /// The caller must put it back via `restore_input_callback` after invoking.
+    pub fn take_input_callback(&mut self) -> Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>> {
+        self.callbacks.input.take()
+    }
+
+    /// Restore a previously taken input callback.
+    pub fn restore_input_callback(&mut self, callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>) {
+        self.callbacks.input = callback;
+    }
+
     /// Handle surface destroyed event
     pub fn handle_surface_destroyed(&mut self) {
         log::info!("AndroidWindow: surface destroyed");
@@ -267,7 +278,9 @@ impl AndroidWindowState {
         self.callbacks.request_frame = Some(callback);
     }
 
-    /// Handle input events
+    /// Handle input events (for internal use only)
+    /// Note: Callers should use dispatch_input on AndroidPlatform instead,
+    /// which properly handles the callback borrowing to avoid reentrancy issues.
     pub fn handle_input(&mut self, input: PlatformInput) -> DispatchEventResult {
         if let Some(ref mut callback) = self.callbacks.input {
             callback(input)
