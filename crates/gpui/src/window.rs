@@ -14,7 +14,7 @@ use crate::{
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
@@ -59,7 +59,8 @@ mod prompts;
 use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
 
-pub(crate) const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(864.));
+/// Default window size used when no explicit size is provided.
+pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(864.));
 
 /// A 6:5 aspect ratio minimum window size to be used for functional,
 /// additional-to-main-Zed windows, like the settings and rules library windows.
@@ -217,19 +218,77 @@ slotmap::new_key_type! {
 }
 
 thread_local! {
+    /// Fallback arena used when no app-specific arena is active.
+    /// In production, each window draw sets CURRENT_ELEMENT_ARENA to the app's arena.
     pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(1024 * 1024));
+
+    /// Points to the current App's element arena during draw operations.
+    /// This allows multiple test Apps to have isolated arenas, preventing
+    /// cross-session corruption when the scheduler interleaves their tasks.
+    static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
+}
+
+/// Allocates an element in the current arena. Uses the app-specific arena if one
+/// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
+pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
+    CURRENT_ELEMENT_ARENA.with(|current| {
+        if let Some(arena_ptr) = current.get() {
+            // SAFETY: The pointer is valid for the duration of the draw operation
+            // that set it, and we're being called during that same draw.
+            let arena_cell = unsafe { &*arena_ptr };
+            f(&mut arena_cell.borrow_mut())
+        } else {
+            ELEMENT_ARENA.with_borrow_mut(f)
+        }
+    })
+}
+
+/// RAII guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw operation.
+/// When dropped, restores the previous arena (supporting nested draws).
+pub(crate) struct ElementArenaScope {
+    previous: Option<*const RefCell<Arena>>,
+}
+
+impl ElementArenaScope {
+    /// Enter a scope where element allocations use the given arena.
+    pub(crate) fn enter(arena: &RefCell<Arena>) -> Self {
+        let previous = CURRENT_ELEMENT_ARENA.with(|current| {
+            let prev = current.get();
+            current.set(Some(arena as *const RefCell<Arena>));
+            prev
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for ElementArenaScope {
+    fn drop(&mut self) {
+        CURRENT_ELEMENT_ARENA.with(|current| {
+            current.set(self.previous);
+        });
+    }
 }
 
 /// Returned when the element arena has been used and so must be cleared before the next draw.
 #[must_use]
-pub struct ArenaClearNeeded;
+pub struct ArenaClearNeeded {
+    arena: *const RefCell<Arena>,
+}
 
 impl ArenaClearNeeded {
+    /// Create a new ArenaClearNeeded that will clear the given arena.
+    pub(crate) fn new(arena: &RefCell<Arena>) -> Self {
+        Self {
+            arena: arena as *const RefCell<Arena>,
+        }
+    }
+
     /// Clear the element arena.
     pub fn clear(self) {
-        ELEMENT_ARENA.with_borrow_mut(|element_arena| {
-            element_arena.clear();
-        });
+        // SAFETY: The arena pointer is valid because ArenaClearNeeded is created
+        // at the end of draw() and must be cleared before the next draw.
+        let arena_cell = unsafe { &*self.arena };
+        arena_cell.borrow_mut().clear();
     }
 }
 
@@ -666,6 +725,7 @@ pub(crate) struct DeferredDraw {
     parent_node: DispatchNodeId,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
+    rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
@@ -1096,6 +1156,7 @@ impl Window {
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let last_frame_time = Rc::new(Cell::new(None));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1125,6 +1186,20 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
+                let thermal_state = cx.update(|cx| cx.thermal_state());
+
+                if thermal_state == ThermalState::Serious || thermal_state == ThermalState::Critical
+                {
+                    let now = Instant::now();
+                    let last_frame_time = last_frame_time.replace(Some(now));
+
+                    if let Some(last_frame) = last_frame_time
+                        && now.duration_since(last_frame) < Duration::from_micros(16667)
+                    {
+                        return;
+                    }
+                }
+
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
                     handle
@@ -1374,8 +1449,8 @@ impl Window {
 
 /// Result of dispatching a platform input event to a window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[expect(missing_docs)]
 pub struct DispatchEventResult {
-    /// Whether the event should continue propagating.
     pub propagate: bool,
     /// Whether the default browser/platform behavior was prevented.
     pub default_prevented: bool,
@@ -1986,10 +2061,22 @@ impl Window {
         element_id: ElementId,
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
-        self.element_id_stack.push(element_id);
-        let global_id = GlobalElementId(Arc::from(&*self.element_id_stack));
+        self.with_id(element_id, |this| {
+            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
 
-        let result = f(&global_id, self);
+            f(&global_id, this)
+        })
+    }
+
+    /// Calls the provided closure with the element ID pushed on the stack.
+    #[inline]
+    pub fn with_id<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.element_id_stack.push(element_id.into());
+        let result = f(self);
         self.element_id_stack.pop();
         result
     }
@@ -2078,6 +2165,10 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        // Set up the per-App arena for element allocation during this draw.
+        // This ensures that multiple test Apps have isolated arenas.
+        let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2145,13 +2236,12 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
-        ArenaClearNeeded
+        ArenaClearNeeded::new(&cx.element_arena)
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
-        let mut entities_ref = cx.entities.accessed_entities.borrow_mut();
+        let mut entities_ref = cx.entities.accessed_entities.get_mut();
         let mut entities = mem::take(entities_ref.deref_mut());
-        drop(entities_ref);
         let handle = self.handle;
         cx.record_entities_accessed(
             handle,
@@ -2159,7 +2249,7 @@ impl Window {
             self.invalidator.clone(),
             &entities,
         );
-        let mut entities_ref = cx.entities.accessed_entities.borrow_mut();
+        let mut entities_ref = cx.entities.accessed_entities.get_mut();
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
@@ -2339,8 +2429,13 @@ impl Window {
             let prepaint_start = self.prepaint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
-                        element.prepaint(window, cx)
+                    window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                        window.with_absolute_element_offset(
+                            deferred_draw.absolute_offset,
+                            |window| {
+                                element.prepaint(window, cx);
+                            },
+                        );
                     });
                 })
             } else {
@@ -2374,7 +2469,9 @@ impl Window {
             let paint_start = self.paint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    element.paint(window, cx);
+                    window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                        element.paint(window, cx);
+                    })
                 })
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
@@ -2437,6 +2534,7 @@ impl Window {
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
+                    rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
@@ -2772,11 +2870,6 @@ impl Window {
         })
     }
 
-    /// Immediately push an element ID onto the stack. Useful for simplifying IDs in lists
-    pub fn with_id<R>(&mut self, id: impl Into<ElementId>, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.with_global_id(id.into(), |_, window| f(window))
-    }
-
     /// Use a piece of state that exists as long this element is being rendered in consecutive frames, without needing to specify a key
     ///
     /// NOTE: This method uses the location of the caller to generate an ID for this state.
@@ -2938,6 +3031,7 @@ impl Window {
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
+            rem_size: self.rem_size(),
             priority,
             element: Some(element),
             absolute_offset,
@@ -3569,6 +3663,7 @@ impl Window {
         self.rendered_entity_stack.last().copied().unwrap()
     }
 
+    #[inline]
     pub(crate) fn with_rendered_view<R>(
         &mut self,
         id: EntityId,
@@ -4898,6 +4993,19 @@ impl Window {
     pub fn set_modifiers(&mut self, modifiers: Modifiers) {
         self.modifiers = modifiers;
     }
+
+    /// For testing: simulate a mouse move event to the given position.
+    /// This dispatches the event through the normal event handling path,
+    /// which will trigger hover states and tooltips.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_mouse_move(&mut self, position: Point<Pixels>, cx: &mut App) {
+        let event = PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            modifiers: self.modifiers,
+            pressed_button: None,
+        });
+        let _ = self.dispatch_event(event, cx);
+    }
 }
 
 // #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -4958,11 +5066,11 @@ impl<V: 'static + Render> WindowHandle<V> {
     where
         C: AppContext,
     {
-        crate::Flatten::flatten(cx.update_window(self.any_handle, |root_view, _, _| {
+        cx.update_window(self.any_handle, |root_view, _, _| {
             root_view
                 .downcast::<V>()
                 .map_err(|_| anyhow!("the type of the window's root view has changed"))
-        }))
+        })?
     }
 
     /// Updates the root view of this window.

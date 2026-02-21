@@ -50,7 +50,6 @@ use rpc::{
     },
 };
 use semver::Version;
-use serde::{Serialize, Serializer};
 use std::{
     any::TypeId,
     future::Future,
@@ -131,7 +130,6 @@ impl<R: RequestMessage> Response<R> {
 #[derive(Clone, Debug)]
 pub enum Principal {
     User(User),
-    Impersonated { user: User, admin: User },
 }
 
 impl Principal {
@@ -140,11 +138,6 @@ impl Principal {
             Principal::User(user) => {
                 span.record("user_id", user.id.0);
                 span.record("login", &user.github_login);
-            }
-            Principal::Impersonated { user, admin } => {
-                span.record("user_id", user.id.0);
-                span.record("login", &user.github_login);
-                span.record("impersonator", &admin.github_login);
             }
         }
     }
@@ -204,16 +197,16 @@ struct Session {
 
 impl Session {
     async fn db(&self) -> tokio::sync::MutexGuard<'_, DbHandle> {
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         tokio::task::yield_now().await;
         let guard = self.db.lock().await;
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         tokio::task::yield_now().await;
         guard
     }
 
     async fn connection_pool(&self) -> ConnectionPoolGuard<'_> {
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         tokio::task::yield_now().await;
         let guard = self.connection_pool.lock();
         ConnectionPoolGuard {
@@ -226,14 +219,12 @@ impl Session {
     fn is_staff(&self) -> bool {
         match &self.principal {
             Principal::User(user) => user.admin,
-            Principal::Impersonated { .. } => true,
         }
     }
 
     fn user_id(&self) -> UserId {
         match &self.principal {
             Principal::User(user) => user.id,
-            Principal::Impersonated { user, .. } => user.id,
         }
     }
 }
@@ -244,10 +235,6 @@ impl Debug for Session {
         match &self.principal {
             Principal::User(user) => {
                 result.field("user", &user.github_login);
-            }
-            Principal::Impersonated { user, admin } => {
-                result.field("user", &user.github_login);
-                result.field("impersonator", &admin.github_login);
             }
         }
         result.field("connection_id", &self.connection_id).finish()
@@ -267,31 +254,15 @@ impl Deref for DbHandle {
 pub struct Server {
     id: parking_lot::Mutex<ServerId>,
     peer: Arc<Peer>,
-    pub(crate) connection_pool: Arc<parking_lot::Mutex<ConnectionPool>>,
+    pub connection_pool: Arc<parking_lot::Mutex<ConnectionPool>>,
     app_state: Arc<AppState>,
     handlers: HashMap<TypeId, MessageHandler>,
     teardown: watch::Sender<bool>,
 }
 
-pub(crate) struct ConnectionPoolGuard<'a> {
+struct ConnectionPoolGuard<'a> {
     guard: parking_lot::MutexGuard<'a, ConnectionPool>,
     _not_send: PhantomData<Rc<()>>,
-}
-
-#[derive(Serialize)]
-pub struct ServerSnapshot<'a> {
-    peer: &'a Peer,
-    #[serde(serialize_with = "serialize_deref")]
-    connection_pool: ConnectionPoolGuard<'a>,
-}
-
-pub fn serialize_deref<S, T, U>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    T: Deref<Target = U>,
-    U: Serialize,
-{
-    Serialize::serialize(value.deref(), serializer)
 }
 
 impl Server {
@@ -339,6 +310,7 @@ impl Server {
             .add_request_handler(forward_read_only_project_request::<proto::GetColorPresentation>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenBufferByPath>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenImageByPath>)
+            .add_request_handler(forward_read_only_project_request::<proto::DownloadFileByPath>)
             .add_request_handler(forward_read_only_project_request::<proto::GitGetBranches>)
             .add_request_handler(forward_read_only_project_request::<proto::GetDefaultBranch>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenUnstagedDiff>)
@@ -391,6 +363,9 @@ impl Server {
             .add_message_handler(create_image_for_peer)
             .add_request_handler(update_buffer)
             .add_message_handler(broadcast_project_message_from_host::<proto::RefreshInlayHints>)
+            .add_message_handler(
+                broadcast_project_message_from_host::<proto::RefreshSemanticTokens>,
+            )
             .add_message_handler(broadcast_project_message_from_host::<proto::RefreshCodeLens>)
             .add_message_handler(broadcast_project_message_from_host::<proto::UpdateBufferFile>)
             .add_message_handler(broadcast_project_message_from_host::<proto::BufferReloaded>)
@@ -468,7 +443,8 @@ impl Server {
             .add_request_handler(forward_mutating_project_request::<proto::ToggleLspLogs>)
             .add_message_handler(broadcast_project_message_from_host::<proto::LanguageServerLog>)
             .add_request_handler(share_agent_thread)
-            .add_request_handler(get_shared_agent_thread);
+            .add_request_handler(get_shared_agent_thread)
+            .add_request_handler(forward_project_search_chunk);
 
         Arc::new(server)
     }
@@ -650,7 +626,7 @@ impl Server {
         let _ = self.teardown.send(true);
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     pub fn reset(&self, id: ServerId) {
         self.teardown();
         *self.id.lock() = id;
@@ -658,7 +634,7 @@ impl Server {
         let _ = self.teardown.send(false);
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     pub fn id(&self) -> ServerId {
         *self.id.lock()
     }
@@ -775,7 +751,6 @@ impl Server {
             connection_id=field::Empty,
             user_id=field::Empty,
             login=field::Empty,
-            impersonator=field::Empty,
             user_agent=field::Empty,
             geoip_country_code=field::Empty,
             release_channel=field::Empty,
@@ -884,7 +859,6 @@ impl Server {
                                 concurrent_handlers,
                                 user_id=field::Empty,
                                 login=field::Empty,
-                                impersonator=field::Empty,
                                 lsp_query_request=field::Empty,
                                 release_channel=field::Empty,
                                 { TOTAL_DURATION_MS }=field::Empty,
@@ -948,7 +922,7 @@ impl Server {
         }
 
         match &session.principal {
-            Principal::User(user) | Principal::Impersonated { user, admin: _ } => {
+            Principal::User(user) => {
                 if !user.connected_once {
                     self.peer.send(connection_id, proto::ShowContacts {})?;
                     self.app_state
@@ -984,16 +958,6 @@ impl Server {
 
         Ok(())
     }
-
-    pub async fn snapshot(self: &Arc<Self>) -> ServerSnapshot<'_> {
-        ServerSnapshot {
-            connection_pool: ConnectionPoolGuard {
-                guard: self.connection_pool.lock(),
-                _not_send: PhantomData,
-            },
-            peer: &self.peer,
-        }
-    }
 }
 
 impl Deref for ConnectionPoolGuard<'_> {
@@ -1012,7 +976,7 @@ impl DerefMut for ConnectionPoolGuard<'_> {
 
 impl Drop for ConnectionPoolGuard<'_> {
     fn drop(&mut self) {
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         self.check_invariants();
     }
 }
@@ -1554,6 +1518,7 @@ fn notify_rejoined_projects(
                         path: settings_file.path,
                         content: Some(settings_file.content),
                         kind: Some(settings_file.kind.to_proto().into()),
+                        outside_worktree: Some(settings_file.outside_worktree),
                     },
                 )?;
             }
@@ -1986,6 +1951,7 @@ async fn join_project(
                     path: settings_file.path,
                     content: Some(settings_file.content),
                     kind: Some(settings_file.kind.to_proto() as i32),
+                    outside_worktree: Some(settings_file.outside_worktree),
                 },
             )?;
         }
@@ -2423,6 +2389,20 @@ async fn update_context(message: proto::UpdateContext, session: MessageContext) 
         },
     );
 
+    Ok(())
+}
+
+async fn forward_project_search_chunk(
+    message: proto::FindSearchCandidatesChunk,
+    response: Response<proto::FindSearchCandidatesChunk>,
+    session: MessageContext,
+) -> Result<()> {
+    let peer_id = message.peer_id.context("missing peer_id")?;
+    let payload = session
+        .peer
+        .forward_request(session.connection_id, peer_id.into(), message)
+        .await?;
+    response.send(payload)?;
     Ok(())
 }
 

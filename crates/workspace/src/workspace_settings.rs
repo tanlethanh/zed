@@ -31,6 +31,7 @@ pub struct WorkspaceSettings {
     pub text_rendering_mode: settings::TextRenderingMode,
     pub resize_all_panels_in_dock: Vec<DockPosition>,
     pub close_on_file_delete: bool,
+    pub close_panel_on_toggle: bool,
     pub use_system_window_tabs: bool,
     pub zoomed_padding: bool,
     pub window_decorations: settings::WindowDecorations,
@@ -60,6 +61,7 @@ pub struct TabBarSettings {
     pub show: bool,
     pub show_nav_history_buttons: bool,
     pub show_tab_bar_buttons: bool,
+    pub show_pinned_tabs_in_separate_row: bool,
 }
 
 impl Settings for WorkspaceSettings {
@@ -107,6 +109,7 @@ impl Settings for WorkspaceSettings {
                 .map(Into::into)
                 .collect(),
             close_on_file_delete: workspace.close_on_file_delete.unwrap(),
+            close_panel_on_toggle: workspace.close_panel_on_toggle.unwrap(),
             use_system_window_tabs: workspace.use_system_window_tabs.unwrap(),
             zoomed_padding: workspace.zoomed_padding.unwrap(),
             window_decorations: workspace.window_decorations.unwrap(),
@@ -121,6 +124,7 @@ impl Settings for TabBarSettings {
             show: tab_bar.show.unwrap(),
             show_nav_history_buttons: tab_bar.show_nav_history_buttons.unwrap(),
             show_tab_bar_buttons: tab_bar.show_tab_bar_buttons.unwrap(),
+            show_pinned_tabs_in_separate_row: tab_bar.show_pinned_tabs_in_separate_row.unwrap(),
         }
     }
 }

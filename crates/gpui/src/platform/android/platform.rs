@@ -11,7 +11,7 @@ use jni::{JavaVM, objects::GlobalRef};
 use ndk::looper::ThreadLooper;
 use util::ResultExt;
 
-use crate::platform::blade::BladeContext;
+use crate::platform::wgpu::WgpuContext;
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
     DispatchEventResult, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions,
@@ -101,7 +101,7 @@ pub struct AndroidPlatform {
     main_receiver: RefCell<AndroidQueueReceiver<RunnableVariant>>,
     jvm: Arc<JavaVM>,
     activity: Arc<Mutex<GlobalRef>>,
-    blade_context: RefCell<Option<Arc<BladeContext>>>,
+    wgpu_context: RefCell<Option<Arc<WgpuContext>>>,
     windows: RefCell<Vec<RcWeak<RefCell<AndroidWindowState>>>>,
     display_scale: Cell<f32>,
 }
@@ -125,7 +125,7 @@ impl AndroidPlatform {
             main_receiver: RefCell::new(main_receiver),
             jvm,
             activity,
-            blade_context: RefCell::new(None),
+            wgpu_context: RefCell::new(None),
             windows: RefCell::new(Vec::new()),
             display_scale: Cell::new(3.0),
         }
@@ -145,8 +145,8 @@ impl AndroidPlatform {
             .and_then(|w| w.upgrade())
             .ok_or_else(|| anyhow!("No windows available to attach surface"))?;
 
-        let blade_context = self.ensure_blade_context()?;
-        window.borrow_mut().handle_surface_created(native_window, &blade_context)
+        let wgpu_context = self.ensure_wgpu_context()?;
+        window.borrow_mut().handle_surface_created(native_window, &wgpu_context)
     }
 
     /// Detach native window from the most recently created AndroidWindow
@@ -164,11 +164,11 @@ impl AndroidPlatform {
             .and_then(|w| w.upgrade())
             .ok_or_else(|| anyhow!("No windows available for surface resize"))?;
 
-        let blade_context = self.ensure_blade_context()?;
+        let wgpu_context = self.ensure_wgpu_context()?;
 
         // handle_surface_changed returns pending resize info so the callback
         // can be fired after the mutable borrow is released.
-        let resize_info = window.borrow_mut().handle_surface_changed(width, height, &blade_context)?;
+        let resize_info = window.borrow_mut().handle_surface_changed(width, height, &wgpu_context)?;
         if let Some((size, scale)) = resize_info {
             let mut callback = window.borrow_mut().take_resize_callback();
             if let Some(ref mut cb) = callback {
@@ -244,22 +244,17 @@ impl AndroidPlatform {
     }
 
     /// Get or create the BladeContext
-    fn ensure_blade_context(&self) -> Result<Arc<BladeContext>> {
-        let mut blade_context = self.blade_context.borrow_mut();
-        if let Some(ref ctx) = *blade_context {
+    fn ensure_wgpu_context(&self) -> Result<Arc<WgpuContext>> {
+        let mut wgpu_context = self.wgpu_context.borrow_mut();
+        if let Some(ref ctx) = *wgpu_context {
             return Ok(ctx.clone());
         }
 
-        let ctx = BladeContext::new()
-            .or_else(|_| {
-                // Retry with lenient settings
-                unsafe { std::env::set_var("BLADE_PERMISSIVE", "1") };
-                BladeContext::new()
-            })
-            .map_err(|e| anyhow!("Failed to create BladeContext: {:?}", e))?;
+        let ctx = WgpuContext::new()
+            .map_err(|e| anyhow!("Failed to create WgpuContext: {:?}", e))?;
 
         let ctx = Arc::new(ctx);
-        *blade_context = Some(ctx.clone());
+        *wgpu_context = Some(ctx.clone());
         Ok(ctx)
     }
 
@@ -330,7 +325,7 @@ impl AndroidClient for AndroidPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let blade_context = self.ensure_blade_context()?;
+        let wgpu_context = self.ensure_wgpu_context()?;
         let scale = self.display_scale.get();
 
         let window = AndroidWindow::new(
@@ -339,7 +334,7 @@ impl AndroidClient for AndroidPlatform {
             scale,
             self.jvm.clone(),
             self.activity.clone(),
-            &blade_context,
+            &wgpu_context,
         )?;
 
         self.windows.borrow_mut().push(Rc::downgrade(&window.state));

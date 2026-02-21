@@ -119,12 +119,12 @@ fn run_autofix(pr_number: &WorkflowInput, run_clippy: &WorkflowInput) -> NamedJo
             .add_step(steps::cache_rust_dependencies_namespace())
             .map(steps::install_linux_dependencies)
             .add_step(steps::setup_pnpm())
-            .add_step(run_prettier_fix())
-            .add_step(run_cargo_fmt())
             .add_step(install_cargo_machete().if_condition(Expression::new(run_clippy.to_string())))
             .add_step(run_cargo_fix().if_condition(Expression::new(run_clippy.to_string())))
             .add_step(run_cargo_machete_fix().if_condition(Expression::new(run_clippy.to_string())))
             .add_step(run_clippy_fix().if_condition(Expression::new(run_clippy.to_string())))
+            .add_step(run_prettier_fix())
+            .add_step(run_cargo_fmt())
             .add_step(create_patch())
             .add_step(upload_patch_artifact())
             .add_step(steps::cleanup_cargo_config(runners::Platform::Linux)),
@@ -169,7 +169,7 @@ fn commit_changes(pr_number: &WorkflowInput, autofix_job: &NamedJob) -> NamedJob
                 autofix_job.name
             )))
             .add_step(authenticate)
-            .add_step(steps::checkout_repo_with_token(&token))
+            .add_step(steps::checkout_repo().with_token(&token))
             .add_step(checkout_pr(pr_number, &token))
             .add_step(download_patch_artifact())
             .add_step(apply_patch())

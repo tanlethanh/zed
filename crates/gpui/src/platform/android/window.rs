@@ -6,28 +6,23 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use blade_graphics as gpu;
-
 use anyhow::{anyhow, Result};
 use futures::channel::oneshot;
-use jni::{
-    objects::GlobalRef,
-    JavaVM,
-};
+use jni::{objects::GlobalRef, JavaVM};
 use ndk::native_window::NativeWindow;
 use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, HasDisplayHandle, HasWindowHandle,
     RawDisplayHandle, RawWindowHandle,
 };
 
-use crate::{
-    AnyWindowHandle, Bounds, Capslock, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, Size, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, scene::Scene,
-};
-use crate::platform::blade::{BladeAtlas, BladeContext, BladeRenderer, BladeSurfaceConfig};
+use crate::platform::wgpu::{WgpuAtlas, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use crate::DispatchEventResult;
+use crate::{
+    scene::Scene, AnyWindowHandle, Bounds, Capslock, DevicePixels, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, Size, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+};
 
 /// Callbacks for window events
 #[derive(Default)]
@@ -53,17 +48,28 @@ unsafe impl Send for RawWindow {}
 unsafe impl Sync for RawWindow {}
 
 impl HasWindowHandle for RawWindow {
-    fn window_handle(&self) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        let window = NonNull::new(self.window).ok_or(raw_window_handle::HandleError::Unavailable)?;
+    fn window_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
+    {
+        let window =
+            NonNull::new(self.window).ok_or(raw_window_handle::HandleError::Unavailable)?;
         let handle = AndroidNdkWindowHandle::new(window.cast());
-        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(RawWindowHandle::AndroidNdk(handle)) })
+        Ok(unsafe {
+            raw_window_handle::WindowHandle::borrow_raw(RawWindowHandle::AndroidNdk(handle))
+        })
     }
 }
 
 impl HasDisplayHandle for RawWindow {
-    fn display_handle(&self) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+    fn display_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+    {
         let handle = AndroidDisplayHandle::new();
-        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(RawDisplayHandle::Android(handle)) })
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(RawDisplayHandle::Android(handle))
+        })
     }
 }
 
@@ -71,8 +77,8 @@ impl HasDisplayHandle for RawWindow {
 pub(crate) struct AndroidWindowState {
     raw_window: Option<RawWindow>,
     native_window: Option<NativeWindow>,
-    renderer: Option<BladeRenderer>,
-    atlas: Arc<BladeAtlas>,
+    renderer: Option<WgpuRenderer>,
+    atlas: Arc<WgpuAtlas>,
     bounds: Bounds<Pixels>,
     scale: f32,
     input_handler: Option<PlatformInputHandler>,
@@ -94,10 +100,13 @@ impl AndroidWindowState {
         scale: f32,
         jvm: Arc<JavaVM>,
         activity: Arc<Mutex<GlobalRef>>,
-        context: &BladeContext,
+        context: &WgpuContext,
     ) -> Result<Self> {
         // Create the atlas for texture management
-        let atlas = Arc::new(BladeAtlas::new(context.gpu_context()));
+        let atlas = Arc::new(WgpuAtlas::new(
+            Arc::clone(&context.device),
+            Arc::clone(&context.queue),
+        ));
 
         Ok(Self {
             raw_window: None,
@@ -123,27 +132,29 @@ impl AndroidWindowState {
     pub fn handle_surface_created(
         &mut self,
         native_window: NativeWindow,
-        context: &BladeContext,
+        context: &WgpuContext,
     ) -> Result<()> {
         log::info!("AndroidWindow: surface created");
 
         let window_ptr = native_window.ptr().as_ptr() as *mut c_void;
-        let raw_window = RawWindow {
-            window: window_ptr,
+        let raw_window = RawWindow { window: window_ptr };
+
+        // Create the WGPU renderer with PHYSICAL pixels (bounds * scale)
+        let size = Size {
+            width: DevicePixels((self.bounds.size.width.0 * self.scale) as i32),
+            height: DevicePixels((self.bounds.size.height.0 * self.scale) as i32),
         };
 
-        // Create the Blade renderer with PHYSICAL pixels (bounds * scale)
-        let size = gpu::Extent {
-            width: (self.bounds.size.width.0 * self.scale) as u32,
-            height: (self.bounds.size.height.0 * self.scale) as u32,
-            depth: 1,
-        };
+        log::info!(
+            "Creating WgpuRenderer with physical size: {}x{} (logical: {}x{}, scale: {})",
+            size.width.0,
+            size.height.0,
+            self.bounds.size.width.0,
+            self.bounds.size.height.0,
+            self.scale
+        );
 
-        log::info!("Creating BladeRenderer with physical size: {}x{} (logical: {}x{}, scale: {})",
-            size.width, size.height,
-            self.bounds.size.width.0, self.bounds.size.height.0, self.scale);
-
-        let config = BladeSurfaceConfig {
+        let config = WgpuSurfaceConfig {
             size,
             transparent: matches!(
                 self.background_appearance,
@@ -151,10 +162,9 @@ impl AndroidWindowState {
             ),
         };
 
-        // CRITICAL: Use new_with_atlas to share the same atlas instance between the window
-        // and renderer. The GPUI Window captures sprite_atlas() during construction BEFORE
-        // the renderer exists, so the renderer must use the same atlas.
-        let renderer = BladeRenderer::new_with_atlas(context, &raw_window, config, self.atlas.clone())?;
+        // Create the renderer - WGPU doesn't have a new_with_atlas method,
+        // so we'll need to update the atlas after creation
+        let renderer = WgpuRenderer::new(context, &raw_window, config)?;
 
         self.native_window = Some(native_window);
         self.raw_window = Some(raw_window);
@@ -166,7 +176,7 @@ impl AndroidWindowState {
     /// Handle surface changed event (resize/rotation).
     /// Returns the new size and scale so the caller can invoke the resize
     /// callback *after* releasing the mutable borrow on the window state.
-    pub fn handle_surface_changed(&mut self, width: u32, height: u32, context: &BladeContext) -> Result<Option<(Size<Pixels>, f32)>> {
+    pub fn handle_surface_changed(&mut self, width: u32, height: u32, context: &WgpuContext) -> Result<Option<(Size<Pixels>, f32)>> {
         log::info!("AndroidWindow: surface changed to {}x{}", width, height);
 
         let new_bounds = Bounds {
@@ -185,6 +195,40 @@ impl AndroidWindowState {
         // Recreate the renderer only if dimensions actually changed.
         // After a background/foreground cycle, handle_surface_created already
         // created a renderer with the current bounds — skip the duplicate
+        // creation to avoid surface errors.
+        if bounds_changed {
+            if let Some(ref raw_window) = self.raw_window {
+                let size = Size {
+                    width: DevicePixels(width as i32),
+                    height: DevicePixels(height as i32),
+                };
+
+                let config = WgpuSurfaceConfig {
+                    size,
+                    transparent: matches!(
+                        self.background_appearance,
+                        WindowBackgroundAppearance::Transparent | WindowBackgroundAppearance::Blurred
+                    ),
+                };
+
+                let renderer = WgpuRenderer::new(context, raw_window, config)?;
+                self.renderer = Some(renderer);
+            }
+        }
+
+        // Return resize info so the caller can fire the callback after
+        // dropping the mutable borrow (avoids RefCell double-borrow panic).
+        let has_callback = self.callbacks.resize.is_some();
+        Ok(if has_callback {
+            Some((new_bounds.size, self.scale))
+        } else {
+            None
+        })
+    }
+
+        // Recreate the renderer only if dimensions actually changed.
+        // After a background/foreground cycle, handle_surface_created already
+        // created a renderer with the current bounds — skip the duplicate
         // creation to avoid ERROR_NATIVE_WINDOW_IN_USE_KHR.
         if bounds_changed {
             if let Some(ref raw_window) = self.raw_window {
@@ -198,12 +242,14 @@ impl AndroidWindowState {
                     size,
                     transparent: matches!(
                         self.background_appearance,
-                        WindowBackgroundAppearance::Transparent | WindowBackgroundAppearance::Blurred
+                        WindowBackgroundAppearance::Transparent
+                            | WindowBackgroundAppearance::Blurred
                     ),
                 };
 
                 // Use the same shared atlas when recreating the renderer
-                let renderer = BladeRenderer::new_with_atlas(context, raw_window, config, self.atlas.clone())?;
+                let renderer =
+                    BladeRenderer::new_with_atlas(context, raw_window, config, self.atlas.clone())?;
                 self.renderer = Some(renderer);
             }
         }
@@ -231,12 +277,17 @@ impl AndroidWindowState {
 
     /// Take the input callback out of the state temporarily.
     /// The caller must put it back via `restore_input_callback` after invoking.
-    pub fn take_input_callback(&mut self) -> Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>> {
+    pub fn take_input_callback(
+        &mut self,
+    ) -> Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>> {
         self.callbacks.input.take()
     }
 
     /// Restore a previously taken input callback.
-    pub fn restore_input_callback(&mut self, callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>) {
+    pub fn restore_input_callback(
+        &mut self,
+        callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
+    ) {
         self.callbacks.input = callback;
     }
 
@@ -269,12 +320,17 @@ impl AndroidWindowState {
 
     /// Extract the request_frame callback without calling it
     /// Returns the callback if it exists
-    pub(crate) fn take_request_frame_callback(&mut self) -> Option<Box<dyn FnMut(RequestFrameOptions)>> {
+    pub(crate) fn take_request_frame_callback(
+        &mut self,
+    ) -> Option<Box<dyn FnMut(RequestFrameOptions)>> {
         self.callbacks.request_frame.take()
     }
 
     /// Put back the request_frame callback
-    pub(crate) fn put_request_frame_callback(&mut self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+    pub(crate) fn put_request_frame_callback(
+        &mut self,
+        callback: Box<dyn FnMut(RequestFrameOptions)>,
+    ) {
         self.callbacks.request_frame = Some(callback);
     }
 
@@ -304,7 +360,7 @@ impl AndroidWindow {
         scale: f32,
         jvm: Arc<JavaVM>,
         activity: Arc<Mutex<GlobalRef>>,
-        context: &BladeContext,
+        context: &WgpuContext,
     ) -> Result<Self> {
         let state = AndroidWindowState::new(handle, bounds, scale, jvm, activity, context)?;
         Ok(Self {
@@ -315,7 +371,7 @@ impl AndroidWindow {
     pub fn handle_surface_created(
         &self,
         native_window: NativeWindow,
-        context: &BladeContext,
+        context: &WgpuContext,
     ) -> Result<()> {
         self.state.borrow_mut().handle_surface_created(native_window, context)
     }
@@ -324,9 +380,41 @@ impl AndroidWindow {
         &self,
         width: u32,
         height: u32,
-        context: &BladeContext,
+        context: &WgpuContext,
     ) -> Result<()> {
         let resize_info = self.state.borrow_mut().handle_surface_changed(width, height, context)?;
+        if let Some((size, scale)) = resize_info {
+            // Take the callback out so we can invoke it without holding a
+            // mutable borrow (the callback reads window state via borrow()).
+            let mut callback = self.state.borrow_mut().take_resize_callback();
+            if let Some(ref mut cb) = callback {
+                cb(size, scale);
+            }
+            self.state.borrow_mut().restore_resize_callback(callback);
+        }
+        Ok(())
+    }
+
+    pub fn handle_surface_created(
+        &self,
+        native_window: NativeWindow,
+        context: &BladeContext,
+    ) -> Result<()> {
+        self.state
+            .borrow_mut()
+            .handle_surface_created(native_window, context)
+    }
+
+    pub fn handle_surface_changed(
+        &self,
+        width: u32,
+        height: u32,
+        context: &BladeContext,
+    ) -> Result<()> {
+        let resize_info = self
+            .state
+            .borrow_mut()
+            .handle_surface_changed(width, height, context)?;
         if let Some((size, scale)) = resize_info {
             // Take the callback out so we can invoke it without holding a
             // mutable borrow (the callback reads window state via borrow()).
@@ -526,7 +614,10 @@ impl PlatformWindow for AndroidWindow {
 }
 
 impl HasWindowHandle for AndroidWindow {
-    fn window_handle(&self) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+    fn window_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
+    {
         // We can't safely return a handle that borrows from RefCell
         // For now, return Unavailable - this will be fixed when GPUI is fully integrated
         Err(raw_window_handle::HandleError::Unavailable)
@@ -534,9 +625,14 @@ impl HasWindowHandle for AndroidWindow {
 }
 
 impl HasDisplayHandle for AndroidWindow {
-    fn display_handle(&self) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+    fn display_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+    {
         // Android display handle doesn't borrow anything
         let handle = AndroidDisplayHandle::new();
-        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(RawDisplayHandle::Android(handle)) })
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(RawDisplayHandle::Android(handle))
+        })
     }
 }

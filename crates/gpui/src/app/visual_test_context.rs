@@ -1,9 +1,9 @@
 use crate::{
-    Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, BackgroundExecutor, Bounds,
-    ClipboardItem, Context, Entity, ForegroundExecutor, Global, InputEvent, Keystroke, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Platform, Point, Render,
-    Result, Size, Task, TextSystem, Window, WindowBounds, WindowHandle, WindowOptions,
-    app::GpuiMode, current_platform,
+    Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetSource, BackgroundExecutor,
+    Bounds, ClipboardItem, Context, Entity, ForegroundExecutor, Global, InputEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Platform, Point,
+    Render, Result, Size, Task, TestDispatcher, TextSystem, VisualTestPlatform, Window,
+    WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
 };
 use anyhow::anyhow;
 use image::RgbaImage;
@@ -25,35 +25,62 @@ pub struct VisualTestAppContext {
     pub background_executor: BackgroundExecutor,
     /// The foreground executor for running tasks on the main thread
     pub foreground_executor: ForegroundExecutor,
+    /// The test dispatcher for deterministic task scheduling
+    dispatcher: TestDispatcher,
     platform: Rc<dyn Platform>,
     text_system: Arc<TextSystem>,
 }
 
 impl VisualTestAppContext {
-    /// Creates a new `VisualTestAppContext` with real macOS platform rendering.
+    /// Creates a new `VisualTestAppContext` with real macOS platform rendering
+    /// but deterministic task scheduling via TestDispatcher.
     ///
-    /// This initializes the real macOS platform (not the test platform), which means:
-    /// - Windows are actually rendered by Metal/the compositor
-    /// - Screenshots can be captured via ScreenCaptureKit
-    /// - All platform APIs work as they do in production
-    pub fn new() -> Self {
-        let liveness = Arc::new(());
-        let liveness_weak = Arc::downgrade(&liveness);
-        let platform = current_platform(false, liveness_weak);
+    /// This provides:
+    /// - Real Metal/compositor rendering for accurate screenshots
+    /// - Deterministic task scheduling via TestDispatcher
+    /// - Controllable time via `advance_clock`
+    ///
+    /// Note: This uses a no-op asset source, so SVG icons won't render.
+    /// Use `with_asset_source` to provide real assets for icon rendering.
+    pub fn new(platform: Rc<dyn Platform>) -> Self {
+        Self::with_asset_source(platform, Arc::new(()))
+    }
+
+    /// Creates a new `VisualTestAppContext` with a custom asset source.
+    ///
+    /// Use this when you need SVG icons to render properly in visual tests.
+    /// Pass the real `Assets` struct to enable icon rendering.
+    pub fn with_asset_source(
+        platform: Rc<dyn Platform>,
+        asset_source: Arc<dyn AssetSource>,
+    ) -> Self {
+        // Use a seeded RNG for deterministic behavior
+        let seed = std::env::var("SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        // Create a visual test platform that combines real Mac rendering
+        // with controllable TestDispatcher for deterministic task scheduling
+        let platform = Rc::new(VisualTestPlatform::new(platform, seed));
+
+        // Get the dispatcher and executors from the platform
+        let dispatcher = platform.dispatcher().clone();
         let background_executor = platform.background_executor();
         let foreground_executor = platform.foreground_executor();
+
         let text_system = Arc::new(TextSystem::new(platform.text_system()));
 
-        let asset_source = Arc::new(());
         let http_client = http_client::FakeHttpClient::with_404_response();
 
-        let mut app = App::new_app(platform.clone(), liveness, asset_source, http_client);
+        let mut app = App::new_app(platform.clone(), asset_source, http_client);
         app.borrow_mut().mode = GpuiMode::test();
 
         Self {
             app,
             background_executor,
             foreground_executor,
+            dispatcher,
             platform,
             text_system,
         }
@@ -120,9 +147,17 @@ impl VisualTestAppContext {
         self.foreground_executor.clone()
     }
 
-    /// Runs pending background tasks until there's nothing left to do.
+    /// Runs all pending foreground and background tasks until there's nothing left to do.
+    /// This is essential for processing async operations like tooltip timers.
     pub fn run_until_parked(&self) {
-        self.background_executor.run_until_parked();
+        self.dispatcher.run_until_parked();
+    }
+
+    /// Advances the simulated clock by the given duration and processes any tasks
+    /// that become ready. This is essential for testing time-based behaviors like
+    /// tooltip delays.
+    pub fn advance_clock(&self, duration: Duration) {
+        self.dispatcher.advance_clock(duration);
     }
 
     /// Updates the app state.
@@ -359,24 +394,13 @@ impl VisualTestAppContext {
     }
 }
 
-impl Default for VisualTestAppContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AppContext for VisualTestAppContext {
-    type Result<T> = T;
-
-    fn new<T: 'static>(
-        &mut self,
-        build_entity: impl FnOnce(&mut Context<T>) -> T,
-    ) -> Self::Result<Entity<T>> {
+    fn new<T: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
         let mut app = self.app.borrow_mut();
         app.new(build_entity)
     }
 
-    fn reserve_entity<T: 'static>(&mut self) -> Self::Result<crate::Reservation<T>> {
+    fn reserve_entity<T: 'static>(&mut self) -> crate::Reservation<T> {
         let mut app = self.app.borrow_mut();
         app.reserve_entity()
     }
@@ -385,7 +409,7 @@ impl AppContext for VisualTestAppContext {
         &mut self,
         reservation: crate::Reservation<T>,
         build_entity: impl FnOnce(&mut Context<T>) -> T,
-    ) -> Self::Result<Entity<T>> {
+    ) -> Entity<T> {
         let mut app = self.app.borrow_mut();
         app.insert_entity(reservation, build_entity)
     }
@@ -394,23 +418,19 @@ impl AppContext for VisualTestAppContext {
         &mut self,
         handle: &Entity<T>,
         update: impl FnOnce(&mut T, &mut Context<T>) -> R,
-    ) -> Self::Result<R> {
+    ) -> R {
         let mut app = self.app.borrow_mut();
         app.update_entity(handle, update)
     }
 
-    fn as_mut<'a, T>(&'a mut self, _: &Entity<T>) -> Self::Result<crate::GpuiBorrow<'a, T>>
+    fn as_mut<'a, T>(&'a mut self, _: &Entity<T>) -> crate::GpuiBorrow<'a, T>
     where
         T: 'static,
     {
         panic!("Cannot use as_mut with a visual test app context. Try calling update() first")
     }
 
-    fn read_entity<T, R>(
-        &self,
-        handle: &Entity<T>,
-        read: impl FnOnce(&T, &App) -> R,
-    ) -> Self::Result<R>
+    fn read_entity<T, R>(&self, handle: &Entity<T>, read: impl FnOnce(&T, &App) -> R) -> R
     where
         T: 'static,
     {
@@ -445,7 +465,7 @@ impl AppContext for VisualTestAppContext {
         self.background_executor.spawn(future)
     }
 
-    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> Self::Result<R>
+    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> R
     where
         G: Global,
     {
