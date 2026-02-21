@@ -33,7 +33,12 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
         )
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        panic!("AndroidPlatform must be initialized from JNI with JavaVM and Activity");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
     {
         gpui_linux::current_platform(headless)
     }

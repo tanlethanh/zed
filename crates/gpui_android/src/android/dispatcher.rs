@@ -1,16 +1,11 @@
 use std::{
-    mem::MaybeUninit,
-    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-use util::ResultExt;
-
-use crate::{
+use gpui::{
     GLOBAL_THREAD_TIMINGS, PlatformDispatcher, Priority, PriorityQueueReceiver,
-    PriorityQueueSender, RealtimePriority, RunnableVariant, THREAD_TIMINGS, TaskLabel, TaskTiming,
-    profiler,
+    PriorityQueueSender, RunnableVariant, THREAD_TIMINGS, TaskTiming, ThreadTaskTimings, profiler,
 };
 
 struct TimerAfter {
@@ -34,46 +29,32 @@ impl AndroidDispatcher {
         let thread_count =
             std::thread::available_parallelism().map_or(MIN_THREADS, |i| i.get().max(MIN_THREADS));
 
-        // Background worker threads
         let mut background_threads = (0..thread_count)
             .map(|i| {
-                let mut receiver = background_receiver.clone();
+                let receiver: PriorityQueueReceiver<RunnableVariant> = background_receiver.clone();
                 std::thread::Builder::new()
                     .name(format!("Worker-{i}"))
                     .spawn(move || {
                         for runnable in receiver.iter() {
+                            if runnable.metadata().is_closed() {
+                                continue;
+                            }
+
                             let start = Instant::now();
 
-                            let mut location = match runnable {
-                                RunnableVariant::Meta(runnable) => {
-                                    let location = runnable.metadata().location;
-                                    let timing = TaskTiming {
-                                        location,
-                                        start,
-                                        end: None,
-                                    };
-                                    profiler::add_task_timing(timing);
-
-                                    runnable.run();
-                                    timing
-                                }
-                                RunnableVariant::Compat(runnable) => {
-                                    let location = core::panic::Location::caller();
-                                    let timing = TaskTiming {
-                                        location,
-                                        start,
-                                        end: None,
-                                    };
-                                    profiler::add_task_timing(timing);
-
-                                    runnable.run();
-                                    timing
-                                }
+                            let location = runnable.metadata().location;
+                            let mut timing = TaskTiming {
+                                location,
+                                start,
+                                end: None,
                             };
+                            profiler::add_task_timing(timing);
+
+                            runnable.run();
 
                             let end = Instant::now();
-                            location.end = Some(end);
-                            profiler::add_task_timing(location);
+                            timing.end = Some(end);
+                            profiler::add_task_timing(timing);
 
                             log::trace!(
                                 "background thread {}: ran runnable. took: {:?}",
@@ -86,7 +67,6 @@ impl AndroidDispatcher {
             })
             .collect::<Vec<_>>();
 
-        // Timer thread
         let (timer_sender, timer_receiver) = std::sync::mpsc::channel::<TimerAfter>();
         let timer_thread = std::thread::Builder::new()
             .name("Timer".to_owned())
@@ -94,32 +74,22 @@ impl AndroidDispatcher {
                 while let std::result::Result::Ok(timer) = timer_receiver.recv() {
                     std::thread::sleep(timer.duration);
 
+                    let runnable = timer.runnable;
+                    if runnable.metadata().is_closed() {
+                        continue;
+                    }
+
                     let start = Instant::now();
-                    let mut timing = match timer.runnable {
-                        RunnableVariant::Meta(runnable) => {
-                            let location = runnable.metadata().location;
-                            let timing = TaskTiming {
-                                location,
-                                start,
-                                end: None,
-                            };
-                            profiler::add_task_timing(timing);
-
-                            runnable.run();
-                            timing
-                        }
-                        RunnableVariant::Compat(runnable) => {
-                            let timing = TaskTiming {
-                                location: core::panic::Location::caller(),
-                                start,
-                                end: None,
-                            };
-                            profiler::add_task_timing(timing);
-
-                            runnable.run();
-                            timing
-                        }
+                    let location = runnable.metadata().location;
+                    let mut timing = TaskTiming {
+                        location,
+                        start,
+                        end: None,
                     };
+                    profiler::add_task_timing(timing);
+
+                    runnable.run();
+
                     let end = Instant::now();
                     timing.end = Some(end);
                     profiler::add_task_timing(timing);
@@ -140,14 +110,16 @@ impl AndroidDispatcher {
 }
 
 impl PlatformDispatcher for AndroidDispatcher {
-    fn get_all_timings(&self) -> Vec<crate::ThreadTaskTimings> {
+    fn get_all_timings(&self) -> Vec<ThreadTaskTimings> {
         let global_timings = GLOBAL_THREAD_TIMINGS.lock();
-        crate::ThreadTaskTimings::convert(&global_timings)
+        ThreadTaskTimings::convert(&global_timings)
     }
 
-    fn get_current_thread_timings(&self) -> Vec<crate::TaskTiming> {
+    fn get_current_thread_timings(&self) -> ThreadTaskTimings {
         THREAD_TIMINGS.with(|timings| {
             let timings = timings.lock();
+            let thread_name = timings.thread_name.clone();
+            let total_pushed = timings.total_pushed;
             let timings = &timings.timings;
 
             let mut vec = Vec::with_capacity(timings.len());
@@ -155,7 +127,13 @@ impl PlatformDispatcher for AndroidDispatcher {
             let (s1, s2) = timings.as_slices();
             vec.extend_from_slice(s1);
             vec.extend_from_slice(s2);
-            vec
+
+            ThreadTaskTimings {
+                thread_name,
+                thread_id: std::thread::current().id(),
+                timings: vec,
+                total_pushed,
+            }
         })
     }
 
@@ -163,7 +141,7 @@ impl PlatformDispatcher for AndroidDispatcher {
         thread::current().id() == self.main_thread_id
     }
 
-    fn dispatch(&self, runnable: RunnableVariant, _: Option<TaskLabel>, priority: Priority) {
+    fn dispatch(&self, runnable: RunnableVariant, priority: Priority) {
         self.background_sender
             .send(priority, runnable)
             .unwrap_or_else(|_| panic!("blocking sender returned without value"));
@@ -173,14 +151,6 @@ impl PlatformDispatcher for AndroidDispatcher {
         self.main_sender
             .send(priority, runnable)
             .unwrap_or_else(|runnable| {
-                // NOTE: Runnable may wrap a Future that is !Send.
-                //
-                // This is usually safe because we only poll it on the main thread.
-                // However if the send fails, we know that:
-                // 1. main_receiver has been dropped (which implies the app is shutting down)
-                // 2. we are on a background thread.
-                // It is not safe to drop something !Send on the wrong thread, and
-                // the app will exit soon anyway, so we must forget the runnable.
                 std::mem::forget(runnable);
             });
     }
@@ -191,15 +161,10 @@ impl PlatformDispatcher for AndroidDispatcher {
             .ok();
     }
 
-    fn spawn_realtime(&self, _priority: RealtimePriority, f: Box<dyn FnOnce() + Send>) {
-        // Android doesn't have simple realtime thread priorities like Linux
-        // Just spawn a normal thread with high priority hint
+    fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
         std::thread::Builder::new()
             .name("Realtime".to_owned())
             .spawn(move || {
-                // On Android, we could potentially use JNI to call
-                // android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-                // but for now just run the function
                 f();
             })
             .ok();
