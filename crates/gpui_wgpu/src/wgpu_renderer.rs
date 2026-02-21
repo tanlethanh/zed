@@ -128,6 +128,15 @@ impl WgpuRenderer {
         window: &W,
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
+        Self::new_with_atlas(context, window, config, None)
+    }
+
+    pub fn new_with_atlas<W: HasWindowHandle + HasDisplayHandle>(
+        context: &WgpuContext,
+        window: &W,
+        config: WgpuSurfaceConfig,
+        existing_atlas: Option<Arc<WgpuAtlas>>,
+    ) -> anyhow::Result<Self> {
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
@@ -217,7 +226,8 @@ impl WgpuRenderer {
             dual_source_blending,
         );
 
-        let atlas = Arc::new(WgpuAtlas::new(Arc::clone(&device), Arc::clone(&queue)));
+        let atlas = existing_atlas
+            .unwrap_or_else(|| Arc::new(WgpuAtlas::new(Arc::clone(&device), Arc::clone(&queue))));
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -473,11 +483,29 @@ impl WgpuRenderer {
         path_sample_count: u32,
         dual_source_blending: bool,
     ) -> WgpuPipelines {
-        let shader_source = include_str!("shaders.wgsl");
+        let base_shader = include_str!("shaders.wgsl");
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpui_shaders"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            source: wgpu::ShaderSource::Wgsl(base_shader.into()),
         });
+
+        // Subpixel sprite shaders use dual-source blending (`@blend_src`) which is
+        // not available on all GPUs (e.g. Mali-G68). Compile them into a separate
+        // module only when the feature is supported, since wgpu validates all entry
+        // points at shader module creation time.
+        let subpixel_shader_module = if dual_source_blending {
+            let subpixel_source = format!(
+                "{}\n{}",
+                base_shader,
+                include_str!("shaders_subpixel.wgsl"),
+            );
+            Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("gpui_subpixel_shaders"),
+                source: wgpu::ShaderSource::Wgsl(subpixel_source.into()),
+            }))
+        } else {
+            None
+        };
 
         let blend_mode = match alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied => {
@@ -628,7 +656,7 @@ impl WgpuRenderer {
             1,
         );
 
-        let subpixel_sprites = if dual_source_blending {
+        let subpixel_sprites = if let Some(ref subpixel_module) = subpixel_shader_module {
             let subpixel_blend = wgpu::BlendState {
                 color: wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::Src1,
@@ -642,20 +670,50 @@ impl WgpuRenderer {
                 },
             };
 
-            Some(create_pipeline(
-                "subpixel_sprites",
-                "vs_subpixel_sprite",
-                "fs_subpixel_sprite",
-                &layouts.globals,
-                &layouts.instances_with_texture,
-                wgpu::PrimitiveTopology::TriangleStrip,
-                &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(subpixel_blend),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })],
-                1,
-            ))
+            let pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("subpixel_sprites_layout"),
+                    bind_group_layouts: &[&layouts.globals, &layouts.instances_with_texture],
+                    immediate_size: 0,
+                });
+
+            Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("subpixel_sprites"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: subpixel_module,
+                    entry_point: Some("vs_subpixel_sprite"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: subpixel_module,
+                    entry_point: Some("fs_subpixel_sprite"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(subpixel_blend),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            }))
         } else {
             None
         };

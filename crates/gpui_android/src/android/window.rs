@@ -156,7 +156,7 @@ impl AndroidWindowState {
             ),
         };
 
-        let renderer = WgpuRenderer::new(context, &raw_window, config)?;
+        let renderer = WgpuRenderer::new_with_atlas(context, &raw_window, config, Some(self.atlas.clone()))?;
 
         self.native_window = Some(native_window);
         self.raw_window = Some(raw_window);
@@ -196,7 +196,7 @@ impl AndroidWindowState {
                     ),
                 };
 
-                let renderer = WgpuRenderer::new(context, raw_window, config)?;
+                let renderer = WgpuRenderer::new_with_atlas(context, raw_window, config, Some(self.atlas.clone()))?;
                 self.renderer = Some(renderer);
             }
         }
