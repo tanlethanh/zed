@@ -419,7 +419,7 @@ impl AndroidClient for AndroidPlatform {
 
 impl AndroidPlatform {
     /// Process pending tasks from the main receiver
-    fn process_pending_tasks(&self) {
+    pub fn process_pending_tasks(&self) {
         let mut main_receiver = self.main_receiver.borrow_mut();
         while let Some(runnable) = main_receiver.try_recv() {
             match runnable {
