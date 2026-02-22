@@ -8,13 +8,15 @@
 //! - Touch-based input instead of mouse
 //! - System keyboard handling differs significantly
 
-use super::{IosDispatcher, IosDisplay, IosWindow};
+use super::dispatcher::IosDispatcher;
+use super::display::IosDisplay;
+use super::window::IosWindow;
 use crate::metal_renderer;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
     Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result, Task, WindowAppearance,
-    WindowParams,
+    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result, Task, ThermalState,
+    WindowAppearance, WindowParams,
 };
 use anyhow::anyhow;
 use futures::channel::oneshot;
@@ -26,9 +28,9 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) struct IosPlatform(Mutex<IosPlatformState>);
+pub struct IosPlatform(Mutex<IosPlatformState>);
 
-pub(crate) struct IosPlatformState {
+struct IosPlatformState {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
@@ -278,6 +280,12 @@ impl Platform for IosPlatform {
     }
 
     fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {}
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
 }
 
 pub struct IosKeyboardLayout;

@@ -9,7 +9,7 @@
 //! The window is backed by a UIWindow containing a UIViewController
 //! whose view hosts the Metal rendering layer.
 
-use super::{IosDisplay, events::*, text_input, text_input::{create_text_position, create_text_range, get_position_index, get_range_indices}};
+use super::{display::IosDisplay, events::*, text_input, text_input::{create_text_position, create_text_range, get_position_index, get_range_indices}};
 use crate::metal_renderer;
 use gpui::{
     AnyWindowHandle, Bounds, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
@@ -1045,8 +1045,8 @@ fn register_metal_view_class() -> &'static Class {
 
                 match bounds {
                     Some(b) => IOSCGRect::new(
-                        IOSCGPoint::new(b.origin.x.0 as f64, b.origin.y.0 as f64),
-                        IOSCGSize::new(2.0, b.size.height.0 as f64), // 2px wide caret
+                        IOSCGPoint::new(b.origin.x.as_f32() as f64, b.origin.y.as_f32() as f64),
+                        IOSCGSize::new(2.0, b.size.height.as_f32() as f64), // 2px wide caret
                     ),
                     None => default_rect,
                 }
@@ -1074,8 +1074,8 @@ fn register_metal_view_class() -> &'static Class {
 
                 match bounds {
                     Some(b) => IOSCGRect::new(
-                        IOSCGPoint::new(b.origin.x.0 as f64, b.origin.y.0 as f64),
-                        IOSCGSize::new(b.size.width.0 as f64, b.size.height.0 as f64),
+                        IOSCGPoint::new(b.origin.x.as_f32() as f64, b.origin.y.as_f32() as f64),
+                        IOSCGSize::new(b.size.width.as_f32() as f64, b.size.height.as_f32() as f64),
                     ),
                     None => default_rect,
                 }
@@ -2152,6 +2152,14 @@ impl PlatformWindow for IosWindow {
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.renderer.borrow().sprite_atlas().clone()
+    }
+
+    fn background_appearance(&self) -> WindowBackgroundAppearance {
+        WindowBackgroundAppearance::Opaque
+    }
+
+    fn is_subpixel_rendering_supported(&self) -> bool {
+        true
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

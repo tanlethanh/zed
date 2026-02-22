@@ -1,5 +1,5 @@
-pub(crate) mod dispatcher;
-pub(crate) mod display;
+pub mod dispatcher;
+pub mod display;
 pub mod events;
 pub mod ffi;
 pub mod file_picker;
@@ -9,3 +9,6 @@ pub mod window;
 
 #[cfg(feature = "font-kit")]
 pub(crate) mod text_system;
+
+#[cfg(feature = "font-kit")]
+pub(crate) use text_system::IosTextSystem;

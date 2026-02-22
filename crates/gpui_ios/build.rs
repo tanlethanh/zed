@@ -1,11 +1,14 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
-    #[cfg(target_os = "ios")]
-    ios_build::run();
+    // Build scripts run on the host, not the target. Use CARGO_CFG_TARGET_OS
+    // to detect the cross-compilation target instead of #[cfg(target_os)].
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "ios" {
+        ios_build::run();
+    }
 }
 
-#[cfg(target_os = "ios")]
 mod ios_build {
     use std::{
         env,
@@ -103,7 +106,6 @@ mod ios_build {
 
         let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-        // Source files from gpui that define types used in shaders
         let gpui_src_paths = [
             gpui_dir.join("src/scene.rs"),
             gpui_dir.join("src/geometry.rs"),
@@ -112,7 +114,6 @@ mod ios_build {
             gpui_dir.join("src/platform.rs"),
         ];
 
-        // Source files from this crate
         let local_src_paths = [crate_dir.join("src/metal_renderer.rs")];
 
         for src_path in gpui_src_paths.iter().chain(local_src_paths.iter()) {
@@ -135,11 +136,13 @@ mod ios_build {
 
     fn compile_metal_shaders(header_path: &Path) {
         use std::process::{self, Command};
-        let shader_path = "./src/shaders.metal";
+
+        let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let shader_path = crate_dir.join("src/shaders.metal");
         let air_output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.air");
         let metallib_output_path =
             PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metallib");
-        println!("cargo:rerun-if-changed={}", shader_path);
+        println!("cargo:rerun-if-changed={}", shader_path.display());
 
         let output = Command::new("xcrun")
             .args([
@@ -150,11 +153,11 @@ mod ios_build {
                 "-mios-version-min=16.0",
                 "-MO",
                 "-c",
-                shader_path,
-                "-include",
-                (header_path.to_str().unwrap()),
-                "-o",
             ])
+            .arg(&shader_path)
+            .arg("-include")
+            .arg(header_path)
+            .arg("-o")
             .arg(&air_output_path)
             .output()
             .unwrap();

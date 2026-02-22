@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 /// Represents an iOS display (UIScreen).
 #[derive(Debug)]
-pub(crate) struct IosDisplay {
+pub struct IosDisplay {
     /// The UIScreen object
     screen: *mut objc::runtime::Object,
 }
@@ -66,7 +66,7 @@ impl IosDisplay {
 impl PlatformDisplay for IosDisplay {
     fn id(&self) -> DisplayId {
         // iOS doesn't have display IDs like macOS, so we use the screen pointer as an ID
-        DisplayId(self.screen as u32)
+        DisplayId::new(self.screen as u32)
     }
 
     fn uuid(&self) -> Result<Uuid> {
