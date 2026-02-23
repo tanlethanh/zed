@@ -26,7 +26,8 @@ mod ios_build {
     }
 
     fn generate_dispatch_bindings() {
-        println!("cargo:rustc-link-lib=framework=System");
+        // libdispatch is part of libSystem on iOS (not a separate framework)
+        println!("cargo:rustc-link-lib=dylib=System");
 
         let bindings = bindgen::Builder::default()
             .header("src/dispatch.h")
