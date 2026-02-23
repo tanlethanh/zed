@@ -4,7 +4,6 @@ use block::ConcreteBlock;
 use objc::runtime::{NO, YES};
 
 // Type aliases that replace cocoa crate dependencies (not available on iOS)
-type NSUInteger = u64;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -31,7 +30,7 @@ use image::RgbaImage;
 use core_foundation::base::TCFType;
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CAMetalLayer, CommandQueue, MTLPixelFormat, MTLResourceOptions, NSRange,
+    CAMetalLayer, CommandQueue, MTLPixelFormat, MTLResourceOptions,
     RenderPassColorAttachmentDescriptorRef,
 };
 use objc::{self, msg_send, sel, sel_impl};
@@ -56,11 +55,29 @@ pub(crate) type Renderer = MetalRenderer;
 pub(crate) unsafe fn new_renderer(
     context: self::Context,
     _native_window: *mut c_void,
-    _native_view: *mut c_void,
+    native_view: *mut c_void,
     _bounds: gpui::Size<f32>,
     transparent: bool,
 ) -> Renderer {
-    MetalRenderer::new(context, transparent)
+    let mut renderer = MetalRenderer::new(context, transparent);
+
+    // On iOS, the UIView's layer IS the CAMetalLayer (via +layerClass).
+    // Replace the renderer's standalone layer with the view's layer so
+    // that drawables are presented on screen.
+    if !native_view.is_null() {
+        let view = native_view as *mut objc::runtime::Object;
+        let layer_ptr: *mut objc::runtime::Object = msg_send![view, layer];
+        // Retain because MetalLayer::from_ptr takes ownership of +1 ref.
+        let _: *mut objc::runtime::Object = msg_send![layer_ptr, retain];
+        let layer = metal::MetalLayer::from_ptr(layer_ptr as *mut _);
+        layer.set_device(&renderer.device);
+        layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        layer.set_opaque(!transparent);
+        layer.set_maximum_drawable_count(3);
+        renderer.layer = layer;
+    }
+
+    renderer
 }
 
 pub(crate) struct InstanceBufferPool {
@@ -92,7 +109,7 @@ impl InstanceBufferPool {
         let buffer = self.buffers.pop().unwrap_or_else(|| {
             device.new_buffer(
                 self.buffer_size as u64,
-                MTLResourceOptions::StorageModeManaged,
+                MTLResourceOptions::StorageModeShared,
             )
         });
         InstanceBuffer {
@@ -206,7 +223,7 @@ impl MetalRenderer {
         let unit_vertices = device.new_buffer_with_data(
             unit_vertices.as_ptr() as *const c_void,
             mem::size_of_val(&unit_vertices) as u64,
-            MTLResourceOptions::StorageModeManaged,
+            MTLResourceOptions::StorageModeShared,
         );
 
         let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
@@ -652,10 +669,9 @@ impl MetalRenderer {
 
         command_encoder.end_encoding();
 
-        instance_buffer.metal_buffer.did_modify_range(NSRange {
-            location: 0,
-            length: instance_offset as NSUInteger,
-        });
+        // did_modify_range is only needed for MTLStorageModeManaged (macOS).
+        // On iOS we use MTLStorageModeShared, so no sync needed.
+
         Ok(command_buffer.to_owned())
     }
 

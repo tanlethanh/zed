@@ -17,6 +17,16 @@ mod ios_build {
 
     use cbindgen::Config;
 
+    fn is_simulator() -> bool {
+        env::var("TARGET")
+            .unwrap_or_default()
+            .contains("-sim")
+    }
+
+    fn metal_sdk() -> &'static str {
+        if is_simulator() { "iphonesimulator" } else { "iphoneos" }
+    }
+
     pub fn run() {
         generate_dispatch_bindings();
 
@@ -28,6 +38,12 @@ mod ios_build {
     fn generate_dispatch_bindings() {
         // libdispatch is part of libSystem on iOS (not a separate framework)
         println!("cargo:rustc-link-lib=dylib=System");
+
+        let clang_target = if is_simulator() {
+            "--target=arm64-apple-ios-simulator"
+        } else {
+            "--target=arm64-apple-ios"
+        };
 
         let bindings = bindgen::Builder::default()
             .header("src/dispatch.h")
@@ -48,7 +64,7 @@ mod ios_build {
             .allowlist_function("dispatch_suspend")
             .allowlist_function("dispatch_source_cancel")
             .allowlist_function("dispatch_set_context")
-            .clang_arg("--target=arm64-apple-ios")
+            .clang_arg(clang_target)
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .layout_tests(false)
             .generate()
@@ -138,6 +154,7 @@ mod ios_build {
     fn compile_metal_shaders(header_path: &Path) {
         use std::process::{self, Command};
 
+        let sdk = metal_sdk();
         let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let shader_path = crate_dir.join("src/shaders.metal");
         let air_output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.air");
@@ -145,16 +162,19 @@ mod ios_build {
             PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metallib");
         println!("cargo:rerun-if-changed={}", shader_path.display());
 
-        let output = Command::new("xcrun")
-            .args([
-                "-sdk",
-                "iphoneos",
-                "metal",
-                "-gline-tables-only",
-                "-mios-version-min=16.0",
-                "-MO",
-                "-c",
-            ])
+        let mut cmd = Command::new("xcrun");
+        cmd.args([
+            "-sdk", sdk,
+            "metal",
+            "-gline-tables-only",
+            "-mios-version-min=16.0",
+            "-MO",
+            "-c",
+        ]);
+        if is_simulator() {
+            cmd.arg("-target").arg("air64-apple-ios18.1-simulator");
+        }
+        let output = cmd
             .arg(&shader_path)
             .arg("-include")
             .arg(header_path)
@@ -172,7 +192,7 @@ mod ios_build {
         }
 
         let output = Command::new("xcrun")
-            .args(["-sdk", "iphoneos", "metallib"])
+            .args(["-sdk", sdk, "metallib"])
             .arg(air_output_path)
             .arg("-o")
             .arg(metallib_output_path)
