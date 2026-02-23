@@ -22,13 +22,12 @@ mod autoresizing_mask {
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
     Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
-use core_foundation::base::TCFType;
-use foreign_types::{ForeignType, ForeignTypeRef};
+use foreign_types::ForeignType;
 use metal::{
     CAMetalLayer, CommandQueue, MTLPixelFormat, MTLResourceOptions,
     RenderPassColorAttachmentDescriptorRef,
@@ -1187,8 +1186,8 @@ impl MetalRenderer {
     fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
-        instance_buffer: &mut InstanceBuffer,
-        instance_offset: &mut usize,
+        _instance_buffer: &mut InstanceBuffer,
+        _instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {

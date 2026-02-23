@@ -20,7 +20,7 @@ use gpui::{
 use anyhow::Result;
 use core_graphics::{
     base::CGFloat,
-    geometry::{CGPoint, CGRect, CGSize},
+    geometry::{CGRect, CGSize},
 };
 use objc::{
     class,
@@ -243,14 +243,10 @@ fn register_metal_view_class() -> &'static Class {
         // and won't show the keyboard or send text input events
         // Note: UITextInput inherits from UIKeyInput and UITextInputTraits,
         // so we only need to add UITextInput
-        unsafe {
+        {
             use objc::runtime::Protocol;
-            // UITextInput includes UIKeyInput and UITextInputTraits
             if let Some(protocol) = Protocol::get("UITextInput") {
                 decl.add_protocol(protocol);
-                println!("GPUI iOS: Added UITextInput protocol to GPUIMetalView");
-            } else {
-                println!("GPUI iOS: Failed to get UITextInput protocol!");
             }
         }
 
@@ -1727,20 +1723,7 @@ impl IosWindow {
     /// Show the software keyboard
     pub fn show_keyboard(&self) {
         unsafe {
-            // Log using NSLog so it shows in Xcode console
-            let msg = objc::runtime::Sel::register("UTF8String");
-            let log_str = "GPUI iOS: show_keyboard called, calling becomeFirstResponder";
-            let ns_str: *mut Object = msg_send![class!(NSString), stringWithUTF8String: log_str.as_ptr() as *const std::ffi::c_char];
-            let _: () = msg_send![class!(NSObject), performSelector: objc::runtime::Sel::register("class") withObject: std::ptr::null::<Object>()];
-
-            // Make the Metal view (which implements UITextInput) become first responder
-            // This will trigger iOS to show the software keyboard
-            let is_first_responder: BOOL = msg_send![self.view, isFirstResponder];
-            let can_become: BOOL = msg_send![self.view, canBecomeFirstResponder];
-            println!("GPUI iOS: show_keyboard - isFirstResponder={}, canBecomeFirstResponder={}", is_first_responder != NO, can_become != NO);
-
-            let result: BOOL = msg_send![self.view, becomeFirstResponder];
-            println!("GPUI iOS: becomeFirstResponder returned: {}", result != NO);
+            let _: BOOL = msg_send![self.view, becomeFirstResponder];
         }
     }
 

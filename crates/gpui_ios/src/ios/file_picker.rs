@@ -16,7 +16,7 @@ use std::{
     cell::UnsafeCell,
     ffi::c_void,
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
 };
 
 /// Storage for pending file picker results.
@@ -217,7 +217,7 @@ pub(crate) fn prompt_for_paths(
 ///
 /// On iOS, this uses UIDocumentPickerViewController in export mode.
 pub(crate) fn prompt_for_new_path(
-    directory: &std::path::Path,
+    _directory: &std::path::Path,
     suggested_name: Option<&str>,
 ) -> oneshot::Receiver<anyhow::Result<Option<PathBuf>>> {
     let (tx, rx) = oneshot::channel();

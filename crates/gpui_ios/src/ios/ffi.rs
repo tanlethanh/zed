@@ -4,7 +4,7 @@
 //! Objective-C code in the iOS app delegate to initialize and control
 //! the GPUI application lifecycle.
 
-use gpui::{App, AppContext, Application, RequestFrameOptions, WindowOptions};
+use gpui::RequestFrameOptions;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
