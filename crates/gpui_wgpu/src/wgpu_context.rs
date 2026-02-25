@@ -24,8 +24,16 @@ impl WgpuContext {
             }
         };
 
+        // On Android, request only the Vulkan backend. Enabling both Vulkan
+        // and GL causes wgpu to initialize both backends, doubling GPU memory
+        // usage for internal driver structures on shared-memory Mali GPUs.
+        let backends = if cfg!(target_os = "android") {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::VULKAN | wgpu::Backends::GL
+        };
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -39,9 +47,19 @@ impl WgpuContext {
             adapter.get_info().backend
         );
 
-        let dual_source_blending_available = adapter
+        let mut dual_source_blending_available = adapter
             .features()
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+
+        // MoltenVK through the emulator's Vulkan proxy reports DSB as
+        // available but requesting it triggers device lost.
+        if dual_source_blending_available && Self::is_android_emulator() {
+            log::info!(
+                "[gpui_wgpu] skipping dual-source blending on emulator \
+                (MoltenVK proxy does not reliably support it)"
+            );
+            dual_source_blending_available = false;
+        }
 
         let mut required_features = wgpu::Features::empty();
         if dual_source_blending_available {
@@ -62,6 +80,18 @@ impl WgpuContext {
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         }))
         .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
+
+        // Replace the default uncaptured-error handler (which panics) with one
+        // that logs. On mobile GPUs with limited memory, transient OOM errors
+        // are survivable — the current frame is simply dropped.
+        device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+            log::error!("[gpui_wgpu] uncaptured GPU error: {error}");
+            log::error!("[gpui_wgpu] error detail: {error:?}");
+        }));
+
+        device.set_device_lost_callback(|reason, message| {
+            log::error!("[gpui_wgpu] device lost: {reason:?} — {message}");
+        });
 
         Ok(Self {
             instance,
@@ -126,6 +156,25 @@ impl WgpuContext {
 
     pub fn supports_dual_source_blending(&self) -> bool {
         self.dual_source_blending
+    }
+
+    /// Poll the GPU device to completion, ensuring all pending work and
+    /// deferred resource deletions are processed. Call this before
+    /// recreating the renderer to reclaim GPU memory from the old one.
+    pub fn poll_device_wait(&self) {
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    }
+
+    #[cfg(target_os = "android")]
+    fn is_android_emulator() -> bool {
+        // Modern emulators use goldfish_address_space; older ones use qemu_pipe.
+        std::path::Path::new("/dev/goldfish_address_space").exists()
+            || std::path::Path::new("/dev/qemu_pipe").exists()
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn is_android_emulator() -> bool {
+        false
     }
 }
 

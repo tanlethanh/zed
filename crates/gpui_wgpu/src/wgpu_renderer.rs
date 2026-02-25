@@ -495,7 +495,7 @@ impl WgpuRenderer {
         // points at shader module creation time.
         let subpixel_shader_module = if dual_source_blending {
             let subpixel_source = format!(
-                "{}\n{}",
+                "enable dual_source_blending;\n{}\n{}",
                 base_shader,
                 include_str!("shaders_subpixel.wgsl"),
             );

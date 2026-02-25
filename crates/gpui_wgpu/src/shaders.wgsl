@@ -400,16 +400,19 @@ struct GradientColor {
     color1: vec4<f32>,
 }
 
+// Individual color stop parameters instead of array<LinearColorStop, 2> to
+// avoid SPIRV-Cross type mismatch when translating storage buffer arrays to
+// Metal (MoltenVK: `const device T[N]` vs `spvUnsafeArray<T, N>`).
 fn prepare_gradient_color(tag: u32, color_space: u32,
-    solid: Hsla, colors: array<LinearColorStop, 2>) -> GradientColor {
+    solid: Hsla, stop0: LinearColorStop, stop1: LinearColorStop) -> GradientColor {
     var result = GradientColor();
 
     if (tag == 0u || tag == 2u || tag == 3u) {
         result.solid = hsla_to_rgba(solid);
     } else if (tag == 1u) {
         // The hsla_to_rgba is returns a linear sRGB color
-        result.color0 = hsla_to_rgba(colors[0].color);
-        result.color1 = hsla_to_rgba(colors[1].color);
+        result.color0 = hsla_to_rgba(stop0.color);
+        result.color1 = hsla_to_rgba(stop1.color);
 
         // Prepare color space in vertex for avoid conversion
         // in fragment shader for performance reasons
@@ -550,7 +553,8 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
         quad.background.tag,
         quad.background.color_space,
         quad.background.solid,
-        quad.background.colors
+        quad.background.colors[0],
+        quad.background.colors[1]
     );
     out.background_solid = gradient.solid;
     out.background_color0 = gradient.color0;
@@ -917,7 +921,7 @@ fn dash_alpha(t: f32, period: f32, length: f32, dash_velocity: f32, antialias_th
     let half_length = length / 2;
     // Value in [-half_period, half_period].
     // The dash is in [-half_length, half_length].
-    let centered = fmod(t + half_period - half_length, period) - half_period;
+    let centered = trunc_mod(t + half_period - half_length, period) - half_period;
     // Signed distance for the dash, negative values are inside the dash.
     let signed_distance = abs(centered) - half_length;
     // Antialiased alpha based on the signed distance.
@@ -940,8 +944,9 @@ fn quarter_ellipse_sdf(point: vec2<f32>, radii: vec2<f32>) -> f32 {
     return unit_circle_sdf * (radii.x + radii.y) * -0.5;
 }
 
-// Modulus that has the same sign as `a`.
-fn fmod(a: f32, b: f32) -> f32 {
+// Modulus that has the same sign as `a`. Named `trunc_mod` to avoid
+// conflicting with Metal's built-in `fmod` when SPIRV-Cross translates to MSL.
+fn trunc_mod(a: f32, b: f32) -> f32 {
     return a - b * trunc(a / b);
 }
 
@@ -1075,7 +1080,8 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.tag,
         background.color_space,
         background.solid,
-        background.colors,
+        background.colors[0],
+        background.colors[1],
     );
     let color = gradient_color(background, input.position.xy, bounds,
         gradient_color.solid, gradient_color.color0, gradient_color.color1);
