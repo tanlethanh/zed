@@ -156,9 +156,19 @@ pub struct PathRasterizationVertex {
 
 impl MetalRenderer {
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
+        // On iOS, `isRemovable` and `isLowPower` are macOS-only Metal properties
+        // and are not implemented on iOS GPU device classes (e.g. AGXG16GDevice on M4).
+        // Calling them raises NSInvalidArgumentException. Use system_default() directly.
+        #[cfg(target_os = "ios")]
+        let device = metal::Device::system_default().unwrap_or_else(|| {
+            log::error!("unable to access a compatible graphics device");
+            std::process::exit(1);
+        });
+
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
+        #[cfg(not(target_os = "ios"))]
         let device = if let Some(d) = metal::Device::all()
             .into_iter()
             .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
