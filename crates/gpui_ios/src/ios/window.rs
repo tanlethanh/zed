@@ -1538,6 +1538,10 @@ pub(crate) struct IosWindow {
     renderer: RefCell<metal_renderer::Renderer>,
     /// Track if a touch is currently pressed
     touch_pressed: Cell<bool>,
+    /// Optional callback to intercept raw touch events before GPUI dispatch.
+    /// Called with (pos_x, pos_y, delta_x, delta_y, phase_u8).
+    /// Returns true to consume the event (suppresses GPUI dispatch).
+    touch_interceptor: RefCell<Option<Box<dyn Fn(f32, f32, f32, f32, u8) -> bool>>>,
 }
 
 // Required for raw_window_handle
@@ -1658,6 +1662,7 @@ impl IosWindow {
                 modifiers: Cell::new(Modifiers::default()),
                 renderer: RefCell::new(renderer),
                 touch_pressed: Cell::new(false),
+                touch_interceptor: RefCell::new(None),
             };
 
             Ok(ios_window)
@@ -1688,6 +1693,14 @@ impl IosWindow {
         self.window
     }
 
+    /// Set a callback to intercept raw touch events before GPUI dispatch.
+    /// The callback receives (pos_x, pos_y, delta_x, delta_y, phase_u8) where
+    /// phase values are: 0=Began, 1=Moved, 3=Ended, 4=Cancelled.
+    /// Return true to consume the event (suppress GPUI dispatch).
+    pub fn set_touch_interceptor(&self, f: Box<dyn Fn(f32, f32, f32, f32, u8) -> bool>) {
+        *self.touch_interceptor.borrow_mut() = Some(f);
+    }
+
     pub fn handle_touch(&self, touch: *mut Object, _event: *mut Object) {
         let position = touch_location_in_view(touch, self.view);
         let phase = touch_phase(touch);
@@ -1707,6 +1720,19 @@ impl IosWindow {
             position.x - prev_position.x,
             position.y - prev_position.y,
         );
+
+        // Give the app a chance to intercept before GPUI sees the event.
+        if let Some(interceptor) = self.touch_interceptor.borrow().as_ref() {
+            if interceptor(
+                f32::from(position.x),
+                f32::from(position.y),
+                f32::from(delta.x),
+                f32::from(delta.y),
+                phase as i64 as u8,
+            ) {
+                return;
+            }
+        }
 
         let platform_input = match phase {
             UITouchPhase::Began => {
