@@ -199,6 +199,11 @@ impl MetalRenderer {
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
+            // setAutoresizingMask: is a UIView/NSView method, not a CALayer method.
+            // On macOS the Metal layer is standalone and needs this to resize with its
+            // superlayer; on iOS the layer is the UIView's backing layer and resizes
+            // automatically with the view, so calling this crashes at runtime.
+            #[cfg(not(target_os = "ios"))]
             let _: () = msg_send![
                 &*layer,
                 setAutoresizingMask: autoresizing_mask::WIDTH_SIZABLE
