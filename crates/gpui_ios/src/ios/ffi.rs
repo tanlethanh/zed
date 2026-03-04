@@ -286,13 +286,13 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
     // Safety: window_ptr must be a valid pointer to an IosWindow
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
 
-    // Take the callback, invoke it, then restore it
-    // We must complete the borrow before invoking the callback,
-    // as the callback might try to borrow the same RefCell
+    // Advance fling before the render callback so scroll events are processed
+    // in the same frame they are generated.
+    window.process_fling();
+
     let callback = window.request_frame_callback.borrow_mut().take();
     if let Some(mut cb) = callback {
         cb(RequestFrameOptions::default());
-        // Restore the callback for the next frame
         window.request_frame_callback.borrow_mut().replace(cb);
     }
 }

@@ -14,8 +14,9 @@ use crate::metal_renderer;
 use gpui::{
     AnyWindowHandle, Bounds, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, Scene, Size, TouchPhase, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, px,
+    PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    px,
 };
 use anyhow::Result;
 use core_graphics::{
@@ -41,6 +42,15 @@ use std::{
 
 const GPUI_VIEW_IVAR: &str = "gpui_view";
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
+
+const FLING_THRESHOLD: f32 = 50.0;
+
+struct TouchFling {
+    velocity_x: f32,
+    velocity_y: f32,
+    last_time: std::time::Instant,
+    position: Point<Pixels>,
+}
 
 /// NSRange structure for Objective-C interop
 #[repr(C)]
@@ -1538,6 +1548,12 @@ pub(crate) struct IosWindow {
     renderer: RefCell<metal_renderer::Renderer>,
     /// Track if a touch is currently pressed
     touch_pressed: Cell<bool>,
+    /// Exponentially-smoothed touch velocity (logical px/s) for fling detection
+    touch_velocity_x: Cell<f32>,
+    touch_velocity_y: Cell<f32>,
+    touch_last_time: RefCell<Option<std::time::Instant>>,
+    /// Active fling state after finger lift
+    fling: RefCell<Option<TouchFling>>,
 }
 
 // Required for raw_window_handle
@@ -1658,6 +1674,10 @@ impl IosWindow {
                 modifiers: Cell::new(Modifiers::default()),
                 renderer: RefCell::new(renderer),
                 touch_pressed: Cell::new(false),
+                touch_velocity_x: Cell::new(0.0),
+                touch_velocity_y: Cell::new(0.0),
+                touch_last_time: RefCell::new(None),
+                fling: RefCell::new(None),
             };
 
             Ok(ios_window)
@@ -1696,12 +1716,10 @@ impl IosWindow {
 
         self.mouse_position.set(position);
 
-        // Stationary touches carry no movement — skip early.
         if phase == UITouchPhase::Stationary {
             return;
         }
 
-        // Delta from previous touch position (zero for Began/Ended).
         let prev_position = touch_previous_location_in_view(touch, self.view);
         let delta = Point::new(
             position.x - prev_position.x,
@@ -1711,13 +1729,41 @@ impl IosWindow {
         let platform_input = match phase {
             UITouchPhase::Began => {
                 self.touch_pressed.set(true);
+                self.touch_velocity_x.set(0.0);
+                self.touch_velocity_y.set(0.0);
+                *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
+                *self.fling.borrow_mut() = None;
                 touch_began_to_mouse_down(position, tap_count, modifiers)
             }
             UITouchPhase::Moved => {
+                // Track velocity using exponential smoothing: v = 0.7*v_old + 0.3*(delta/dt)
+                let now = std::time::Instant::now();
+                let dt = self.touch_last_time.borrow()
+                    .map(|t| now.duration_since(t).as_secs_f32().max(0.001))
+                    .unwrap_or(0.016);
+                let instant_vx = f32::from(delta.x) / dt;
+                let instant_vy = f32::from(delta.y) / dt;
+                self.touch_velocity_x.set(self.touch_velocity_x.get() * 0.7 + instant_vx * 0.3);
+                self.touch_velocity_y.set(self.touch_velocity_y.get() * 0.7 + instant_vy * 0.3);
+                *self.touch_last_time.borrow_mut() = Some(now);
                 pan_gesture_to_scroll(position, delta, modifiers, phase.into())
             }
             UITouchPhase::Ended | UITouchPhase::Cancelled => {
                 self.touch_pressed.set(false);
+                // Start fling if velocity exceeds threshold
+                if phase == UITouchPhase::Ended {
+                    let vx = self.touch_velocity_x.get();
+                    let vy = self.touch_velocity_y.get();
+                    if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
+                        log::info!("[PERF] iOS fling: start vel=({:.0}, {:.0})", vx, vy);
+                        *self.fling.borrow_mut() = Some(TouchFling {
+                            velocity_x: vx,
+                            velocity_y: vy,
+                            last_time: std::time::Instant::now(),
+                            position,
+                        });
+                    }
+                }
                 touch_ended_to_mouse_up(position, tap_count, modifiers)
             }
             UITouchPhase::Stationary => unreachable!(),
@@ -1725,6 +1771,57 @@ impl IosWindow {
 
         if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
             callback(platform_input);
+        }
+    }
+
+    /// Advance the fling animation one frame. Called from `gpui_ios_request_frame`
+    /// before invoking the render callback so fling scroll events are processed
+    /// in the same frame they are generated.
+    pub(super) fn process_fling(&self) {
+        let fling_data = {
+            let fling = self.fling.borrow();
+            fling.as_ref().map(|f| (f.velocity_x, f.velocity_y, f.last_time, f.position))
+        };
+        let Some((vx, vy, last_time, position)) = fling_data else {
+            return;
+        };
+
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(last_time).as_secs_f32();
+        let friction = 0.95_f32.powf(dt * 60.0);
+        let new_vx = vx * friction;
+        let new_vy = vy * friction;
+
+        if new_vx.abs() < FLING_THRESHOLD && new_vy.abs() < FLING_THRESHOLD {
+            log::info!("[PERF] iOS fling: end");
+            *self.fling.borrow_mut() = None;
+            if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                callback(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(Point::new(px(0.0), px(0.0))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Ended,
+                }));
+            }
+            return;
+        }
+
+        {
+            let mut fling = self.fling.borrow_mut();
+            if let Some(ref mut f) = *fling {
+                f.velocity_x = new_vx;
+                f.velocity_y = new_vy;
+                f.last_time = now;
+            }
+        }
+
+        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+            callback(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(Point::new(px(new_vx * dt), px(new_vy * dt))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            }));
         }
     }
 

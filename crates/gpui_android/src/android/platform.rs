@@ -14,9 +14,11 @@ use gpui_wgpu::WgpuContext;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
     DummyKeyboardMapper, DispatchEventResult, ForegroundExecutor, Keymap, Menu, MenuItem,
-    OwnedMenu, PathPromptOptions, Platform, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow,
-    RequestFrameOptions, RunnableVariant, Task, ThermalState, WindowAppearance, WindowParams, px,
+    Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, OwnedMenu, PathPromptOptions, Pixels,
+    Platform, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, Point, RequestFrameOptions, RunnableVariant,
+    ScrollDelta, ScrollWheelEvent, Task, ThermalState, TouchPhase, WindowAppearance, WindowParams,
+    point, px,
 };
 
 use super::dispatcher::{AndroidDispatcher, AndroidQueueReceiver};
@@ -25,6 +27,34 @@ use super::text_system::CosmicTextSystem;
 use super::window::{AndroidWindow, AndroidWindowState};
 
 pub const DOUBLE_CLICK_DISTANCE: gpui::Pixels = px(5.0);
+
+const TAP_SLOP: f32 = 4.0;
+const FLING_THRESHOLD: f32 = 50.0;
+
+struct FlingState {
+    velocity_x: f32,
+    velocity_y: f32,
+    last_time: std::time::Instant,
+    position: Point<Pixels>,
+}
+
+struct TouchState {
+    last_position: Option<(f32, f32)>,
+    down_position: Option<(f32, f32)>,
+    is_drag: bool,
+    fling: Option<FlingState>,
+}
+
+impl TouchState {
+    fn new() -> Self {
+        Self {
+            last_position: None,
+            down_position: None,
+            is_drag: false,
+            fling: None,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct PlatformHandlers {
@@ -82,6 +112,7 @@ pub struct AndroidPlatform {
     wgpu_context: RefCell<Option<Arc<WgpuContext>>>,
     windows: RefCell<Vec<RcWeak<RefCell<AndroidWindowState>>>>,
     display_scale: Cell<f32>,
+    touch_state: RefCell<TouchState>,
 }
 
 impl AndroidPlatform {
@@ -103,6 +134,7 @@ impl AndroidPlatform {
             wgpu_context: RefCell::new(None),
             windows: RefCell::new(Vec::new()),
             display_scale: Cell::new(3.0),
+            touch_state: RefCell::new(TouchState::new()),
         }
     }
 
@@ -205,6 +237,179 @@ impl AndroidPlatform {
                 runnable.run();
             }
         }
+    }
+
+    /// Handle a raw Android touch event (ACTION_DOWN/MOVE/UP/CANCEL).
+    ///
+    /// Converts physical pixel coordinates to logical pixels, performs tap vs drag
+    /// detection, and dispatches GPUI `PlatformInput` events. All drags become
+    /// `ScrollWheelEvent` so GPUI scroll handlers receive them uniformly — the
+    /// same model as iOS UIKit pan gestures.
+    pub fn handle_touch(&self, action: i32, x: f32, y: f32) {
+        let scale = self.display_scale.get();
+        let logical_x = x / scale;
+        let logical_y = y / scale;
+        let position = point(px(logical_x), px(logical_y));
+
+        match action {
+            0 => {
+                // ACTION_DOWN
+                let mut state = self.touch_state.borrow_mut();
+                state.fling = None;
+                state.down_position = Some((logical_x, logical_y));
+                state.last_position = Some((logical_x, logical_y));
+                state.is_drag = false;
+            }
+            1 => {
+                // ACTION_UP
+                let (is_drag, _last_pos) = {
+                    let mut state = self.touch_state.borrow_mut();
+                    let is_drag = state.is_drag;
+                    let last_pos = state.last_position;
+                    state.last_position = None;
+                    state.down_position = None;
+                    state.is_drag = false;
+                    (is_drag, last_pos)
+                };
+                if !is_drag {
+                    self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }));
+                } else {
+                    self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Ended,
+                    }));
+                }
+                self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }));
+            }
+            2 => {
+                // ACTION_MOVE
+                let (scroll_delta, should_scroll) = {
+                    let mut state = self.touch_state.borrow_mut();
+                    if !state.is_drag {
+                        if let Some((down_x, down_y)) = state.down_position {
+                            let dx = logical_x - down_x;
+                            let dy = logical_y - down_y;
+                            if (dx * dx + dy * dy).sqrt() > TAP_SLOP {
+                                state.is_drag = true;
+                            }
+                        }
+                    }
+                    if state.is_drag {
+                        let delta = state.last_position.map(|(last_x, last_y)| {
+                            (logical_x - last_x, logical_y - last_y)
+                        });
+                        state.last_position = Some((logical_x, logical_y));
+                        (delta, true)
+                    } else {
+                        state.last_position = Some((logical_x, logical_y));
+                        (None, false)
+                    }
+                };
+                if should_scroll {
+                    if let Some((dx, dy)) = scroll_delta {
+                        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position,
+                            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                            modifiers: Modifiers::default(),
+                            touch_phase: TouchPhase::Moved,
+                        }));
+                    }
+                }
+            }
+            3 => {
+                // ACTION_CANCEL
+                let mut state = self.touch_state.borrow_mut();
+                state.last_position = None;
+                state.down_position = None;
+                state.is_drag = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a fling gesture (velocity in physical pixels/second from Android VelocityTracker).
+    pub fn handle_fling(&self, velocity_x: f32, velocity_y: f32) {
+        let scale = self.display_scale.get();
+        let vx = velocity_x / scale;
+        let vy = velocity_y / scale;
+
+        let mut state = self.touch_state.borrow_mut();
+        let position = state.last_position
+            .map(|(x, y)| point(px(x), px(y)))
+            .unwrap_or_default();
+
+        if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
+            log::info!("[PERF] fling: start vel=({:.0}, {:.0})", vx, vy);
+            state.fling = Some(FlingState {
+                velocity_x: vx,
+                velocity_y: vy,
+                last_time: std::time::Instant::now(),
+                position,
+            });
+        }
+    }
+
+    /// Returns true if a fling animation is currently active.
+    pub fn has_active_fling(&self) -> bool {
+        self.touch_state.borrow().fling.is_some()
+    }
+
+    /// Advance fling one frame — apply friction and dispatch scroll events.
+    pub fn process_fling(&self) {
+        let fling_data = {
+            let state = self.touch_state.borrow();
+            state.fling.as_ref().map(|f| (f.velocity_x, f.velocity_y, f.last_time, f.position))
+        };
+        let Some((vx, vy, last_time, position)) = fling_data else {
+            return;
+        };
+
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(last_time).as_secs_f32();
+        let friction = 0.95_f32.powf(dt * 60.0);
+        let new_vx = vx * friction;
+        let new_vy = vy * friction;
+
+        if new_vx.abs() < FLING_THRESHOLD && new_vy.abs() < FLING_THRESHOLD {
+            log::info!("[PERF] fling: end");
+            self.touch_state.borrow_mut().fling = None;
+            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Ended,
+            }));
+            return;
+        }
+
+        {
+            let mut state = self.touch_state.borrow_mut();
+            if let Some(ref mut f) = state.fling {
+                f.velocity_x = new_vx;
+                f.velocity_y = new_vy;
+                f.last_time = now;
+            }
+        }
+
+        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(new_vx * dt), px(new_vy * dt))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        }));
     }
 
     fn with_common<R>(&self, f: impl FnOnce(&mut AndroidCommon) -> R) -> R {
