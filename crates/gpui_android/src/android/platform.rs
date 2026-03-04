@@ -272,6 +272,10 @@ impl AndroidPlatform {
                     (is_drag, last_pos)
                 };
                 if !is_drag {
+                    // Discard any fling: Java forwards velocity unconditionally, but
+                    // tap classification happens here. A fling after a tap would cause
+                    // spurious scrolling.
+                    self.touch_state.borrow_mut().fling = None;
                     self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
                         button: MouseButton::Left,
                         position,
