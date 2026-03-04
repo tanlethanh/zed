@@ -1249,6 +1249,18 @@ fn register_metal_view_class() -> &'static Class {
                 presses_ended as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
             );
 
+            // Tap-to-dismiss: resign first responder (hides keyboard) when tapped.
+            // Triggered by the UITapGestureRecognizer added in IosWindow::new.
+            extern "C" fn dismiss_keyboard_on_tap(this: &mut Object, _sel: Sel, _recognizer: *mut Object) {
+                unsafe {
+                    let _: BOOL = msg_send![this, resignFirstResponder];
+                }
+            }
+            decl.add_method(
+                sel!(dismissKeyboardOnTap:),
+                dismiss_keyboard_on_tap as extern "C" fn(&mut Object, Sel, *mut Object),
+            );
+
             // ============================================
             // UITextInput Protocol - Core Properties
             // ============================================
@@ -1599,9 +1611,15 @@ impl IosWindow {
             // Make the window visible
             let _: () = msg_send![window, makeKeyAndVisible];
 
-            // Make the Metal view first responder for keyboard input
-            // The GPUIMetalView implements UITextInput protocol for text input
-            let _: () = msg_send![view, becomeFirstResponder];
+            // Attach a tap gesture recognizer so tapping the Metal view dismisses
+            // the keyboard (calls resignFirstResponder on the view).
+            // cancelsTouchesInView:NO lets GPUI also receive the touch events.
+            let tap: *mut Object = msg_send![class!(UITapGestureRecognizer), alloc];
+            let tap: *mut Object =
+                msg_send![tap, initWithTarget: view action: sel!(dismissKeyboardOnTap:)];
+            let _: () = msg_send![tap, setCancelsTouchesInView: NO];
+            let _: () = msg_send![view, addGestureRecognizer: tap];
+            let _: () = msg_send![tap, release];
 
             // Create the Metal renderer
             // Note: Blade expects size in pixels (device pixels), not points
@@ -1731,9 +1749,10 @@ impl IosWindow {
     pub fn hide_keyboard(&self) {
         log::info!("GPUI iOS: Hiding keyboard");
         unsafe {
-            // Resign first responder to hide keyboard
             let _: BOOL = msg_send![self.view, resignFirstResponder];
         }
+        // Reset so the keyboard can be shown again when a text input next gets focus.
+        self.keyboard_shown.set(false);
     }
 
     /// Handle text input from the software keyboard
