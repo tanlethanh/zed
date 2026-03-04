@@ -14,8 +14,8 @@ use crate::metal_renderer;
 use gpui::{
     AnyWindowHandle, Bounds, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, Scene, Size, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowParams, px,
+    PromptLevel, RequestFrameOptions, Scene, Size, TouchPhase, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, px,
 };
 use anyhow::Result;
 use core_graphics::{
@@ -1696,19 +1696,31 @@ impl IosWindow {
 
         self.mouse_position.set(position);
 
+        // Stationary touches carry no movement — skip early.
+        if phase == UITouchPhase::Stationary {
+            return;
+        }
+
+        // Delta from previous touch position (zero for Began/Ended).
+        let prev_position = touch_previous_location_in_view(touch, self.view);
+        let delta = Point::new(
+            position.x - prev_position.x,
+            position.y - prev_position.y,
+        );
+
         let platform_input = match phase {
             UITouchPhase::Began => {
                 self.touch_pressed.set(true);
                 touch_began_to_mouse_down(position, tap_count, modifiers)
             }
             UITouchPhase::Moved => {
-                touch_moved_to_mouse_move(position, modifiers, Some(gpui::MouseButton::Left))
+                pan_gesture_to_scroll(position, delta, modifiers, phase.into())
             }
             UITouchPhase::Ended | UITouchPhase::Cancelled => {
                 self.touch_pressed.set(false);
                 touch_ended_to_mouse_up(position, tap_count, modifiers)
             }
-            UITouchPhase::Stationary => return,
+            UITouchPhase::Stationary => unreachable!(),
         };
 
         if let Some(callback) = self.input_callback.borrow_mut().as_mut() {

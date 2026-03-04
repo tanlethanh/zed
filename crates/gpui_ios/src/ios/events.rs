@@ -75,6 +75,14 @@ pub fn touch_tap_count(touch: *mut Object) -> u32 {
     }
 }
 
+/// Get the previous location of a UITouch in the given view (for computing scroll delta)
+pub fn touch_previous_location_in_view(touch: *mut Object, view: *mut Object) -> Point<Pixels> {
+    unsafe {
+        let location: CGPoint = msg_send![touch, previousLocationInView: view];
+        Point::new(px(location.x as f32), px(location.y as f32))
+    }
+}
+
 /// Convert a single touch began event to a mouse down event
 pub fn touch_began_to_mouse_down(
     position: Point<Pixels>,
