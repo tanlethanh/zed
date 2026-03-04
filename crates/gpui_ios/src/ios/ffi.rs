@@ -376,26 +376,6 @@ pub extern "C" fn gpui_ios_handle_key_event(
     window.handle_key_event(key_code, modifiers, is_key_down);
 }
 
-/// Register a raw-touch interceptor on the most recently created window.
-///
-/// The callback receives (pos_x, pos_y, delta_x, delta_y, phase_u8) where
-/// phase values mirror UITouchPhase: 0=Began, 1=Moved, 3=Ended, 4=Cancelled.
-/// Return true to consume the event and suppress GPUI dispatch.
-///
-/// Must be called after the window exists (after gpui_ios_did_finish_launching).
-pub fn set_touch_interceptor(handler: Box<dyn Fn(f32, f32, f32, f32, u8) -> bool>) {
-    if let Some(wrapper) = IOS_WINDOW_LIST.get() {
-        unsafe {
-            let windows = &*wrapper.0.get();
-            if let Some(&window_ptr) = windows.last() {
-                if !window_ptr.is_null() {
-                    (*window_ptr).set_touch_interceptor(handler);
-                }
-            }
-        }
-    }
-}
-
 /// Get the UIWindow from a GPUI window.
 ///
 /// # Safety
