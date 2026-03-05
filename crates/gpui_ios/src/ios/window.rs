@@ -1561,6 +1561,9 @@ pub(crate) struct IosWindow {
     /// Position where the primary touch began (used as scroll event origin so
     /// DrawerHost's edge-zone check reflects the gesture start, not current pos)
     touch_down_position: Cell<Point<Pixels>>,
+    /// Timestamp of the last dispatched Moved event (UITouch.timestamp, seconds since boot).
+    /// Used to skip duplicate Moved callbacks that UIKit fires for the same touch sample.
+    last_move_ts: Cell<f64>,
 }
 
 // Required for raw_window_handle
@@ -1634,16 +1637,6 @@ impl IosWindow {
             // Make the window visible
             let _: () = msg_send![window, makeKeyAndVisible];
 
-            // Attach a tap gesture recognizer so tapping the Metal view dismisses
-            // the keyboard (calls resignFirstResponder on the view).
-            // cancelsTouchesInView:NO lets GPUI also receive the touch events.
-            let tap: *mut Object = msg_send![class!(UITapGestureRecognizer), alloc];
-            let tap: *mut Object =
-                msg_send![tap, initWithTarget: view action: sel!(dismissKeyboardOnTap:)];
-            let _: () = msg_send![tap, setCancelsTouchesInView: NO];
-            let _: () = msg_send![view, addGestureRecognizer: tap];
-            let _: () = msg_send![tap, release];
-
             // Create the Metal renderer
             // Note: Blade expects size in pixels (device pixels), not points
             let renderer = metal_renderer::new_renderer(
@@ -1687,6 +1680,7 @@ impl IosWindow {
                 touch_last_time: RefCell::new(None),
                 fling: RefCell::new(None),
                 touch_down_position: Cell::new(Point::default()),
+                last_move_ts: Cell::new(0.0),
             };
 
             Ok(ios_window)
@@ -1745,6 +1739,7 @@ impl IosWindow {
                     self.touch_pressed.set(true);
                     self.touch_velocity_x.set(0.0);
                     self.touch_velocity_y.set(0.0);
+                    self.last_move_ts.set(0.0);
                     *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
                     *self.fling.borrow_mut() = None;
                     log::debug!("[touch] Began: pos=({:.1},{:.1}) ptr={:#x}",
@@ -1764,6 +1759,14 @@ impl IosWindow {
                 if touch_ptr != self.primary_touch_ptr.get() {
                     return;
                 }
+                // Skip duplicate Moved callbacks: UIKit sometimes delivers the same touch
+                // sample twice (e.g. due to UITextInput protocol interaction). Deduplicate
+                // by comparing UITouch.timestamp — identical timestamps mean the same sample.
+                let ts: f64 = unsafe { msg_send![touch, timestamp] };
+                if ts == self.last_move_ts.get() {
+                    return;
+                }
+                self.last_move_ts.set(ts);
                 // Track velocity using exponential smoothing: v = 0.7*v_old + 0.3*(delta/dt)
                 let now = std::time::Instant::now();
                 let dt = self.touch_last_time.borrow()
@@ -1886,6 +1889,11 @@ impl IosWindow {
                 insets.right as f32,
             )
         }
+    }
+
+    /// Whether the software keyboard is currently visible (view is first responder).
+    pub fn is_keyboard_shown(&self) -> bool {
+        unsafe { msg_send![self.view, isFirstResponder] }
     }
 
     /// Show the software keyboard

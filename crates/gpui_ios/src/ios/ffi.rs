@@ -297,6 +297,16 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
     }
 }
 
+/// Returns true when the software keyboard is visible (view is first responder).
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_is_keyboard_visible(window_ptr: *mut c_void) -> bool {
+    if window_ptr.is_null() {
+        return false;
+    }
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.is_keyboard_shown()
+}
+
 /// Show the software keyboard.
 ///
 /// Call this when a text input field gains focus.
