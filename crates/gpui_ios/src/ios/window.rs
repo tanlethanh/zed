@@ -1548,12 +1548,19 @@ pub(crate) struct IosWindow {
     renderer: RefCell<metal_renderer::Renderer>,
     /// Track if a touch is currently pressed
     touch_pressed: Cell<bool>,
+    /// Raw UITouch pointer value of the primary (first-down) finger.
+    /// 0 means no primary touch is active. Secondary touches are suppressed
+    /// to prevent double-scroll events when two fingers are on screen.
+    primary_touch_ptr: Cell<usize>,
     /// Exponentially-smoothed touch velocity (logical px/s) for fling detection
     touch_velocity_x: Cell<f32>,
     touch_velocity_y: Cell<f32>,
     touch_last_time: RefCell<Option<std::time::Instant>>,
     /// Active fling state after finger lift
     fling: RefCell<Option<TouchFling>>,
+    /// Position where the primary touch began (used as scroll event origin so
+    /// DrawerHost's edge-zone check reflects the gesture start, not current pos)
+    touch_down_position: Cell<Point<Pixels>>,
 }
 
 // Required for raw_window_handle
@@ -1674,10 +1681,12 @@ impl IosWindow {
                 modifiers: Cell::new(Modifiers::default()),
                 renderer: RefCell::new(renderer),
                 touch_pressed: Cell::new(false),
+                primary_touch_ptr: Cell::new(0),
                 touch_velocity_x: Cell::new(0.0),
                 touch_velocity_y: Cell::new(0.0),
                 touch_last_time: RefCell::new(None),
                 fling: RefCell::new(None),
+                touch_down_position: Cell::new(Point::default()),
             };
 
             Ok(ios_window)
@@ -1709,6 +1718,7 @@ impl IosWindow {
     }
 
     pub fn handle_touch(&self, touch: *mut Object, _event: *mut Object) {
+        let touch_ptr = touch as usize;
         let position = touch_location_in_view(touch, self.view);
         let phase = touch_phase(touch);
         let tap_count = touch_tap_count(touch);
@@ -1728,14 +1738,32 @@ impl IosWindow {
 
         let platform_input = match phase {
             UITouchPhase::Began => {
-                self.touch_pressed.set(true);
-                self.touch_velocity_x.set(0.0);
-                self.touch_velocity_y.set(0.0);
-                *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
-                *self.fling.borrow_mut() = None;
-                touch_began_to_mouse_down(position, tap_count, modifiers)
+                if self.primary_touch_ptr.get() == 0 {
+                    // First finger down — register as primary and start tracking.
+                    self.primary_touch_ptr.set(touch_ptr);
+                    self.touch_down_position.set(position);
+                    self.touch_pressed.set(true);
+                    self.touch_velocity_x.set(0.0);
+                    self.touch_velocity_y.set(0.0);
+                    *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
+                    *self.fling.borrow_mut() = None;
+                    log::debug!("[touch] Began: pos=({:.1},{:.1}) ptr={:#x}",
+                        f32::from(position.x), f32::from(position.y), touch_ptr);
+                    touch_began_to_mouse_down(position, tap_count, modifiers)
+                } else {
+                    // Secondary finger down — cancel fling/velocity to prevent
+                    // cross-contamination with the primary finger's scroll state.
+                    log::debug!("[touch] Began: secondary finger suppressed ptr={:#x}", touch_ptr);
+                    *self.fling.borrow_mut() = None;
+                    self.touch_velocity_x.set(0.0);
+                    self.touch_velocity_y.set(0.0);
+                    return;
+                }
             }
             UITouchPhase::Moved => {
+                if touch_ptr != self.primary_touch_ptr.get() {
+                    return;
+                }
                 // Track velocity using exponential smoothing: v = 0.7*v_old + 0.3*(delta/dt)
                 let now = std::time::Instant::now();
                 let dt = self.touch_last_time.borrow()
@@ -1746,10 +1774,23 @@ impl IosWindow {
                 self.touch_velocity_x.set(self.touch_velocity_x.get() * 0.7 + instant_vx * 0.3);
                 self.touch_velocity_y.set(self.touch_velocity_y.get() * 0.7 + instant_vy * 0.3);
                 *self.touch_last_time.borrow_mut() = Some(now);
-                pan_gesture_to_scroll(position, delta, modifiers, phase.into())
+                // Use the DOWN position so DrawerHost's edge-zone check (pos_x < EDGE_ZONE)
+                // sees where the gesture started, not where the finger currently is.
+                let down_pos = self.touch_down_position.get();
+                log::debug!("[touch] Moved: cur=({:.1},{:.1}) delta=({:.1},{:.1}) down=({:.1},{:.1})",
+                    f32::from(position.x), f32::from(position.y),
+                    f32::from(delta.x), f32::from(delta.y),
+                    f32::from(down_pos.x), f32::from(down_pos.y));
+                pan_gesture_to_scroll(down_pos, delta, modifiers, phase.into())
             }
             UITouchPhase::Ended | UITouchPhase::Cancelled => {
+                if touch_ptr != self.primary_touch_ptr.get() {
+                    return;
+                }
+                self.primary_touch_ptr.set(0);
                 self.touch_pressed.set(false);
+                log::debug!("[touch] Ended/Cancelled: pos=({:.1},{:.1})",
+                    f32::from(position.x), f32::from(position.y));
                 // Start fling if velocity exceeds threshold
                 if phase == UITouchPhase::Ended {
                     let vx = self.touch_velocity_x.get();
