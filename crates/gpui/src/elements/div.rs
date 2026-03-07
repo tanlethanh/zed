@@ -47,6 +47,9 @@ use super::ImageCacheProvider;
 const DRAG_THRESHOLD: f64 = 2.;
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
+const LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
+/// How far (logical px) a touch may drift before a long press is cancelled.
+const LONG_PRESS_MOVE_THRESHOLD: f64 = 8.;
 
 /// The styling information for a given group.
 pub struct GroupStyle {
@@ -520,6 +523,19 @@ impl Interactivity {
         self.click_listeners.push(Rc::new(move |event, window, cx| {
             listener(event, window, cx)
         }));
+    }
+
+    /// Bind the given callback to long-press events on this element (fires after the pointer has
+    /// been held down without moving for [`LONG_PRESS_DURATION`]).
+    /// The imperative API equivalent to [`StatefulInteractiveElement::on_long_press`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn on_long_press(
+        &mut self,
+        listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.long_press_listeners
+            .push(Rc::new(move |event, window, cx| listener(event, window, cx)));
     }
 
     /// Bind the given callback to non-primary click events of this element.
@@ -1204,6 +1220,22 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Bind the given callback to long-press events on this element (fires after the pointer has
+    /// been held down without moving for 500ms).
+    /// The fluent API equivalent to [`Interactivity::on_long_press`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_long_press(
+        mut self,
+        listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_long_press(listener);
+        self
+    }
+
     /// Bind the given callback to non-primary click events of this element.
     /// The fluent API equivalent to [`Interactivity::on_aux_click`].
     ///
@@ -1291,6 +1323,9 @@ pub(crate) type ScrollWheelListener =
     Box<dyn Fn(&ScrollWheelEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+
+pub(crate) type LongPressListener =
+    Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) type DragListener =
     Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>;
@@ -1652,6 +1687,7 @@ pub struct Interactivity {
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
     pub(crate) click_listeners: Vec<ClickListener>,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
+    pub(crate) long_press_listeners: Vec<LongPressListener>,
     pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
@@ -1846,6 +1882,7 @@ impl Interactivity {
             || !self.mouse_move_listeners.is_empty()
             || !self.click_listeners.is_empty()
             || !self.aux_click_listeners.is_empty()
+            || !self.long_press_listeners.is_empty()
             || !self.scroll_wheel_listeners.is_empty()
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
@@ -2269,6 +2306,7 @@ impl Interactivity {
         let drop_listeners = mem::take(&mut self.drop_listeners);
         let click_listeners = mem::take(&mut self.click_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
+        let long_press_listeners = mem::take(&mut self.long_press_listeners);
         let can_drop_predicate = mem::take(&mut self.can_drop_predicate);
 
         if !drop_listeners.is_empty() {
@@ -2443,6 +2481,76 @@ impl Interactivity {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                });
+            }
+
+            if !long_press_listeners.is_empty() {
+                let pending_long_press = element_state
+                    .pending_long_press
+                    .get_or_insert_with(Default::default)
+                    .clone();
+                // If click listeners were registered they share this pending_mouse_down
+                // reference. Clear it when the long press fires so the click does not
+                // also fire when the finger is eventually lifted.
+                let pending_click_to_cancel = element_state.pending_mouse_down.clone();
+
+                window.on_mouse_event({
+                    let pending_long_press = pending_long_press.clone();
+                    let hitbox = hitbox.clone();
+                    let long_press_listeners = long_press_listeners.clone();
+                    move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble
+                            && event.button == MouseButton::Left
+                            && hitbox.is_hovered(window)
+                        {
+                            let down_position = event.position;
+                            let event = event.clone();
+                            let task = window.spawn(cx, {
+                                let pending_long_press = pending_long_press.clone();
+                                let pending_click_to_cancel = pending_click_to_cancel.clone();
+                                let long_press_listeners = long_press_listeners.clone();
+                                async move |cx| {
+                                    cx.background_executor().timer(LONG_PRESS_DURATION).await;
+                                    cx.update(|window, cx| {
+                                        pending_long_press.borrow_mut().take();
+                                        if let Some(pending_click) = &pending_click_to_cancel {
+                                            pending_click.borrow_mut().take();
+                                        }
+                                        for listener in &long_press_listeners {
+                                            listener(&event, window, cx);
+                                        }
+                                        window.refresh();
+                                    })
+                                    .ok();
+                                }
+                            });
+                            *pending_long_press.borrow_mut() = Some((down_position, task));
+                        }
+                    }
+                });
+
+                window.on_mouse_event({
+                    let pending_long_press = pending_long_press.clone();
+                    move |_: &MouseUpEvent, _phase, _window, _cx| {
+                        pending_long_press.borrow_mut().take();
+                    }
+                });
+
+                window.on_mouse_event({
+                    move |event: &MouseMoveEvent, phase, _window, _cx| {
+                        if phase == DispatchPhase::Capture {
+                            return;
+                        }
+                        let down_position =
+                            pending_long_press.borrow().as_ref().map(|(pos, _)| *pos);
+                        if let Some(down_position) = down_position {
+                            if (event.position - down_position).magnitude()
+                                > LONG_PRESS_MOVE_THRESHOLD
+                            {
+                                pending_long_press.borrow_mut().take();
                             }
                         }
                     }
@@ -2806,6 +2914,10 @@ pub struct InteractiveElementState {
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+    /// Pending long-press state: (touch-down position, cancellation task).
+    /// Dropping the Task cancels the timer before it fires.
+    pub(crate) pending_long_press:
+        Option<Rc<RefCell<Option<(Point<Pixels>, Task<()>)>>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
