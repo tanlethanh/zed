@@ -297,6 +297,28 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
     }
 }
 
+/// Request a frame to be rendered unconditionally (force_render = true).
+///
+/// Use this when there is known pending state (e.g. terminal output, callbacks)
+/// that requires GPUI to re-render even if no views have been explicitly notified.
+/// Mirrors Android's `platform.request_frame_forced()`.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_request_frame_forced(window_ptr: *mut c_void) {
+    if window_ptr.is_null() {
+        return;
+    }
+
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+
+    window.process_fling();
+
+    let callback = window.request_frame_callback.borrow_mut().take();
+    if let Some(mut cb) = callback {
+        cb(RequestFrameOptions { force_render: true, ..Default::default() });
+        window.request_frame_callback.borrow_mut().replace(cb);
+    }
+}
+
 /// Returns true when the software keyboard is visible (view is first responder).
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_is_keyboard_visible(window_ptr: *mut c_void) -> bool {
