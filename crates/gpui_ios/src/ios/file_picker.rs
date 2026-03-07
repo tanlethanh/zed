@@ -3,13 +3,13 @@
 //! This module provides file selection functionality for iOS, bridging
 //! between GPUI's Platform trait and iOS's document picker APIs.
 
-use gpui::PathPromptOptions;
 use futures::channel::oneshot;
+use gpui::PathPromptOptions;
 use objc::{
     class,
     declare::ClassDecl,
     msg_send,
-    runtime::{Class, Object, Protocol, Sel, BOOL, NO, YES},
+    runtime::{BOOL, Class, NO, Object, Protocol, Sel, YES},
     sel, sel_impl,
 };
 use std::{
@@ -56,7 +56,12 @@ fn register_delegate_class() -> &'static Class {
         decl.add_protocol(picker_delegate_protocol);
 
         // documentPicker:didPickDocumentsAtURLs: - called when user selects files
-        extern "C" fn did_pick_documents(_this: &Object, _sel: Sel, _picker: *mut Object, urls: *mut Object) {
+        extern "C" fn did_pick_documents(
+            _this: &Object,
+            _sel: Sel,
+            _picker: *mut Object,
+            urls: *mut Object,
+        ) {
             log::info!("GPUI iOS: File picker - user selected documents");
 
             unsafe {
@@ -74,9 +79,7 @@ fn register_delegate_class() -> &'static Class {
                     if !path_string.is_null() {
                         let utf8: *const i8 = msg_send![path_string, UTF8String];
                         if !utf8.is_null() {
-                            let path_str = std::ffi::CStr::from_ptr(utf8)
-                                .to_str()
-                                .unwrap_or("");
+                            let path_str = std::ffi::CStr::from_ptr(utf8).to_str().unwrap_or("");
                             if !path_str.is_empty() {
                                 paths.push(PathBuf::from(path_str));
                             }
@@ -167,7 +170,8 @@ pub(crate) fn prompt_for_paths(
         // Create UIDocumentPickerViewController
         // iOS 14+: initForOpeningContentTypes:asCopy:
         let picker: *mut Object = msg_send![class!(UIDocumentPickerViewController), alloc];
-        let picker: *mut Object = msg_send![picker, initForOpeningContentTypes: ut_types asCopy: NO];
+        let picker: *mut Object =
+            msg_send![picker, initForOpeningContentTypes: ut_types asCopy: NO];
 
         // Configure the picker
         let _: () = msg_send![picker, setDelegate: delegate];
