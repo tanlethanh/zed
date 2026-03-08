@@ -136,6 +136,11 @@ const NS_NOT_FOUND: u64 = u64::MAX;
 
 static METAL_VIEW_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
 
+/// Global pointer to the UIView displayed above the software keyboard (inputAccessoryView).
+/// Set from Obj-C via `gpui_ios_set_keyboard_accessory_view`.
+static KEYBOARD_ACCESSORY_VIEW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 // Declare NSLog extern once at module level
 unsafe extern "C" {
     fn NSLog(format: *mut Object, ...);
@@ -305,6 +310,12 @@ fn register_metal_view_class() -> &'static Class {
         // Make view focusable for keyboard input
         extern "C" fn can_become_first_responder(_this: &Object, _sel: Sel) -> bool {
             true
+        }
+
+        // Return the view shown above the software keyboard (set via gpui_ios_set_keyboard_accessory_view).
+        extern "C" fn input_accessory_view(_this: &Object, _sel: Sel) -> *mut Object {
+            let ptr = KEYBOARD_ACCESSORY_VIEW.load(std::sync::atomic::Ordering::Relaxed);
+            ptr as *mut Object
         }
 
         // UITextInputTraits - keyboard type (default)
@@ -1406,12 +1417,24 @@ fn register_metal_view_class() -> &'static Class {
                 sel!(setBaseWritingDirection:forRange:),
                 set_base_writing_direction as extern "C" fn(&mut Object, Sel, i64, *mut Object),
             );
+
+            decl.add_method(
+                sel!(inputAccessoryView),
+                input_accessory_view as extern "C" fn(&Object, Sel) -> *mut Object,
+            );
         }
 
         decl.register();
     });
 
     class!(GPUIMetalView)
+}
+
+/// Store the UIView pointer to use as `inputAccessoryView` on GPUIMetalView.
+///
+/// Called from `gpui_ios_set_keyboard_accessory_view` in ffi.rs.
+pub(super) fn set_keyboard_accessory_view(view_ptr: *mut c_void) {
+    KEYBOARD_ACCESSORY_VIEW.store(view_ptr as usize, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Handle touch events from the GPUIMetalView

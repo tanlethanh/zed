@@ -345,6 +345,16 @@ pub extern "C" fn gpui_ios_show_keyboard(window_ptr: *mut c_void) {
     window.show_keyboard();
 }
 
+/// Set the UIView to display above the software keyboard (inputAccessoryView).
+///
+/// Pass a pointer to a UIView (e.g., UIToolbar) obtained from Objective-C.
+/// The pointer is stored globally and returned by `inputAccessoryView` on GPUIMetalView.
+/// Pass null to remove the accessory view.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_set_keyboard_accessory_view(view_ptr: *mut c_void) {
+    super::window::set_keyboard_accessory_view(view_ptr);
+}
+
 /// Hide the software keyboard.
 ///
 /// Call this when a text input field loses focus.
