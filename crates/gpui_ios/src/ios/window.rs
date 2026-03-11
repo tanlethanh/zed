@@ -1765,13 +1765,10 @@ impl IosWindow {
                     self.last_move_ts.set(0.0);
                     *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
                     *self.fling.borrow_mut() = None;
-                    log::debug!("[touch] Began: pos=({:.1},{:.1}) ptr={:#x}",
-                        f32::from(position.x), f32::from(position.y), touch_ptr);
                     touch_began_to_mouse_down(position, tap_count, modifiers)
                 } else {
                     // Secondary finger down — cancel fling/velocity to prevent
                     // cross-contamination with the primary finger's scroll state.
-                    log::debug!("[touch] Began: secondary finger suppressed ptr={:#x}", touch_ptr);
                     *self.fling.borrow_mut() = None;
                     self.touch_velocity_x.set(0.0);
                     self.touch_velocity_y.set(0.0);
@@ -1803,10 +1800,6 @@ impl IosWindow {
                 // Use the DOWN position so DrawerHost's edge-zone check (pos_x < EDGE_ZONE)
                 // sees where the gesture started, not where the finger currently is.
                 let down_pos = self.touch_down_position.get();
-                log::debug!("[touch] Moved: cur=({:.1},{:.1}) delta=({:.1},{:.1}) down=({:.1},{:.1})",
-                    f32::from(position.x), f32::from(position.y),
-                    f32::from(delta.x), f32::from(delta.y),
-                    f32::from(down_pos.x), f32::from(down_pos.y));
                 pan_gesture_to_scroll(down_pos, delta, modifiers, phase.into())
             }
             UITouchPhase::Ended | UITouchPhase::Cancelled => {
@@ -1815,8 +1808,6 @@ impl IosWindow {
                 }
                 self.primary_touch_ptr.set(0);
                 self.touch_pressed.set(false);
-                log::debug!("[touch] Ended/Cancelled: pos=({:.1},{:.1})",
-                    f32::from(position.x), f32::from(position.y));
                 // Start fling if velocity exceeds threshold
                 if phase == UITouchPhase::Ended {
                     let vx = self.touch_velocity_x.get();
