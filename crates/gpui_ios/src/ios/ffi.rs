@@ -355,6 +355,15 @@ pub extern "C" fn gpui_ios_set_keyboard_accessory_view(view_ptr: *mut c_void) {
     super::window::set_keyboard_accessory_view(view_ptr);
 }
 
+/// Track whether the iOS software keyboard is currently visible.
+///
+/// Called from ObjC keyboard notifications (keyboardWillShow / keyboardWillHide).
+/// Controls whether `inputAccessoryView` returns the toolbar or nil.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_set_software_keyboard_visible(visible: bool) {
+    super::window::set_software_keyboard_visible(visible);
+}
+
 /// Hide the software keyboard.
 ///
 /// Call this when a text input field loses focus.

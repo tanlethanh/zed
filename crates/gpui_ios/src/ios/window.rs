@@ -141,6 +141,12 @@ static METAL_VIEW_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
 static KEYBOARD_ACCESSORY_VIEW: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Whether the iOS software keyboard is currently visible (set via keyboard notifications).
+/// `inputAccessoryView` returns nil when this is false, preventing the toolbar from
+/// appearing without a software keyboard (e.g. on simulator with hardware keyboard).
+static SOFTWARE_KEYBOARD_VISIBLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // Declare NSLog extern once at module level
 unsafe extern "C" {
     fn NSLog(format: *mut Object, ...);
@@ -313,7 +319,12 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // Return the view shown above the software keyboard (set via gpui_ios_set_keyboard_accessory_view).
+        // Only returns the toolbar when the software keyboard is actually visible,
+        // preventing a floating toolbar on simulator with hardware keyboard.
         extern "C" fn input_accessory_view(_this: &Object, _sel: Sel) -> *mut Object {
+            if !SOFTWARE_KEYBOARD_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+                return ptr::null_mut();
+            }
             let ptr = KEYBOARD_ACCESSORY_VIEW.load(std::sync::atomic::Ordering::Relaxed);
             ptr as *mut Object
         }
@@ -1437,6 +1448,15 @@ pub(super) fn set_keyboard_accessory_view(view_ptr: *mut c_void) {
     KEYBOARD_ACCESSORY_VIEW.store(view_ptr as usize, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Track whether the iOS software keyboard is visible.
+///
+/// Called from ObjC keyboard notifications (`keyboardWillShow` / `keyboardWillHide`).
+/// When false, `inputAccessoryView` returns nil so the toolbar doesn't appear
+/// without a software keyboard (e.g. on simulator with hardware keyboard attached).
+pub(super) fn set_software_keyboard_visible(visible: bool) {
+    SOFTWARE_KEYBOARD_VISIBLE.store(visible, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Handle touch events from the GPUIMetalView
 fn handle_touches(view: &mut Object, touches: *mut Object, event: *mut Object) {
     unsafe {
@@ -1517,9 +1537,40 @@ fn handle_presses(view: &mut Object, presses: *mut Object, is_key_down: bool) {
                 continue;
             }
 
+            // Skip printable keys without ctrl/alt/cmd modifiers.
+            // These arrive through insertText; handling them here too would
+            // produce duplicate input (especially visible on simulator with
+            // hardware keyboard). Only non-printable keys (arrows, escape,
+            // function keys, etc.) and modified keys (ctrl+c) go through here.
+            let has_action_modifier = (modifiers & 0b1110) != 0; // ctrl | alt | cmd
+            if !has_action_modifier && !is_non_printable_key(key_code) {
+                ios_log_cstr(c"GPUI iOS: handle_presses - skipping printable key (handled by insertText)");
+                continue;
+            }
+
             window.handle_key_event(key_code as u32, modifiers, is_key_down);
         }
     }
+}
+
+/// Returns true for key codes that do NOT generate `insertText` calls
+/// (non-printable keys). Only these should be handled in `pressesBegan`.
+fn is_non_printable_key(key_code: i64) -> bool {
+    matches!(
+        key_code,
+        0x29          // Escape
+        | 0x39          // CapsLock
+        | 0x3A..=0x45  // F1-F12
+        | 0x46..=0x48  // PrintScreen, ScrollLock, Pause
+        | 0x49          // Insert
+        | 0x4A          // Home
+        | 0x4B          // PageUp
+        | 0x4D          // End
+        | 0x4E          // PageDown
+        | 0x4F..=0x52  // Arrow keys (Right, Left, Down, Up)
+        | 0x68..=0x73  // F13-F24
+        | 0xE0..=0xE7  // Modifier keys
+    )
 }
 
 /// iOS Window backed by UIWindow + UIViewController.
