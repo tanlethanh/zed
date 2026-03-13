@@ -319,12 +319,10 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // Return the view shown above the software keyboard (set via gpui_ios_set_keyboard_accessory_view).
-        // Only returns the toolbar when the software keyboard is actually visible,
-        // preventing a floating toolbar on simulator with hardware keyboard.
+        // UIKit queries inputAccessoryView at becomeFirstResponder time, before
+        // UIKeyboardWillShowNotification fires, so we must return the toolbar
+        // unconditionally here. UIKit only displays it when a keyboard is on screen.
         extern "C" fn input_accessory_view(_this: &Object, _sel: Sel) -> *mut Object {
-            if !SOFTWARE_KEYBOARD_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
-                return ptr::null_mut();
-            }
             let ptr = KEYBOARD_ACCESSORY_VIEW.load(std::sync::atomic::Ordering::Relaxed);
             ptr as *mut Object
         }
@@ -1873,6 +1871,19 @@ impl IosWindow {
                         });
                     }
                 }
+                // Suppress MouseUp (and therefore any click) when the finger moved
+                // beyond TAP_SLOP. Repaints triggered by ScrollWheel events are
+                // deferred to the next display-link tick, so element hitboxes are
+                // stale at the time MouseUp arrives. Without this guard, on_click
+                // handlers fire on scroll release because the row is still at its
+                // pre-scroll hitbox position.
+                const TAP_SLOP: f32 = 8.0;
+                let down_pos = self.touch_down_position.get();
+                let dx = f32::from(position.x) - f32::from(down_pos.x);
+                let dy = f32::from(position.y) - f32::from(down_pos.y);
+                if (dx * dx + dy * dy).sqrt() > TAP_SLOP {
+                    return;
+                }
                 touch_ended_to_mouse_up(position, tap_count, modifiers)
             }
             UITouchPhase::Stationary => unreachable!(),
@@ -1963,6 +1974,8 @@ impl IosWindow {
 
     /// Show the software keyboard
     pub fn show_keyboard(&self) {
+        let already = self.is_keyboard_shown();
+        log::info!("GPUI iOS: show_keyboard called (already_first_responder={})", already);
         unsafe {
             let _: BOOL = msg_send![self.view, becomeFirstResponder];
         }
@@ -1970,12 +1983,13 @@ impl IosWindow {
 
     /// Hide the software keyboard
     pub fn hide_keyboard(&self) {
-        log::info!("GPUI iOS: Hiding keyboard");
-        unsafe {
-            let _: BOOL = msg_send![self.view, resignFirstResponder];
-        }
-        // Reset so the keyboard can be shown again when a text input next gets focus.
-        self.keyboard_shown.set(false);
+        let is_fr = self.is_keyboard_shown();
+        log::info!("GPUI iOS: Hiding keyboard (is_first_responder={})", is_fr);
+        let result: BOOL = unsafe { msg_send![self.view, resignFirstResponder] };
+        log::info!("GPUI iOS: resignFirstResponder returned {}", result == YES);
+        // Do NOT reset keyboard_shown here. set_input_handler is called every frame for
+        // focused views, so resetting to false would cause it to immediately re-show the
+        // keyboard on the next render pass, making explicit dismissal impossible.
     }
 
     /// Handle text input from the software keyboard
