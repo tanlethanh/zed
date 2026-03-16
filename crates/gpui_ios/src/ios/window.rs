@@ -9,24 +9,29 @@
 //! The window is backed by a UIWindow containing a UIViewController
 //! whose view hosts the Metal rendering layer.
 
-use super::{display::IosDisplay, events::*, text_input, text_input::{create_text_position, create_text_range, get_position_index, get_range_indices}};
-use crate::metal_renderer;
-use gpui::{
-    AnyWindowHandle, Bounds, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
-    px,
+use super::{
+    display::IosDisplay,
+    events::*,
+    text_input,
+    text_input::{create_text_position, create_text_range, get_position_index, get_range_indices},
 };
+use crate::metal_renderer;
 use anyhow::Result;
 use core_graphics::{
     base::CGFloat,
     geometry::{CGRect, CGSize},
 };
+use gpui::{
+    AnyWindowHandle, Bounds, DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent, Size,
+    TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowParams, px,
+};
 use objc::{
-    class,
+    Encode, Encoding, class,
     declare::ClassDecl,
-    msg_send, Encode, Encoding,
+    msg_send,
     runtime::{BOOL, Class, NO, Object, Sel, YES},
     sel, sel_impl,
 };
@@ -172,7 +177,8 @@ fn ios_log(message: &str) {
 /// This is simpler and doesn't require allocation.
 fn ios_log_cstr(message: &std::ffi::CStr) {
     unsafe {
-        let ns_string: *mut Object = msg_send![class!(NSString), stringWithUTF8String: message.as_ptr()];
+        let ns_string: *mut Object =
+            msg_send![class!(NSString), stringWithUTF8String: message.as_ptr()];
         NSLog(ns_string);
     }
 }
@@ -180,9 +186,11 @@ fn ios_log_cstr(message: &std::ffi::CStr) {
 /// Helper to log a formatted string to iOS system log.
 /// Creates a proper null-terminated C string.
 fn ios_log_format(message: &str) {
-    let c_string = std::ffi::CString::new(message).unwrap_or_else(|_| std::ffi::CString::new("GPUI iOS: <invalid log message>").unwrap());
+    let c_string = std::ffi::CString::new(message)
+        .unwrap_or_else(|_| std::ffi::CString::new("GPUI iOS: <invalid log message>").unwrap());
     unsafe {
-        let ns_string: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c_string.as_ptr()];
+        let ns_string: *mut Object =
+            msg_send![class!(NSString), stringWithUTF8String: c_string.as_ptr()];
         NSLog(ns_string);
     }
 }
@@ -1542,7 +1550,9 @@ fn handle_presses(view: &mut Object, presses: *mut Object, is_key_down: bool) {
             // function keys, etc.) and modified keys (ctrl+c) go through here.
             let has_action_modifier = (modifiers & 0b1110) != 0; // ctrl | alt | cmd
             if !has_action_modifier && !is_non_printable_key(key_code) {
-                ios_log_cstr(c"GPUI iOS: handle_presses - skipping printable key (handled by insertText)");
+                ios_log_cstr(
+                    c"GPUI iOS: handle_presses - skipping printable key (handled by insertText)",
+                );
                 continue;
             }
 
@@ -1797,10 +1807,7 @@ impl IosWindow {
         }
 
         let prev_position = touch_previous_location_in_view(touch, self.view);
-        let delta = Point::new(
-            position.x - prev_position.x,
-            position.y - prev_position.y,
-        );
+        let delta = Point::new(position.x - prev_position.x, position.y - prev_position.y);
 
         let platform_input = match phase {
             UITouchPhase::Began => {
@@ -1838,14 +1845,28 @@ impl IosWindow {
                 self.last_move_ts.set(ts);
                 // Track velocity using exponential smoothing: v = 0.7*v_old + 0.3*(delta/dt)
                 let now = std::time::Instant::now();
-                let dt = self.touch_last_time.borrow()
+                let dt = self
+                    .touch_last_time
+                    .borrow()
                     .map(|t| now.duration_since(t).as_secs_f32().max(0.001))
                     .unwrap_or(0.016);
                 let instant_vx = f32::from(delta.x) / dt;
                 let instant_vy = f32::from(delta.y) / dt;
-                self.touch_velocity_x.set(self.touch_velocity_x.get() * 0.7 + instant_vx * 0.3);
-                self.touch_velocity_y.set(self.touch_velocity_y.get() * 0.7 + instant_vy * 0.3);
+                self.touch_velocity_x
+                    .set(self.touch_velocity_x.get() * 0.7 + instant_vx * 0.3);
+                self.touch_velocity_y
+                    .set(self.touch_velocity_y.get() * 0.7 + instant_vy * 0.3);
                 *self.touch_last_time.borrow_mut() = Some(now);
+                // Send a MouseMove so GPUI's long-press move-threshold handler can
+                // cancel the timer when the finger drifts. iOS touch moves only
+                // produce ScrollWheel events; without a paired MouseMove the long-press
+                // timer runs uninterrupted through any scroll gesture, firing the delete
+                // dialog on what the user intended as a tap or swipe.
+                let move_input =
+                    touch_moved_to_mouse_move(position, modifiers, Some(gpui::MouseButton::Left));
+                if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                    callback(move_input);
+                }
                 // Use the DOWN position so DrawerHost's edge-zone check (pos_x < EDGE_ZONE)
                 // sees where the gesture started, not where the finger currently is.
                 let down_pos = self.touch_down_position.get();
@@ -1900,7 +1921,9 @@ impl IosWindow {
     pub(super) fn process_fling(&self) {
         let fling_data = {
             let fling = self.fling.borrow();
-            fling.as_ref().map(|f| (f.velocity_x, f.velocity_y, f.last_time, f.position))
+            fling
+                .as_ref()
+                .map(|f| (f.velocity_x, f.velocity_y, f.last_time, f.position))
         };
         let Some((vx, vy, last_time, position)) = fling_data else {
             return;
@@ -1975,7 +1998,10 @@ impl IosWindow {
     /// Show the software keyboard
     pub fn show_keyboard(&self) {
         let already = self.is_keyboard_shown();
-        log::info!("GPUI iOS: show_keyboard called (already_first_responder={})", already);
+        log::info!(
+            "GPUI iOS: show_keyboard called (already_first_responder={})",
+            already
+        );
         unsafe {
             let _: BOOL = msg_send![self.view, becomeFirstResponder];
         }
@@ -2053,7 +2079,10 @@ impl IosWindow {
         if is_key_down {
             let handled = self.handle_arrow_key(&key, modifiers.shift);
             if handled {
-                ios_log_format(&format!("GPUI iOS: handle_key_event - arrow key '{}' handled directly", key));
+                ios_log_format(&format!(
+                    "GPUI iOS: handle_key_event - arrow key '{}' handled directly",
+                    key
+                ));
                 return;
             }
         }
@@ -2065,7 +2094,10 @@ impl IosWindow {
         };
 
         if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            ios_log_format(&format!("GPUI iOS: handle_key_event - calling input_callback with key={}", key));
+            ios_log_format(&format!(
+                "GPUI iOS: handle_key_event - calling input_callback with key={}",
+                key
+            ));
             callback(event);
             ios_log_cstr(c"GPUI iOS: handle_key_event - callback returned");
         } else {
@@ -2080,7 +2112,7 @@ impl IosWindow {
         let delta: i64 = match key {
             "left" => -1,
             "right" => 1,
-            "up" => -1,   // For now, up/down also move by 1 char (proper line nav needs layout info)
+            "up" => -1, // For now, up/down also move by 1 char (proper line nav needs layout info)
             "down" => 1,
             _ => return false,
         };
