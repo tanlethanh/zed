@@ -52,6 +52,14 @@ use std::{borrow::Cow, char, convert::TryFrom, sync::Arc};
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
 
+#[link(name = "CoreText", kind = "framework")]
+unsafe extern "C" {
+    fn CTFontManagerRegisterGraphicsFont(
+        font: core_graphics::sys::CGFontRef,
+        error: *mut core_foundation::base::CFTypeRef,
+    ) -> bool;
+}
+
 /// iOS text system using CoreText for text shaping and rendering.
 ///
 /// This provides full text rendering support on iOS using the same
@@ -207,9 +215,27 @@ impl IosTextSystemState {
                     let data_provider = unsafe {
                         core_graphics::data_provider::CGDataProvider::from_slice(embedded_font)
                     };
-                    let font = core_graphics::font::CGFont::from_data_provider(data_provider)
-                        .map_err(|()| anyhow!("Could not load an embedded font."))?;
-                    let font = font_kit::loaders::core_text::Font::from_core_graphics_font(font);
+                    let cg_font =
+                        core_graphics::font::CGFont::from_data_provider(data_provider)
+                            .map_err(|()| anyhow!("Could not load an embedded font."))?;
+
+                    // Register with CoreText so cascade fallbacks can find this font by name.
+                    // This makes embedded fonts discoverable via kCTFontCascadeListAttribute.
+                    unsafe {
+                        use foreign_types::ForeignType;
+                        let mut error: core_foundation::base::CFTypeRef =
+                            std::ptr::null_mut() as _;
+                        let ok = CTFontManagerRegisterGraphicsFont(
+                            cg_font.as_ptr(),
+                            &mut error as *mut _ as *mut _,
+                        );
+                        if !ok && !error.is_null() {
+                            core_foundation::base::CFRelease(error);
+                        }
+                    }
+
+                    let font =
+                        font_kit::loaders::core_text::Font::from_core_graphics_font(cg_font);
                     Ok(Handle::from_native(&font))
                 }
                 Cow::Owned(bytes) => Ok(Handle::from_memory(Arc::new(bytes), 0)),
