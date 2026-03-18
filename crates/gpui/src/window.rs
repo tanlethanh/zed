@@ -600,6 +600,9 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// Extra space around the visual bounds that still registers pointer hits.
+    /// Useful for making small touch targets easier to activate on mobile.
+    pub hit_slop: Edges<Pixels>,
 }
 
 impl Hitbox {
@@ -844,7 +847,18 @@ impl Frame {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+            let slop = &hitbox.hit_slop;
+            let interaction_bounds = Bounds {
+                origin: point(
+                    hitbox.bounds.origin.x - slop.left,
+                    hitbox.bounds.origin.y - slop.top,
+                ),
+                size: Size {
+                    width: hitbox.bounds.size.width + slop.left + slop.right,
+                    height: hitbox.bounds.size.height + slop.top + slop.bottom,
+                },
+            };
+            let bounds = interaction_bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
@@ -3603,16 +3617,30 @@ impl Window {
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
+        self.insert_hitbox_with_slop(bounds, Edges::default(), behavior)
+    }
+
+    /// Like [`insert_hitbox`], but expands the pointer-hit area by `hit_slop` on each side
+    /// without affecting the visual bounds of the element. Useful for small touch targets.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn insert_hitbox_with_slop(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        hit_slop: Edges<Pixels>,
+        behavior: HitboxBehavior,
+    ) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
-        let mut id = self.next_hitbox_id;
+        let id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
             id,
             bounds,
             content_mask,
             behavior,
+            hit_slop,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox

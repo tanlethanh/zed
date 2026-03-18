@@ -17,7 +17,7 @@
 
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
-    DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
+    DispatchPhase, Display, Edges, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
     Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
     KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
@@ -630,6 +630,13 @@ impl Interactivity {
         });
     }
 
+    /// Expand the pointer-hit area beyond the visual bounds of this element.
+    /// The element will respond to clicks within the slop region even though nothing is painted
+    /// there. Useful for small touch targets on mobile.
+    pub fn set_hit_slop(&mut self, slop: Edges<Pixels>) {
+        self.hit_slop = slop;
+    }
+
     /// Block the mouse from all interactions with elements behind this element's hitbox. Typically
     /// `block_mouse_except_scroll` should be preferred.
     ///
@@ -1098,6 +1105,26 @@ pub trait InteractiveElement: Sized {
     /// See [`Hitbox::is_hovered`] for details.
     fn block_mouse_except_scroll(mut self) -> Self {
         self.interactivity().block_mouse_except_scroll();
+        self
+    }
+
+    /// Expand the pointer-hit area beyond the visual bounds of this element by a uniform amount
+    /// on all sides. The element will respond to clicks in the expanded region even though nothing
+    /// is painted there. Useful for small touch targets on mobile.
+    fn hit_slop(mut self, slop: Pixels) -> Self {
+        self.interactivity().set_hit_slop(Edges {
+            top: slop,
+            right: slop,
+            bottom: slop,
+            left: slop,
+        });
+        self
+    }
+
+    /// Expand the pointer-hit area beyond the visual bounds of this element by the given
+    /// per-side amounts. See [`InteractiveElement::hit_slop`] for details.
+    fn hit_slop_edges(mut self, slop: Edges<Pixels>) -> Self {
+        self.interactivity().set_hit_slop(slop);
         self
     }
 
@@ -1693,6 +1720,7 @@ pub struct Interactivity {
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) window_control: Option<WindowControlArea>,
     pub(crate) hitbox_behavior: HitboxBehavior,
+    pub(crate) hit_slop: Edges<Pixels>,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,
@@ -1850,7 +1878,11 @@ impl Interactivity {
                         style.overflow_mask(bounds, window.rem_size()),
                         |window| {
                             let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                                Some(window.insert_hitbox_with_slop(
+                                    bounds,
+                                    self.hit_slop,
+                                    self.hitbox_behavior,
+                                ))
                             } else {
                                 None
                             };
