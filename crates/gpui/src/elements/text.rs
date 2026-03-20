@@ -640,6 +640,26 @@ impl TextLayout {
         accumulator.pop();
         accumulator
     }
+
+    /// Request layout for plain uniform text, matching the [`SharedString`] element.
+    pub fn uniform_request_layout(
+        &self,
+        text: SharedString,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.layout(text, None, window, cx)
+    }
+
+    /// Commit bounds after layout, before paint (pairs with [`Self::uniform_request_layout`]).
+    pub fn uniform_prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
+        self.prepaint(bounds, text)
+    }
+
+    /// Paint the laid-out uniform text (pairs with [`Self::uniform_prepaint`]).
+    pub fn uniform_paint(&self, text: &str, window: &mut Window, cx: &mut App) {
+        self.paint(text, window, cx)
+    }
 }
 
 /// A text element that can be interacted with.
