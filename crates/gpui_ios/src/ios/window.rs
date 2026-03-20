@@ -1883,7 +1883,6 @@ impl IosWindow {
                     let vx = self.touch_velocity_x.get();
                     let vy = self.touch_velocity_y.get();
                     if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
-                        log::info!("[PERF] iOS fling: start vel=({:.0}, {:.0})", vx, vy);
                         *self.fling.borrow_mut() = Some(TouchFling {
                             velocity_x: vx,
                             velocity_y: vy,
@@ -1936,7 +1935,6 @@ impl IosWindow {
         let new_vy = vy * friction;
 
         if new_vx.abs() < FLING_THRESHOLD && new_vy.abs() < FLING_THRESHOLD {
-            log::info!("[PERF] iOS fling: end");
             *self.fling.borrow_mut() = None;
             if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
                 callback(PlatformInput::ScrollWheel(ScrollWheelEvent {

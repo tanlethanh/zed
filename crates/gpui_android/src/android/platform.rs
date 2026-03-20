@@ -356,7 +356,6 @@ impl AndroidPlatform {
             .unwrap_or_default();
 
         if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
-            log::info!("[PERF] fling: start vel=({:.0}, {:.0})", vx, vy);
             state.fling = Some(FlingState {
                 velocity_x: vx,
                 velocity_y: vy,
@@ -388,7 +387,6 @@ impl AndroidPlatform {
         let new_vy = vy * friction;
 
         if new_vx.abs() < FLING_THRESHOLD && new_vy.abs() < FLING_THRESHOLD {
-            log::info!("[PERF] fling: end");
             self.touch_state.borrow_mut().fling = None;
             self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                 position,
