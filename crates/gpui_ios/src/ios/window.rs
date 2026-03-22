@@ -2172,6 +2172,32 @@ impl IosWindow {
             callback(is_active);
         }
     }
+
+    /// Update window bounds and Metal drawable size after a rotation or resize event.
+    ///
+    /// `width_pts` and `height_pts` are the new dimensions in logical points
+    /// (as reported by `[UIScreen mainScreen].bounds`).
+    pub fn handle_resize(&self, width_pts: f32, height_pts: f32) {
+        let scale = self.scale_factor.get();
+        let new_size = size(px(width_pts), px(height_pts));
+        let new_bounds = Bounds {
+            origin: Point::default(),
+            size: new_size,
+        };
+        self.bounds.set(new_bounds);
+
+        let physical_size = Size {
+            width: DevicePixels((width_pts * scale) as i32),
+            height: DevicePixels((height_pts * scale) as i32),
+        };
+        self.renderer.borrow_mut().update_drawable_size(physical_size);
+
+        let mut callback = self.resize_callback.borrow_mut().take();
+        if let Some(ref mut cb) = callback {
+            cb(new_size, scale);
+        }
+        *self.resize_callback.borrow_mut() = callback;
+    }
 }
 
 impl HasWindowHandle for IosWindow {

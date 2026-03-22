@@ -427,6 +427,25 @@ pub extern "C" fn gpui_ios_handle_key_event(
     window.handle_key_event(key_code, modifiers, is_key_down);
 }
 
+/// Notify the GPUI window that the screen size has changed (rotation or split-screen resize).
+///
+/// `width_pts` and `height_pts` are the new dimensions in logical points, as reported by
+/// `[UIScreen mainScreen].bounds.size` after the orientation change.
+/// This updates the window's logical bounds, resizes the Metal drawable, and fires the
+/// GPUI resize callback so layout is recomputed at the new dimensions.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_handle_view_resize(
+    window_ptr: *mut c_void,
+    width_pts: f32,
+    height_pts: f32,
+) {
+    if window_ptr.is_null() {
+        return;
+    }
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.handle_resize(width_pts, height_pts);
+}
+
 /// Get the UIWindow from a GPUI window.
 ///
 /// # Safety
