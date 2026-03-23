@@ -22,11 +22,11 @@ use core_graphics::{
     geometry::{CGRect, CGSize},
 };
 use gpui::{
-    AnyWindowHandle, Bounds, DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent, Size,
-    TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowParams, px,
+    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, MouseButton,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent,
+    Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowParams, px, size,
 };
 use objc::{
     Encode, Encoding, class,
@@ -2190,7 +2190,9 @@ impl IosWindow {
             width: DevicePixels((width_pts * scale) as i32),
             height: DevicePixels((height_pts * scale) as i32),
         };
-        self.renderer.borrow_mut().update_drawable_size(physical_size);
+        self.renderer
+            .borrow_mut()
+            .update_drawable_size(physical_size);
 
         let mut callback = self.resize_callback.borrow_mut().take();
         if let Some(ref mut cb) = callback {
