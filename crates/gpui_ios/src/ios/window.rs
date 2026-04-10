@@ -22,11 +22,11 @@ use core_graphics::{
     geometry::{CGRect, CGSize},
 };
 use gpui::{
-    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, MouseButton,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent,
-    Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowParams, px, size,
+    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent, Size,
+    TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowParams, px, size,
 };
 use objc::{
     Encode, Encoding, class,

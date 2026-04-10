@@ -68,7 +68,7 @@ pub(crate) unsafe fn new_renderer(
         let layer_ptr: *mut objc::runtime::Object = msg_send![view, layer];
         // Retain because MetalLayer::from_ptr takes ownership of +1 ref.
         let _: *mut objc::runtime::Object = msg_send![layer_ptr, retain];
-        let layer = metal::MetalLayer::from_ptr(layer_ptr as *mut _);
+        let layer = unsafe { metal::MetalLayer::from_ptr(layer_ptr as *mut _) };
         layer.set_device(&renderer.device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         layer.set_opaque(!transparent);

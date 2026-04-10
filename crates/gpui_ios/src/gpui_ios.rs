@@ -1,4 +1,5 @@
 #![cfg(target_os = "ios")]
+#![allow(dead_code)]
 //! iOS platform implementation for GPUI.
 //!
 //! This crate provides the iOS platform backend for GPUI, using Metal
