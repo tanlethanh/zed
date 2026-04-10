@@ -14,7 +14,7 @@ use objc::{
     class,
     declare::ClassDecl,
     msg_send,
-    runtime::{Class, Object, Sel, BOOL, NO, YES},
+    runtime::{BOOL, Class, NO, Object, Sel, YES},
     sel, sel_impl,
 };
 use std::sync::Once;
@@ -64,11 +64,7 @@ pub fn register_text_position_class() -> &'static Class {
                 }
                 let this_index: usize = *this.get_ivar(GPUI_POSITION_INDEX_IVAR);
                 let other_index: usize = *(&*other).get_ivar(GPUI_POSITION_INDEX_IVAR);
-                if this_index == other_index {
-                    YES
-                } else {
-                    NO
-                }
+                if this_index == other_index { YES } else { NO }
             }
         }
 
@@ -98,9 +94,7 @@ pub fn register_text_position_class() -> &'static Class {
 
     // Return cached class - safe because Once::call_once guarantees
     // the closure has completed before we reach this point.
-    unsafe {
-        TEXT_POSITION_CLASS.expect("GPUITextPosition class should be registered")
-    }
+    unsafe { TEXT_POSITION_CLASS.expect("GPUITextPosition class should be registered") }
 }
 
 /// Create a GPUITextPosition with the given UTF-16 index.
@@ -163,11 +157,7 @@ pub fn register_text_range_class() -> &'static Class {
             unsafe {
                 let start: usize = *this.get_ivar(GPUI_RANGE_START_IVAR);
                 let end: usize = *this.get_ivar(GPUI_RANGE_END_IVAR);
-                if start == end {
-                    YES
-                } else {
-                    NO
-                }
+                if start == end { YES } else { NO }
             }
         }
 
@@ -196,9 +186,7 @@ pub fn register_text_range_class() -> &'static Class {
 
     // Return cached class - safe because Once::call_once guarantees
     // the closure has completed before we reach this point.
-    unsafe {
-        TEXT_RANGE_CLASS.expect("GPUITextRange class should be registered")
-    }
+    unsafe { TEXT_RANGE_CLASS.expect("GPUITextRange class should be registered") }
 }
 
 /// Pre-register all text input classes.

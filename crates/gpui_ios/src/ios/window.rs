@@ -227,7 +227,7 @@ where
         // Take the handler out of the RefCell in a scoped block.
         // This releases the borrow before callback execution.
         let mut handler = {
-            let Ok(mut borrow) = window.input_handler.try_borrow_mut() else {
+            let Ok(mut borrow) = window.callback_input_handler.try_borrow_mut() else {
                 ios_log_cstr(c"GPUI iOS: with_input_handler - BORROW CONFLICT during take!");
                 return None;
             };
@@ -244,7 +244,7 @@ where
 
         // Restore handler back into RefCell
         {
-            let Ok(mut borrow) = window.input_handler.try_borrow_mut() else {
+            let Ok(mut borrow) = window.callback_input_handler.try_borrow_mut() else {
                 // This should never happen since we released the borrow above,
                 // but log an error if it does
                 ios_log_cstr(c"GPUI iOS: with_input_handler - BORROW CONFLICT during restore!");
@@ -386,7 +386,6 @@ fn register_metal_view_class() -> &'static Class {
 
         // UIKeyInput protocol - hasText
         extern "C" fn has_text(_this: &Object, _sel: Sel) -> bool {
-            ios_log_cstr(c"GPUI iOS: hasText called - returning true");
             true // Always return true to receive text input
         }
 
@@ -396,7 +395,6 @@ fn register_metal_view_class() -> &'static Class {
         // so we always process insertText (no hardware key blocking needed here).
         extern "C" fn insert_text(this: &mut Object, _sel: Sel, text: *mut Object) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                ios_log_cstr(c"GPUI iOS: insertText called");
                 unsafe {
                     // Get the string from the NSString first (before any handler access)
                     let utf8: *const std::os::raw::c_char = msg_send![text, UTF8String];
@@ -406,21 +404,17 @@ fn register_metal_view_class() -> &'static Class {
                     }
 
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
-                    ios_log_format(&format!("GPUI iOS: insertText - got text: {:?}", text_str));
 
                     // First try the input handler directly (for text fields)
                     // This is the preferred path for software keyboard input.
                     // Uses with_input_handler which releases the borrow during callback
                     // to prevent conflicts when iOS queries multiple UITextInput methods.
                     if with_input_handler(this, |handler| {
-                        ios_log_cstr(c"GPUI iOS: insertText - handler found, calling replace_text_in_range");
                         handler.replace_text_in_range(None, &text_str);
                     }).is_some() {
-                        ios_log_cstr(c"GPUI iOS: insertText - SUCCESS via input handler");
                         return;
                     }
 
-                    ios_log_cstr(c"GPUI iOS: insertText - no handler, using key event fallback");
                     // Fallback: with_input_handler returned None (no handler set)
                     // Send as key events for non-input-handler scenarios
                     let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
@@ -455,7 +449,6 @@ fn register_metal_view_class() -> &'static Class {
                             }
                         }
                     }
-                    ios_log_cstr(c"GPUI iOS: insertText - sent via key event fallback");
                 }
             }));
         }
@@ -464,119 +457,49 @@ fn register_metal_view_class() -> &'static Class {
         // This is the ONLY path for backspace deletion - we skip backspace in pressesBegan
         // to avoid duplicate handling.
         //
-        // iOS sometimes calls deleteBackward twice in rapid succession for a single key press.
-        // We use a debounce mechanism to ignore duplicate calls within a short time window.
+        // iOS sometimes calls deleteBackward twice for one user gesture.
+        // Ignore callbacks that land in the exact same millisecond while preserving
+        // native long-press repeat cadence.
         extern "C" fn delete_backward(this: &mut Object, _sel: Sel) {
             use std::sync::atomic::{AtomicU64, Ordering};
             use std::time::{SystemTime, UNIX_EPOCH};
 
-            // Use a static counter to track how many times deleteBackward is called
-            static CALL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let call_id = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            // Debounce: track last deletion time to ignore rapid duplicate calls
-            // This is necessary because iOS sometimes calls deleteBackward twice per key press.
-            static LAST_DELETE_TIME: AtomicU64 = AtomicU64::new(0);
-            const DEBOUNCE_MS: u64 = 100; // Ignore calls within 100ms of each other
+            // Dedupe callbacks that land in the exact same millisecond.
+            // This keeps true key-repeat cadence untouched.
+            static LAST_DELETE_TIME_MS: AtomicU64 = AtomicU64::new(0);
 
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                let now = SystemTime::now()
+                let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                let last_ms = LAST_DELETE_TIME_MS.load(Ordering::SeqCst);
+                let delta_ms = now_ms.saturating_sub(last_ms);
 
-                let last_time = LAST_DELETE_TIME.load(Ordering::SeqCst);
-                let elapsed = now.saturating_sub(last_time);
-
-                ios_log_format(&format!(
-                    "GPUI iOS: deleteBackward [#{}] ENTRY - elapsed={}ms since last",
-                    call_id, elapsed
-                ));
-
-                if elapsed < DEBOUNCE_MS && last_time > 0 {
-                    ios_log_format(&format!(
-                        "GPUI iOS: deleteBackward [#{}] SKIPPED - debounce ({}ms < {}ms)",
-                        call_id, elapsed, DEBOUNCE_MS
-                    ));
+                if last_ms != 0 && delta_ms == 0 {
                     return;
                 }
+                LAST_DELETE_TIME_MS.store(now_ms, Ordering::SeqCst);
 
-                // Track whether we actually performed a deletion
-                let mut did_delete = false;
-
-                // First try the input handler directly
-                // This is the preferred path for software keyboard input.
-                // Uses with_input_handler which releases the borrow during callback
-                // to prevent conflicts when iOS queries multiple UITextInput methods.
-                let handler_result = with_input_handler(this, |handler| {
-                    ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - handler found", call_id));
+                // Route software-keyboard deletes through the active GPUI input handler.
+                // The callback mirror keeps this available across GPUI's per-frame take/set cycle.
+                let _ = with_input_handler(this, |handler| {
                     // Get current selection
                     if let Some(selection) = handler.selected_text_range(false) {
-                        ios_log_format(&format!(
-                            "GPUI iOS: deleteBackward [#{}] - selection: {:?}, empty: {}",
-                            call_id, selection.range, selection.range.is_empty()
-                        ));
                         if selection.range.is_empty() {
                             // No selection - delete one character before cursor
                             if selection.range.start > 0 {
                                 let delete_range = selection.range.start - 1..selection.range.start;
-                                ios_log_format(&format!(
-                                    "GPUI iOS: deleteBackward [#{}] - deleting range {:?} (UTF-16)",
-                                    call_id, delete_range
-                                ));
                                 handler.replace_text_in_range(Some(delete_range), "");
-                                ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - deleted one char", call_id));
-                                return true; // Performed deletion
-                            } else {
-                                ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - at start, nothing to delete", call_id));
+                                return;
                             }
                         } else {
                             // Has selection - delete the selection
-                            ios_log_format(&format!(
-                                "GPUI iOS: deleteBackward [#{}] - deleting selection {:?}",
-                                call_id, selection.range
-                            ));
                             handler.replace_text_in_range(Some(selection.range), "");
-                            ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - deleted selection", call_id));
-                            return true; // Performed deletion
+                            return;
                         }
-                    } else {
-                        ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - no selection available", call_id));
                     }
-                    false // No deletion performed
                 });
-
-                match handler_result {
-                    Some(true) => {
-                        did_delete = true;
-                        ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - SUCCESS via input handler", call_id));
-                    }
-                    Some(false) => {
-                        ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - handler found but no deletion needed", call_id));
-                    }
-                    None => {
-                        ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - no handler, using key event fallback", call_id));
-                        // Fallback: with_input_handler returned None (no handler set)
-                        // Send as key event
-                        unsafe {
-                            let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
-                            if window_ptr.is_null() {
-                                ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - window pointer is null for fallback!", call_id));
-                                return;
-                            }
-                            let window = &*(window_ptr as *const IosWindow);
-                            ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - sending backspace key event", call_id));
-                            window.handle_key_event(0x2A, 0, true); // Backspace key code
-                            did_delete = true;
-                        }
-                    }
-                }
-
-                // Update the last delete time after a successful deletion
-                if did_delete {
-                    LAST_DELETE_TIME.store(now, Ordering::SeqCst);
-                    ios_log_format(&format!("GPUI iOS: deleteBackward [#{}] - updated last_delete_time to {}", call_id, now));
-                }
             }));
         }
 
@@ -587,7 +510,6 @@ fn register_metal_view_class() -> &'static Class {
             presses: *mut Object,
             event: *mut Object,
         ) {
-            ios_log_cstr(c"GPUI iOS: pressesBegan - hardware key pressed");
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 handle_presses(this, presses, true);
             }));
@@ -604,7 +526,6 @@ fn register_metal_view_class() -> &'static Class {
             presses: *mut Object,
             event: *mut Object,
         ) {
-            ios_log_cstr(c"GPUI iOS: pressesEnded - hardware key released");
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 handle_presses(this, presses, false);
             }));
@@ -677,17 +598,11 @@ fn register_metal_view_class() -> &'static Class {
         // and track it as a "pending" selection that we verify matches our internal state.
         extern "C" fn set_selected_text_range(_this: &mut Object, _sel: Sel, range: *mut Object) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                if let Some((start, end)) = get_range_indices(range) {
-                    ios_log_format(&format!(
-                        "GPUI iOS: setSelectedTextRange called with {}..{} (ignored - cursor managed internally)",
-                        start, end
-                    ));
+                if let Some((_start, _end)) = get_range_indices(range) {
                     // We intentionally ignore this call.
                     // Our text operations (insertText, deleteBackward) already update the cursor.
                     // Calling replace_text_in_range here interferes with the deduplication logic
                     // and can cause issues with subsequent text insertions.
-                } else {
-                    ios_log_cstr(c"GPUI iOS: setSelectedTextRange called with nil range (ignored)");
                 }
             }));
         }
@@ -1536,10 +1451,13 @@ fn handle_presses(view: &mut Object, presses: *mut Object, is_key_down: bool) {
                 modifiers |= 1 << 3;
             } // Command
 
-            // Skip backspace (0x2A) and delete (0x4C) - let iOS handle them entirely
-            // through deleteBackward. This prevents duplicate deletion.
-            if key_code == 0x2A || key_code == 0x4C {
-                ios_log_cstr(c"GPUI iOS: handle_presses - skipping backspace/delete, handled by deleteBackward");
+            // When the software keyboard is visible, backspace/delete are delivered
+            // via deleteBackward. Keep skipping here to avoid duplicate deletion.
+            // When the software keyboard is hidden (hardware keyboard path), do not
+            // skip so key-repeat can flow through normal key event dispatch.
+            if (key_code == 0x2A || key_code == 0x4C)
+                && SOFTWARE_KEYBOARD_VISIBLE.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 continue;
             }
 
@@ -1599,6 +1517,8 @@ pub(crate) struct IosWindow {
     appearance: Cell<WindowAppearance>,
     /// Input handler for text input
     input_handler: RefCell<Option<PlatformInputHandler>>,
+    /// Stable mirror used by UIKit callbacks while GPUI is between frame phases.
+    callback_input_handler: RefCell<Option<PlatformInputHandler>>,
     /// Whether the keyboard is currently shown (tracked to avoid show/hide flicker)
     keyboard_shown: Cell<bool>,
     /// Callback for frame requests
@@ -1741,6 +1661,7 @@ impl IosWindow {
                 scale_factor: Cell::new(scale_factor),
                 appearance: Cell::new(WindowAppearance::Light),
                 input_handler: RefCell::new(None),
+                callback_input_handler: RefCell::new(None),
                 keyboard_shown: Cell::new(false),
                 request_frame_callback: RefCell::new(None),
                 input_callback: RefCell::new(None),
@@ -2011,6 +1932,7 @@ impl IosWindow {
         log::info!("GPUI iOS: Hiding keyboard (is_first_responder={})", is_fr);
         let result: BOOL = unsafe { msg_send![self.view, resignFirstResponder] };
         log::info!("GPUI iOS: resignFirstResponder returned {}", result == YES);
+        self.callback_input_handler.borrow_mut().take();
         // Do NOT reset keyboard_shown here. set_input_handler is called every frame for
         // focused views, so resetting to false would cause it to immediately re-show the
         // keyboard on the next render pass, making explicit dismissal impossible.
@@ -2092,12 +2014,7 @@ impl IosWindow {
         };
 
         if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            ios_log_format(&format!(
-                "GPUI iOS: handle_key_event - calling input_callback with key={}",
-                key
-            ));
             callback(event);
-            ios_log_cstr(c"GPUI iOS: handle_key_event - callback returned");
         } else {
             ios_log_cstr(c"GPUI iOS: handle_key_event - NO input_callback set!");
         }
@@ -2278,13 +2195,13 @@ impl PlatformWindow for IosWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
+        *self.callback_input_handler.borrow_mut() = Some(input_handler.clone());
         *self.input_handler.borrow_mut() = Some(input_handler);
         // Only show keyboard if we haven't already shown it.
         // Note: set_input_handler and take_input_handler are called every frame
         // as part of GPUI's rendering cycle, so we use keyboard_shown flag to
         // track state and avoid show/hide flicker.
         if !self.keyboard_shown.get() {
-            ios_log_cstr(c"GPUI iOS: set_input_handler - showing keyboard (first time)");
             self.keyboard_shown.set(true);
             self.show_keyboard();
         }
