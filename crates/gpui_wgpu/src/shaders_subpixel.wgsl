@@ -1,7 +1,4 @@
-// --- subpixel sprites (requires dual-source blending) --- //
-// Note: `enable dual_source_blending;` is prepended by the renderer
-// when concatenating with the base shader module, since WGSL requires
-// directives before all global declarations.
+// --- subpixel sprites --- //
 
 struct SubpixelSprite {
     order: u32,
