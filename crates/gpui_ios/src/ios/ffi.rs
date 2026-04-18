@@ -99,7 +99,6 @@ pub extern "C" fn gpui_ios_get_window() -> *mut c_void {
         unsafe {
             let windows = &*wrapper.0.get();
             if let Some(&window) = windows.last() {
-                log::info!("GPUI iOS: Returning window {:p}", window);
                 return window as *mut c_void;
             }
         }
@@ -374,8 +373,6 @@ pub extern "C" fn gpui_ios_hide_keyboard(window_ptr: *mut c_void) {
         return;
     }
 
-    log::info!("GPUI iOS: Hide keyboard requested");
-
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
     window.hide_keyboard();
 }
@@ -391,8 +388,6 @@ pub extern "C" fn gpui_ios_handle_text_input(window_ptr: *mut c_void, text_ptr: 
     if window_ptr.is_null() || text_ptr.is_null() {
         return;
     }
-
-    log::info!("GPUI iOS: Handle text input");
 
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
     window.handle_text_input(text_ptr as *mut objc::runtime::Object);
