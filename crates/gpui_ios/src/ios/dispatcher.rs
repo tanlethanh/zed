@@ -129,10 +129,6 @@ extern "C" fn trampoline(context: *mut c_void) {
 
     let metadata = runnable.metadata();
 
-    if metadata.is_closed() {
-        return;
-    }
-
     let location = metadata.location;
 
     let start = Instant::now();
