@@ -6,7 +6,7 @@
 
 use gpui::RequestFrameOptions;
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Global storage for the GPUI application state.
 /// This is set during initialization and used by FFI callbacks.
@@ -35,6 +35,19 @@ unsafe impl Send for WindowListWrapper {}
 unsafe impl Sync for WindowListWrapper {}
 
 static IOS_WINDOW_LIST: OnceLock<WindowListWrapper> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+pub(crate) struct EmbeddedWindowConfig {
+    pub parent_view: *mut objc::runtime::Object,
+    pub width_pts: f32,
+    pub height_pts: f32,
+}
+
+// Safety: UIKit pointers are only used from the main thread. This wrapper only
+// exists so the config can sit behind a static Mutex.
+unsafe impl Send for EmbeddedWindowConfig {}
+
+static PENDING_EMBEDDED_WINDOW: OnceLock<Mutex<Option<EmbeddedWindowConfig>>> = OnceLock::new();
 
 /// Initialize the GPUI iOS application.
 ///
@@ -67,6 +80,7 @@ pub extern "C" fn gpui_ios_initialize() -> *mut c_void {
 
     // Initialize the window list
     let _ = IOS_WINDOW_LIST.set(WindowListWrapper(std::cell::UnsafeCell::new(Vec::new())));
+    let _ = PENDING_EMBEDDED_WINDOW.set(Mutex::new(None));
 
     // Return a non-null pointer to indicate success
     // The actual state is stored in the static
@@ -87,6 +101,69 @@ pub(crate) fn register_window(window: *const super::window::IosWindow) {
             log::info!("GPUI iOS: Registered window {:p}", window);
         }
     }
+}
+
+pub(crate) fn unregister_window(window: *const super::window::IosWindow) {
+    if let Some(wrapper) = IOS_WINDOW_LIST.get() {
+        unsafe {
+            let windows = &mut *wrapper.0.get();
+            windows.retain(|&entry| entry != window);
+        }
+    }
+}
+
+pub(crate) fn take_pending_embedded_window() -> Option<EmbeddedWindowConfig> {
+    let pending = PENDING_EMBEDDED_WINDOW.get()?;
+    pending.lock().ok()?.take()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_set_next_embedded_parent(
+    parent_view_ptr: *mut c_void,
+    width_pts: f32,
+    height_pts: f32,
+) {
+    let Some(pending) = PENDING_EMBEDDED_WINDOW.get() else {
+        return;
+    };
+    let Ok(mut slot) = pending.lock() else {
+        return;
+    };
+
+    *slot = Some(EmbeddedWindowConfig {
+        parent_view: parent_view_ptr as *mut objc::runtime::Object,
+        width_pts,
+        height_pts,
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_attach_embedded_view(
+    window_ptr: *mut c_void,
+    parent_view_ptr: *mut c_void,
+    width_pts: f32,
+    height_pts: f32,
+) {
+    if window_ptr.is_null() || parent_view_ptr.is_null() {
+        return;
+    }
+
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.attach_to_parent(
+        parent_view_ptr as *mut objc::runtime::Object,
+        width_pts,
+        height_pts,
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_detach_embedded_view(window_ptr: *mut c_void) {
+    if window_ptr.is_null() {
+        return;
+    }
+
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.detach_from_parent();
 }
 
 /// Get the most recently created window pointer.

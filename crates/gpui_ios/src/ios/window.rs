@@ -1690,6 +1690,150 @@ impl IosWindow {
         }
     }
 
+    pub fn new_embedded(
+        handle: AnyWindowHandle,
+        _params: WindowParams,
+        renderer_context: metal_renderer::Context,
+        parent_view: *mut Object,
+        width_pts: f32,
+        height_pts: f32,
+    ) -> Result<Self> {
+        text_input::ensure_text_input_classes_registered();
+
+        let screen = IosDisplay::main();
+        let scale_factor = screen.scale();
+        let embedded_bounds = Bounds {
+            origin: Point::default(),
+            size: size(px(width_pts), px(height_pts)),
+        };
+
+        unsafe {
+            let frame = CGRect {
+                origin: core_graphics::geometry::CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: width_pts as CGFloat,
+                    height: height_pts as CGFloat,
+                },
+            };
+
+            let view_controller: *mut Object = msg_send![class!(UIViewController), alloc];
+            let view_controller: *mut Object = msg_send![view_controller, init];
+
+            let metal_view_class = register_metal_view_class();
+            let view: *mut Object = msg_send![metal_view_class, alloc];
+            let view: *mut Object = msg_send![view, initWithFrame: frame];
+
+            let layer: *mut Object = msg_send![view, layer];
+            #[link(name = "Metal", kind = "framework")]
+            unsafe extern "C" {
+                fn MTLCreateSystemDefaultDevice() -> *mut Object;
+            }
+            let device = MTLCreateSystemDefaultDevice();
+            if !device.is_null() {
+                let _: () = msg_send![layer, setDevice: device];
+            }
+            let _: () = msg_send![layer, setPixelFormat: 80_u64];
+            let _: () = msg_send![layer, setFramebufferOnly: NO];
+
+            let screen_obj: *mut Object = msg_send![class!(UIScreen), mainScreen];
+            let scale: CGFloat = msg_send![screen_obj, scale];
+            let _: () = msg_send![layer, setContentsScale: scale];
+            let drawable_size = CGSize {
+                width: width_pts as CGFloat * scale,
+                height: height_pts as CGFloat * scale,
+            };
+            let _: () = msg_send![layer, setDrawableSize: drawable_size];
+            let _: () = msg_send![view, setUserInteractionEnabled: YES];
+            let _: () = msg_send![view, setMultipleTouchEnabled: YES];
+            let _: () = msg_send![view_controller, setView: view];
+
+            // Flexible width/height so UIKit layout changes on the parent propagate to the
+            // attached Metal view without requiring Auto Layout bindings from Rust.
+            let flexible_width: u64 = 1 << 1;
+            let flexible_height: u64 = 1 << 4;
+            let _: () = msg_send![view, setAutoresizingMask: flexible_width | flexible_height];
+            let _: () = msg_send![parent_view, addSubview: view];
+
+            let renderer = metal_renderer::new_renderer(
+                renderer_context,
+                ptr::null_mut(),
+                view as *mut c_void,
+                gpui::Size {
+                    width: drawable_size.width as f32,
+                    height: drawable_size.height as f32,
+                },
+                true,
+            );
+
+            Ok(Self {
+                handle,
+                window: ptr::null_mut(),
+                view_controller,
+                view,
+                bounds: Cell::new(embedded_bounds),
+                scale_factor: Cell::new(scale_factor),
+                appearance: Cell::new(WindowAppearance::Light),
+                input_handler: RefCell::new(None),
+                callback_input_handler: RefCell::new(None),
+                keyboard_shown: Cell::new(false),
+                request_frame_callback: RefCell::new(None),
+                input_callback: RefCell::new(None),
+                active_status_callback: RefCell::new(None),
+                hover_status_callback: RefCell::new(None),
+                resize_callback: RefCell::new(None),
+                moved_callback: RefCell::new(None),
+                should_close_callback: RefCell::new(None),
+                hit_test_callback: RefCell::new(None),
+                close_callback: RefCell::new(None),
+                appearance_changed_callback: RefCell::new(None),
+                mouse_position: Cell::new(Point::default()),
+                modifiers: Cell::new(Modifiers::default()),
+                renderer: RefCell::new(renderer),
+                touch_pressed: Cell::new(false),
+                primary_touch_ptr: Cell::new(0),
+                touch_velocity_x: Cell::new(0.0),
+                touch_velocity_y: Cell::new(0.0),
+                touch_last_time: RefCell::new(None),
+                fling: RefCell::new(None),
+                touch_down_position: Cell::new(Point::default()),
+                last_move_ts: Cell::new(0.0),
+            })
+        }
+    }
+
+    pub fn attach_to_parent(&self, parent_view: *mut Object, width_pts: f32, height_pts: f32) {
+        unsafe {
+            let frame = CGRect {
+                origin: core_graphics::geometry::CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: width_pts as CGFloat,
+                    height: height_pts as CGFloat,
+                },
+            };
+            let _: () = msg_send![self.view, setFrame: frame];
+            let flexible_width: u64 = 1 << 1;
+            let flexible_height: u64 = 1 << 4;
+            let _: () = msg_send![self.view, setAutoresizingMask: flexible_width | flexible_height];
+            let superview: *mut Object = msg_send![self.view, superview];
+            if superview != parent_view {
+                if !superview.is_null() {
+                    let _: () = msg_send![self.view, removeFromSuperview];
+                }
+                let _: () = msg_send![parent_view, addSubview: self.view];
+            }
+        }
+        self.handle_resize(width_pts, height_pts);
+    }
+
+    pub fn detach_from_parent(&self) {
+        unsafe {
+            let superview: *mut Object = msg_send![self.view, superview];
+            if !superview.is_null() {
+                let _: () = msg_send![self.view, removeFromSuperview];
+            }
+        }
+    }
+
     /// Register this window with the FFI layer after it's been stored.
     /// This must be called after the window is placed at a stable address
     /// (e.g., in a Box or Arc).
@@ -2119,6 +2263,12 @@ impl IosWindow {
     }
 }
 
+impl Drop for IosWindow {
+    fn drop(&mut self) {
+        super::ffi::unregister_window(self as *const Self);
+    }
+}
+
 impl HasWindowHandle for IosWindow {
     fn window_handle(
         &self,
@@ -2266,12 +2416,14 @@ impl PlatformWindow for IosWindow {
             }
 
             // Present the alert
-            let _: () = msg_send![
-                self.view_controller,
-                presentViewController: alert
-                animated: YES
-                completion: ptr::null::<Object>()
-            ];
+            if !self.view_controller.is_null() {
+                let _: () = msg_send![
+                    self.view_controller,
+                    presentViewController: alert
+                    animated: YES
+                    completion: ptr::null::<Object>()
+                ];
+            }
         }
 
         Some(rx)
@@ -2279,11 +2431,16 @@ impl PlatformWindow for IosWindow {
 
     fn activate(&self) {
         unsafe {
-            let _: () = msg_send![self.window, makeKeyAndVisible];
+            if !self.window.is_null() {
+                let _: () = msg_send![self.window, makeKeyAndVisible];
+            }
         }
     }
 
     fn is_active(&self) -> bool {
+        if self.window.is_null() {
+            return true;
+        }
         unsafe {
             let app: *mut Object = msg_send![class!(UIApplication), sharedApplication];
             let key_window: *mut Object = msg_send![app, keyWindow];

@@ -127,7 +127,18 @@ impl Platform for IosPlatform {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let renderer_context = self.0.lock().renderer_context.clone();
-        let window = Box::new(IosWindow::new(handle, options, renderer_context)?);
+        let window = if let Some(config) = super::ffi::take_pending_embedded_window() {
+            Box::new(IosWindow::new_embedded(
+                handle,
+                options,
+                renderer_context,
+                config.parent_view,
+                config.width_pts,
+                config.height_pts,
+            )?)
+        } else {
+            Box::new(IosWindow::new(handle, options, renderer_context)?)
+        };
         window.register_with_ffi();
         Ok(window)
     }
