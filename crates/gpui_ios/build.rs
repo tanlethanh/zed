@@ -18,13 +18,15 @@ mod ios_build {
     use cbindgen::Config;
 
     fn is_simulator() -> bool {
-        env::var("TARGET")
-            .unwrap_or_default()
-            .contains("-sim")
+        env::var("TARGET").unwrap_or_default().contains("-sim")
     }
 
     fn metal_sdk() -> &'static str {
-        if is_simulator() { "iphonesimulator" } else { "iphoneos" }
+        if is_simulator() {
+            "iphonesimulator"
+        } else {
+            "iphoneos"
+        }
     }
 
     pub fn run() {
@@ -164,7 +166,8 @@ mod ios_build {
 
         let mut cmd = Command::new("xcrun");
         cmd.args([
-            "-sdk", sdk,
+            "-sdk",
+            sdk,
             "metal",
             "-gline-tables-only",
             "-mios-version-min=16.0",

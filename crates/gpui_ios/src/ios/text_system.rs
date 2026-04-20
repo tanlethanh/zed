@@ -3,12 +3,6 @@
 //! This is adapted from the macOS text system since both platforms share
 //! the CoreText framework for text rendering.
 
-use gpui::{
-    Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem,
-    RenderGlyphParams, Result, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size,
-    TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
-};
 use anyhow::anyhow;
 use collections::HashMap;
 use core_foundation::{
@@ -39,6 +33,12 @@ use font_kit::{
     properties::{Style as FontkitStyle, Weight as FontkitWeight},
     source::SystemSource,
     sources::mem::MemSource,
+};
+use gpui::{
+    Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
+    FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams,
+    Result, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode,
+    point, px, size, swap_rgba_pa_to_bgra,
 };
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
@@ -215,16 +215,14 @@ impl IosTextSystemState {
                     let data_provider = unsafe {
                         core_graphics::data_provider::CGDataProvider::from_slice(embedded_font)
                     };
-                    let cg_font =
-                        core_graphics::font::CGFont::from_data_provider(data_provider)
-                            .map_err(|()| anyhow!("Could not load an embedded font."))?;
+                    let cg_font = core_graphics::font::CGFont::from_data_provider(data_provider)
+                        .map_err(|()| anyhow!("Could not load an embedded font."))?;
 
                     // Register with CoreText so cascade fallbacks can find this font by name.
                     // This makes embedded fonts discoverable via kCTFontCascadeListAttribute.
                     unsafe {
                         use foreign_types::ForeignType;
-                        let mut error: core_foundation::base::CFTypeRef =
-                            std::ptr::null_mut() as _;
+                        let mut error: core_foundation::base::CFTypeRef = std::ptr::null_mut() as _;
                         let ok = CTFontManagerRegisterGraphicsFont(
                             cg_font.as_ptr(),
                             &mut error as *mut _ as *mut _,
@@ -234,8 +232,7 @@ impl IosTextSystemState {
                         }
                     }
 
-                    let font =
-                        font_kit::loaders::core_text::Font::from_core_graphics_font(cg_font);
+                    let font = font_kit::loaders::core_text::Font::from_core_graphics_font(cg_font);
                     Ok(Handle::from_native(&font))
                 }
                 Cow::Owned(bytes) => Ok(Handle::from_memory(Arc::new(bytes), 0)),
@@ -328,7 +325,9 @@ impl IosTextSystemState {
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
-        Ok(size_from_vector2f(self.fonts[font_id.0].advance(glyph_id.0)?))
+        Ok(size_from_vector2f(
+            self.fonts[font_id.0].advance(glyph_id.0)?,
+        ))
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {

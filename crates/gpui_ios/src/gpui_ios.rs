@@ -9,5 +9,5 @@ mod ios;
 mod metal_atlas;
 pub mod metal_renderer;
 
-pub use ios::platform::IosPlatform;
 pub use ios::ffi;
+pub use ios::platform::IosPlatform;

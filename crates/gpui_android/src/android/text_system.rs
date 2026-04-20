@@ -1,14 +1,14 @@
-use gpui::{
-    Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, FontStyle,
-    GlyphId, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point,
-    size,
-};
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
     Attrs, AttrsList, Family, Font as CosmicTextFont, FontFeatures as CosmicFontFeatures,
     FontSystem, ShapeBuffer, ShapeLine,
+};
+use gpui::{
+    Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, FontStyle, GlyphId,
+    LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point,
+    size,
 };
 
 use itertools::Itertools;
@@ -300,9 +300,9 @@ impl CosmicTextSystemState {
                 face.families.iter().any(|family| {
                     let family_lower = family.0.to_lowercase();
                     *name == family.0
-                    || family_lower == name_lower
-                    || family_lower.contains(&name_lower)
-                    || name_lower.contains(&family_lower)
+                        || family_lower == name_lower
+                        || family_lower.contains(&name_lower)
+                        || name_lower.contains(&family_lower)
                 })
             })
             .map(|face| (face.id, face.post_script_name.clone()))
@@ -451,11 +451,7 @@ impl CosmicTextSystemState {
     }
 
     fn font_id_for_cosmic_id(&mut self, id: cosmic_text::fontdb::ID) -> Option<FontId> {
-        if let Some(ix) = self
-            .loaded_fonts
-            .iter()
-            .position(|f| f.font.id() == id)
-        {
+        if let Some(ix) = self.loaded_fonts.iter().position(|f| f.font.id() == id) {
             return Some(FontId(ix));
         }
 

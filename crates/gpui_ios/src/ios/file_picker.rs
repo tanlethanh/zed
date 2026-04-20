@@ -12,12 +12,7 @@ use objc::{
     runtime::{BOOL, Class, NO, Object, Protocol, Sel, YES},
     sel, sel_impl,
 };
-use std::{
-    cell::UnsafeCell,
-    ffi::c_void,
-    path::PathBuf,
-    sync::OnceLock,
-};
+use std::{cell::UnsafeCell, ffi::c_void, path::PathBuf, sync::OnceLock};
 
 /// Storage for pending file picker results.
 /// Only one file picker can be active at a time on iOS.

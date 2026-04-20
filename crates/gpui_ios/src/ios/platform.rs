@@ -12,14 +12,14 @@ use super::dispatcher::IosDispatcher;
 use super::display::IosDisplay;
 use super::window::IosWindow;
 use crate::metal_renderer;
+use anyhow::anyhow;
+use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
     Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
     PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result, Task, ThermalState,
     WindowAppearance, WindowParams,
 };
-use anyhow::anyhow;
-use futures::channel::oneshot;
 use objc::{class, msg_send, runtime::Object, sel, sel_impl};
 use parking_lot::Mutex;
 use std::{

@@ -411,7 +411,9 @@ fn register_metal_view_class() -> &'static Class {
                     // to prevent conflicts when iOS queries multiple UITextInput methods.
                     if with_input_handler(this, |handler| {
                         handler.replace_text_in_range(None, &text_str);
-                    }).is_some() {
+                    })
+                    .is_some()
+                    {
                         return;
                     }
 
@@ -419,7 +421,9 @@ fn register_metal_view_class() -> &'static Class {
                     // Send as key events for non-input-handler scenarios
                     let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
                     if window_ptr.is_null() {
-                        ios_log_cstr(c"GPUI iOS: insertText - window pointer is null for fallback!");
+                        ios_log_cstr(
+                            c"GPUI iOS: insertText - window pointer is null for fallback!",
+                        );
                         return;
                     }
                     let window = &*(window_ptr as *const IosWindow);
@@ -443,7 +447,8 @@ fn register_metal_view_class() -> &'static Class {
                                     prefer_character_input: true,
                                 });
 
-                                if let Some(callback) = window.input_callback.borrow_mut().as_mut() {
+                                if let Some(callback) = window.input_callback.borrow_mut().as_mut()
+                                {
                                     callback(event);
                                 }
                             }
@@ -516,7 +521,8 @@ fn register_metal_view_class() -> &'static Class {
             // Call super
             unsafe {
                 let superclass = class!(UIView);
-                let _: () = msg_send![super(this, superclass), pressesBegan: presses withEvent: event];
+                let _: () =
+                    msg_send![super(this, superclass), pressesBegan: presses withEvent: event];
             }
         }
 
@@ -532,7 +538,8 @@ fn register_metal_view_class() -> &'static Class {
             // Call super
             unsafe {
                 let superclass = class!(UIView);
-                let _: () = msg_send![super(this, superclass), pressesEnded: presses withEvent: event];
+                let _: () =
+                    msg_send![super(this, superclass), pressesEnded: presses withEvent: event];
             }
         }
 
@@ -551,10 +558,12 @@ fn register_metal_view_class() -> &'static Class {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let len = with_input_handler(this, |handler| {
                     let mut adjusted = None;
-                    handler.text_for_range(0..usize::MAX, &mut adjusted)
+                    handler
+                        .text_for_range(0..usize::MAX, &mut adjusted)
                         .map(|s| s.encode_utf16().count())
                         .unwrap_or(0)
-                }).unwrap_or(0);
+                })
+                .unwrap_or(0);
                 create_text_position(len)
             }));
 
@@ -568,15 +577,13 @@ fn register_metal_view_class() -> &'static Class {
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn selected_text_range(this: &Object, _sel: Sel) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                let range = with_input_handler(this, |handler| {
-                    handler.selected_text_range(false)
-                }).flatten();
+                let range = with_input_handler(this, |handler| handler.selected_text_range(false))
+                    .flatten();
 
                 match range {
-                    Some(selection) => create_text_range(
-                        selection.range.start,
-                        selection.range.end
-                    ),
+                    Some(selection) => {
+                        create_text_range(selection.range.start, selection.range.end)
+                    }
                     // Return empty range at start, never nil!
                     None => create_text_range(0, 0),
                 }
@@ -612,9 +619,8 @@ fn register_metal_view_class() -> &'static Class {
         extern "C" fn marked_text_range(this: &Object, _sel: Sel) -> *mut Object {
             // Wrap in catch_unwind to prevent panics from unwinding through FFI boundary
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                let range = with_input_handler(this, |handler| {
-                    handler.marked_text_range()
-                }).flatten();
+                let range =
+                    with_input_handler(this, |handler| handler.marked_text_range()).flatten();
 
                 match range {
                     Some(r) => create_text_range(r.start, r.end),
@@ -673,12 +679,14 @@ fn register_metal_view_class() -> &'static Class {
                 let text = with_input_handler(this, |handler| {
                     let mut adjusted = None;
                     handler.text_for_range(start..end, &mut adjusted)
-                }).flatten();
+                })
+                .flatten();
 
                 match text {
                     Some(s) => unsafe {
                         let c_str = std::ffi::CString::new(s).unwrap_or_default();
-                        let ns_string: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c_str.as_ptr()];
+                        let ns_string: *mut Object =
+                            msg_send![class!(NSString), stringWithUTF8String: c_str.as_ptr()];
                         ns_string
                     },
                     None => std::ptr::null_mut(),
@@ -694,7 +702,12 @@ fn register_metal_view_class() -> &'static Class {
         // UITextInput - replaceRange:withText:
         // This is called by iOS for smart punctuation and autocorrect
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
-        extern "C" fn replace_range_with_text(this: &mut Object, _sel: Sel, range: *mut Object, text: *mut Object) {
+        extern "C" fn replace_range_with_text(
+            this: &mut Object,
+            _sel: Sel,
+            range: *mut Object,
+            text: *mut Object,
+        ) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some((start, end)) = get_range_indices(range) else {
                     ios_log_cstr(c"GPUI iOS: replaceRange:withText: - no valid range");
@@ -741,7 +754,8 @@ fn register_metal_view_class() -> &'static Class {
                     }
 
                     // Check if it's NSAttributedString
-                    let is_attributed: BOOL = msg_send![marked_text, isKindOfClass: class!(NSAttributedString)];
+                    let is_attributed: BOOL =
+                        msg_send![marked_text, isKindOfClass: class!(NSAttributedString)];
                     let text_obj: *mut Object = if is_attributed == YES {
                         msg_send![marked_text, string]
                     } else {
@@ -757,11 +771,16 @@ fn register_metal_view_class() -> &'static Class {
 
                     ios_log_format(&format!(
                         "GPUI iOS: setMarkedText - text={:?}, selected_range={}..{}",
-                        text_str, selected_range.location, selected_range.location + selected_range.length
+                        text_str,
+                        selected_range.location,
+                        selected_range.location + selected_range.length
                     ));
 
                     let selected = if selected_range.location != NS_NOT_FOUND {
-                        Some(selected_range.location as usize..(selected_range.location + selected_range.length) as usize)
+                        Some(
+                            selected_range.location as usize
+                                ..(selected_range.location + selected_range.length) as usize,
+                        )
                     } else {
                         None
                     };
@@ -785,7 +804,11 @@ fn register_metal_view_class() -> &'static Class {
 
         // UITextInput - attributedSubstringFromRange: (for copy/paste preview)
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
-        extern "C" fn attributed_substring_from_range(this: &Object, _sel: Sel, range: *mut Object) -> *mut Object {
+        extern "C" fn attributed_substring_from_range(
+            this: &Object,
+            _sel: Sel,
+            range: *mut Object,
+        ) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some((start, end)) = get_range_indices(range) else {
                     return std::ptr::null_mut();
@@ -794,14 +817,17 @@ fn register_metal_view_class() -> &'static Class {
                 let text = with_input_handler(this, |handler| {
                     let mut adjusted = None;
                     handler.text_for_range(start..end, &mut adjusted)
-                }).flatten();
+                })
+                .flatten();
 
                 match text {
                     Some(s) => unsafe {
                         let c_str = std::ffi::CString::new(s).unwrap_or_default();
-                        let ns_string: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c_str.as_ptr()];
+                        let ns_string: *mut Object =
+                            msg_send![class!(NSString), stringWithUTF8String: c_str.as_ptr()];
                         let attributed: *mut Object = msg_send![class!(NSAttributedString), alloc];
-                        let attributed: *mut Object = msg_send![attributed, initWithString: ns_string];
+                        let attributed: *mut Object =
+                            msg_send![attributed, initWithString: ns_string];
                         attributed
                     },
                     None => std::ptr::null_mut(),
@@ -889,7 +915,8 @@ fn register_metal_view_class() -> &'static Class {
             _sel: Sel,
             position: *mut Object,
             other: *mut Object,
-        ) -> i64 { // NSComparisonResult
+        ) -> i64 {
+            // NSComparisonResult
             let Some(a) = get_position_index(position) else {
                 return 0; // NSOrderedSame
             };
@@ -898,9 +925,9 @@ fn register_metal_view_class() -> &'static Class {
             };
 
             match a.cmp(&b) {
-                std::cmp::Ordering::Less => -1,    // NSOrderedAscending
-                std::cmp::Ordering::Equal => 0,    // NSOrderedSame
-                std::cmp::Ordering::Greater => 1,  // NSOrderedDescending
+                std::cmp::Ordering::Less => -1,   // NSOrderedAscending
+                std::cmp::Ordering::Equal => 0,   // NSOrderedSame
+                std::cmp::Ordering::Greater => 1, // NSOrderedDescending
             }
         }
 
@@ -957,14 +984,16 @@ fn register_metal_view_class() -> &'static Class {
                 // Get document length
                 let doc_end = with_input_handler(this, |handler| {
                     let mut adjusted = None;
-                    handler.text_for_range(0..usize::MAX, &mut adjusted)
+                    handler
+                        .text_for_range(0..usize::MAX, &mut adjusted)
                         .map(|s| s.encode_utf16().count())
                         .unwrap_or(0)
-                }).unwrap_or(0);
+                })
+                .unwrap_or(0);
 
                 match direction {
-                    1 | 2 => create_text_range(0, index),           // left/up - to beginning
-                    _ => create_text_range(index, doc_end),         // right/down - to end
+                    1 | 2 => create_text_range(0, index), // left/up - to beginning
+                    _ => create_text_range(index, doc_end), // right/down - to end
                 }
             }));
 
@@ -980,17 +1009,22 @@ fn register_metal_view_class() -> &'static Class {
 
         // UITextInput - caretRectForPosition: (CRITICAL for keyboard to appear!)
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
-        extern "C" fn caret_rect_for_position(this: &Object, _sel: Sel, position: *mut Object) -> IOSCGRect {
-            let default_rect = IOSCGRect::new(IOSCGPoint::new(20.0, 100.0), IOSCGSize::new(2.0, 20.0));
+        extern "C" fn caret_rect_for_position(
+            this: &Object,
+            _sel: Sel,
+            position: *mut Object,
+        ) -> IOSCGRect {
+            let default_rect =
+                IOSCGRect::new(IOSCGPoint::new(20.0, 100.0), IOSCGSize::new(2.0, 20.0));
 
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some(index) = get_position_index(position) else {
                     return default_rect;
                 };
 
-                let bounds = with_input_handler(this, |handler| {
-                    handler.bounds_for_range(index..index)
-                }).flatten();
+                let bounds =
+                    with_input_handler(this, |handler| handler.bounds_for_range(index..index))
+                        .flatten();
 
                 match bounds {
                     Some(b) => IOSCGRect::new(
@@ -1009,17 +1043,22 @@ fn register_metal_view_class() -> &'static Class {
 
         // UITextInput - firstRectForRange:
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
-        extern "C" fn first_rect_for_range(this: &Object, _sel: Sel, range: *mut Object) -> IOSCGRect {
-            let default_rect = IOSCGRect::new(IOSCGPoint::new(20.0, 100.0), IOSCGSize::new(100.0, 20.0));
+        extern "C" fn first_rect_for_range(
+            this: &Object,
+            _sel: Sel,
+            range: *mut Object,
+        ) -> IOSCGRect {
+            let default_rect =
+                IOSCGRect::new(IOSCGPoint::new(20.0, 100.0), IOSCGSize::new(100.0, 20.0));
 
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some((start, end)) = get_range_indices(range) else {
                     return default_rect;
                 };
 
-                let bounds = with_input_handler(this, |handler| {
-                    handler.bounds_for_range(start..end)
-                }).flatten();
+                let bounds =
+                    with_input_handler(this, |handler| handler.bounds_for_range(start..end))
+                        .flatten();
 
                 match bounds {
                     Some(b) => IOSCGRect::new(
@@ -1037,23 +1076,30 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // UITextInput - selectionRectsForRange: (for selection handles)
-        extern "C" fn selection_rects_for_range(_this: &Object, _sel: Sel, _range: *mut Object) -> *mut Object {
+        extern "C" fn selection_rects_for_range(
+            _this: &Object,
+            _sel: Sel,
+            _range: *mut Object,
+        ) -> *mut Object {
             // Return empty array - we handle selection rendering ourselves
-            unsafe {
-                msg_send![class!(NSArray), array]
-            }
+            unsafe { msg_send![class!(NSArray), array] }
         }
 
         // UITextInput - closestPositionToPoint:
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
-        extern "C" fn closest_position_to_point(this: &Object, _sel: Sel, point: IOSCGPoint) -> *mut Object {
+        extern "C" fn closest_position_to_point(
+            this: &Object,
+            _sel: Sel,
+            point: IOSCGPoint,
+        ) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let index = with_input_handler(this, |handler| {
                     handler.character_index_for_point(Point::new(
                         px(point.x as f32),
                         px(point.y as f32),
                     ))
-                }).flatten();
+                })
+                .flatten();
 
                 create_text_position(index.unwrap_or(0))
             }));
@@ -1074,7 +1120,9 @@ fn register_metal_view_class() -> &'static Class {
             let pos = closest_position_to_point(this, _sel, point);
 
             // Clamp to range if valid
-            if let (Some(index), Some((start, end))) = (get_position_index(pos), get_range_indices(range)) {
+            if let (Some(index), Some((start, end))) =
+                (get_position_index(pos), get_range_indices(range))
+            {
                 let clamped = index.clamp(start, end);
                 return create_text_position(clamped);
             }
@@ -1083,7 +1131,11 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // UITextInput - characterRangeAtPoint:
-        extern "C" fn character_range_at_point(this: &Object, _sel: Sel, point: IOSCGPoint) -> *mut Object {
+        extern "C" fn character_range_at_point(
+            this: &Object,
+            _sel: Sel,
+            point: IOSCGPoint,
+        ) -> *mut Object {
             let pos = closest_position_to_point(this, _sel, point);
             let Some(index) = get_position_index(pos) else {
                 return std::ptr::null_mut();
@@ -1204,7 +1256,11 @@ fn register_metal_view_class() -> &'static Class {
 
             // Tap-to-dismiss: resign first responder (hides keyboard) when tapped.
             // Triggered by the UITapGestureRecognizer added in IosWindow::new.
-            extern "C" fn dismiss_keyboard_on_tap(this: &mut Object, _sel: Sel, _recognizer: *mut Object) {
+            extern "C" fn dismiss_keyboard_on_tap(
+                this: &mut Object,
+                _sel: Sel,
+                _recognizer: *mut Object,
+            ) {
                 unsafe {
                     let _: BOOL = msg_send![this, resignFirstResponder];
                 }
@@ -1267,7 +1323,8 @@ fn register_metal_view_class() -> &'static Class {
             );
             decl.add_method(
                 sel!(replaceRange:withText:),
-                replace_range_with_text as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
+                replace_range_with_text
+                    as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
             );
             decl.add_method(
                 sel!(setMarkedText:selectedRange:),
@@ -1279,7 +1336,8 @@ fn register_metal_view_class() -> &'static Class {
             );
             decl.add_method(
                 sel!(attributedSubstringFromRange:),
-                attributed_substring_from_range as extern "C" fn(&Object, Sel, *mut Object) -> *mut Object,
+                attributed_substring_from_range
+                    as extern "C" fn(&Object, Sel, *mut Object) -> *mut Object,
             );
 
             // ============================================
@@ -1287,15 +1345,18 @@ fn register_metal_view_class() -> &'static Class {
             // ============================================
             decl.add_method(
                 sel!(positionFromPosition:offset:),
-                position_from_position_offset as extern "C" fn(&Object, Sel, *mut Object, isize) -> *mut Object,
+                position_from_position_offset
+                    as extern "C" fn(&Object, Sel, *mut Object, isize) -> *mut Object,
             );
             decl.add_method(
                 sel!(positionFromPosition:inDirection:offset:),
-                position_from_position_in_direction as extern "C" fn(&Object, Sel, *mut Object, i64, isize) -> *mut Object,
+                position_from_position_in_direction
+                    as extern "C" fn(&Object, Sel, *mut Object, i64, isize) -> *mut Object,
             );
             decl.add_method(
                 sel!(textRangeFromPosition:toPosition:),
-                text_range_from_position_to_position as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> *mut Object,
+                text_range_from_position_to_position
+                    as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> *mut Object,
             );
             decl.add_method(
                 sel!(comparePosition:toPosition:),
@@ -1303,15 +1364,18 @@ fn register_metal_view_class() -> &'static Class {
             );
             decl.add_method(
                 sel!(offsetFromPosition:toPosition:),
-                offset_from_position as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> isize,
+                offset_from_position
+                    as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> isize,
             );
             decl.add_method(
                 sel!(positionWithinRange:farthestInDirection:),
-                position_within_range_farthest as extern "C" fn(&Object, Sel, *mut Object, i64) -> *mut Object,
+                position_within_range_farthest
+                    as extern "C" fn(&Object, Sel, *mut Object, i64) -> *mut Object,
             );
             decl.add_method(
                 sel!(characterRangeByExtendingPosition:inDirection:),
-                character_range_by_extending as extern "C" fn(&Object, Sel, *mut Object, i64) -> *mut Object,
+                character_range_by_extending
+                    as extern "C" fn(&Object, Sel, *mut Object, i64) -> *mut Object,
             );
 
             // ============================================
@@ -1327,7 +1391,8 @@ fn register_metal_view_class() -> &'static Class {
             );
             decl.add_method(
                 sel!(selectionRectsForRange:),
-                selection_rects_for_range as extern "C" fn(&Object, Sel, *mut Object) -> *mut Object,
+                selection_rects_for_range
+                    as extern "C" fn(&Object, Sel, *mut Object) -> *mut Object,
             );
             decl.add_method(
                 sel!(closestPositionToPoint:),
@@ -1335,7 +1400,8 @@ fn register_metal_view_class() -> &'static Class {
             );
             decl.add_method(
                 sel!(closestPositionToPoint:withinRange:),
-                closest_position_to_point_within_range as extern "C" fn(&Object, Sel, IOSCGPoint, *mut Object) -> *mut Object,
+                closest_position_to_point_within_range
+                    as extern "C" fn(&Object, Sel, IOSCGPoint, *mut Object) -> *mut Object,
             );
             decl.add_method(
                 sel!(characterRangeAtPoint:),

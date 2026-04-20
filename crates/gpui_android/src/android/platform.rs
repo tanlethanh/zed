@@ -10,16 +10,16 @@ use futures::channel::oneshot;
 use jni::{JavaVM, objects::GlobalRef};
 use ndk::looper::ThreadLooper;
 
-use gpui_wgpu::WgpuContext;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
-    DummyKeyboardMapper, DispatchEventResult, ForegroundExecutor, Keymap, Menu, MenuItem,
-    Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, OwnedMenu, PathPromptOptions, Pixels,
-    Platform, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper,
-    PlatformTextSystem, PlatformWindow, Point, RequestFrameOptions, RunnableVariant,
-    ScrollDelta, ScrollWheelEvent, Task, ThermalState, TouchPhase, WindowAppearance, WindowParams,
-    point, px,
+    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DispatchEventResult,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, Modifiers, MouseButton,
+    MouseDownEvent, MouseUpEvent, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
+    PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind,
+    PointerMoveEvent, PointerUpEvent, RequestFrameOptions, RunnableVariant, ScrollDelta,
+    ScrollWheelEvent, Task, ThermalState, TouchPhase, WindowAppearance, WindowParams, point, px,
 };
+use gpui_wgpu::WgpuContext;
 
 use super::dispatcher::{AndroidDispatcher, AndroidQueueReceiver};
 use super::keyboard::AndroidKeyboardLayout;
@@ -142,7 +142,10 @@ impl AndroidPlatform {
         self.display_scale.set(scale);
     }
 
-    pub fn attach_native_window(&self, native_window: ndk::native_window::NativeWindow) -> Result<()> {
+    pub fn attach_native_window(
+        &self,
+        native_window: ndk::native_window::NativeWindow,
+    ) -> Result<()> {
         let windows = self.windows.borrow();
         let window = windows
             .last()
@@ -150,7 +153,9 @@ impl AndroidPlatform {
             .ok_or_else(|| anyhow!("No windows available to attach surface"))?;
 
         let wgpu_context = self.ensure_wgpu_context()?;
-        window.borrow_mut().handle_surface_created(native_window, &wgpu_context)
+        window
+            .borrow_mut()
+            .handle_surface_created(native_window, &wgpu_context)
     }
 
     pub fn detach_native_window(&self) {
@@ -168,7 +173,10 @@ impl AndroidPlatform {
 
         let wgpu_context = self.ensure_wgpu_context()?;
 
-        let resize_info = window.borrow_mut().handle_surface_changed(width, height, &wgpu_context)?;
+        let resize_info =
+            window
+                .borrow_mut()
+                .handle_surface_changed(width, height, &wgpu_context)?;
         if let Some((size, scale)) = resize_info {
             let mut callback = window.borrow_mut().take_resize_callback();
             if let Some(ref mut cb) = callback {
@@ -194,7 +202,10 @@ impl AndroidPlatform {
                 .iter()
                 .filter_map(|w| w.upgrade())
                 .filter_map(|window| {
-                    window.borrow_mut().take_request_frame_callback().map(|cb| (window.clone(), cb))
+                    window
+                        .borrow_mut()
+                        .take_request_frame_callback()
+                        .map(|cb| (window.clone(), cb))
                 })
                 .collect()
         };
@@ -328,9 +339,9 @@ impl AndroidPlatform {
                         }
                     }
                     if state.is_drag {
-                        let delta = state.last_position.map(|(last_x, last_y)| {
-                            (logical_x - last_x, logical_y - last_y)
-                        });
+                        let delta = state
+                            .last_position
+                            .map(|(last_x, last_y)| (logical_x - last_x, logical_y - last_y));
                         state.last_position = Some((logical_x, logical_y));
                         (delta, true)
                     } else {
@@ -382,7 +393,8 @@ impl AndroidPlatform {
         let vy = velocity_y / scale;
 
         let mut state = self.touch_state.borrow_mut();
-        let position = state.last_position
+        let position = state
+            .last_position
             .map(|(x, y)| point(px(x), px(y)))
             .unwrap_or_default();
 
@@ -405,7 +417,10 @@ impl AndroidPlatform {
     pub fn process_fling(&self) {
         let fling_data = {
             let state = self.touch_state.borrow();
-            state.fling.as_ref().map(|f| (f.velocity_x, f.velocity_y, f.last_time, f.position))
+            state
+                .fling
+                .as_ref()
+                .map(|f| (f.velocity_x, f.velocity_y, f.last_time, f.position))
         };
         let Some((vx, vy, last_time, position)) = fling_data else {
             return;
@@ -455,8 +470,8 @@ impl AndroidPlatform {
             return Ok(ctx.clone());
         }
 
-        let ctx = WgpuContext::new()
-            .map_err(|e| anyhow!("Failed to create WgpuContext: {:?}", e))?;
+        let ctx =
+            WgpuContext::new().map_err(|e| anyhow!("Failed to create WgpuContext: {:?}", e))?;
 
         let ctx = Arc::new(ctx);
         *wgpu_context = Some(ctx.clone());
@@ -485,10 +500,13 @@ impl AndroidPlatform {
         const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc"];
 
         for dir in FONT_DIRS {
-            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_font = path.extension()
+                let is_font = path
+                    .extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|ext| FONT_EXTENSIONS.contains(&ext));
 

@@ -3,9 +3,9 @@
 //! iOS has a simpler display model than macOS - typically just the main screen
 //! and possibly an external display via AirPlay or USB-C.
 
-use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, px, size};
 use anyhow::Result;
 use core_graphics::geometry::CGRect;
+use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, px, size};
 use objc::{class, msg_send, sel, sel_impl};
 use uuid::Uuid;
 

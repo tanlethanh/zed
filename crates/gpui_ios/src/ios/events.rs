@@ -14,7 +14,6 @@ use gpui::{
     Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent,
     PointerUpEvent, ScrollDelta, ScrollWheelEvent, TouchPhase, px,
 };
-use core_graphics::geometry::CGPoint;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
 
 /// Touch phase from UIKit

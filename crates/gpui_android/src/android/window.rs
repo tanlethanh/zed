@@ -8,21 +8,20 @@ use std::{
 
 use anyhow::Result;
 use futures::channel::oneshot;
-use jni::{objects::GlobalRef, JavaVM};
+use jni::{JavaVM, objects::GlobalRef};
 use ndk::native_window::NativeWindow;
 use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, HasDisplayHandle, HasWindowHandle,
     RawDisplayHandle, RawWindowHandle,
 };
 
-use gpui_wgpu::{WgpuAtlas, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, DevicePixels, DispatchEventResult,
-    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, Scene, Size, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea,
+    AnyWindowHandle, Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea,
 };
+use gpui_wgpu::{WgpuAtlas, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -156,7 +155,8 @@ impl AndroidWindowState {
             ),
         };
 
-        let renderer = WgpuRenderer::new_with_atlas(context, &raw_window, config, Some(self.atlas.clone()))?;
+        let renderer =
+            WgpuRenderer::new_with_atlas(context, &raw_window, config, Some(self.atlas.clone()))?;
 
         self.native_window = Some(native_window);
         self.raw_window = Some(raw_window);
@@ -165,7 +165,12 @@ impl AndroidWindowState {
         Ok(())
     }
 
-    pub fn handle_surface_changed(&mut self, width: u32, height: u32, context: &WgpuContext) -> Result<Option<(Size<Pixels>, f32)>> {
+    pub fn handle_surface_changed(
+        &mut self,
+        width: u32,
+        height: u32,
+        context: &WgpuContext,
+    ) -> Result<Option<(Size<Pixels>, f32)>> {
         log::info!("AndroidWindow: surface changed to {}x{}", width, height);
 
         let new_bounds = Bounds {
@@ -192,11 +197,17 @@ impl AndroidWindowState {
                     size,
                     transparent: matches!(
                         self.background_appearance,
-                        WindowBackgroundAppearance::Transparent | WindowBackgroundAppearance::Blurred
+                        WindowBackgroundAppearance::Transparent
+                            | WindowBackgroundAppearance::Blurred
                     ),
                 };
 
-                let renderer = WgpuRenderer::new_with_atlas(context, raw_window, config, Some(self.atlas.clone()))?;
+                let renderer = WgpuRenderer::new_with_atlas(
+                    context,
+                    raw_window,
+                    config,
+                    Some(self.atlas.clone()),
+                )?;
                 self.renderer = Some(renderer);
             }
         }
@@ -298,7 +309,9 @@ impl AndroidWindow {
         native_window: NativeWindow,
         context: &WgpuContext,
     ) -> Result<()> {
-        self.state.borrow_mut().handle_surface_created(native_window, context)
+        self.state
+            .borrow_mut()
+            .handle_surface_created(native_window, context)
     }
 
     pub fn handle_surface_changed(
@@ -307,7 +320,10 @@ impl AndroidWindow {
         height: u32,
         context: &WgpuContext,
     ) -> Result<()> {
-        let resize_info = self.state.borrow_mut().handle_surface_changed(width, height, context)?;
+        let resize_info = self
+            .state
+            .borrow_mut()
+            .handle_surface_changed(width, height, context)?;
         if let Some((size, scale)) = resize_info {
             let mut callback = self.state.borrow_mut().take_resize_callback();
             if let Some(ref mut cb) = callback {

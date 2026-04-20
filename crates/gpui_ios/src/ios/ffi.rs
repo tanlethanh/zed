@@ -390,7 +390,10 @@ pub extern "C" fn gpui_ios_request_frame_forced(window_ptr: *mut c_void) {
 
     let callback = window.request_frame_callback.borrow_mut().take();
     if let Some(mut cb) = callback {
-        cb(RequestFrameOptions { force_render: true, ..Default::default() });
+        cb(RequestFrameOptions {
+            force_render: true,
+            ..Default::default()
+        });
         window.request_frame_callback.borrow_mut().replace(cb);
     }
 }
@@ -552,7 +555,9 @@ pub extern "C" fn gpui_ios_handle_view_resize(
 /// # Safety
 /// The window_ptr must be a valid pointer to an IosWindow.
 #[unsafe(no_mangle)]
-pub extern "C" fn gpui_ios_get_ui_window(window_ptr: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+pub extern "C" fn gpui_ios_get_ui_window(
+    window_ptr: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
     if window_ptr.is_null() {
         return std::ptr::null_mut();
     }
@@ -560,4 +565,3 @@ pub extern "C" fn gpui_ios_get_ui_window(window_ptr: *mut std::ffi::c_void) -> *
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
     window.ui_window() as *mut std::ffi::c_void
 }
-
