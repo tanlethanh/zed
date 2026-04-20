@@ -18,13 +18,14 @@
 use crate::PinchEvent;
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
-    DispatchPhase, Display, Edges, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
-    Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
-    KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
-    MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
-    Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    DispatchPhase, Display, Edges, Element, ElementId, Entity, FocusHandle, Global,
+    GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero,
+    KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId,
+    ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
+    MousePressureEvent, MouseUpEvent, Overflow, ParentElement, Pixels, Point, PointerCancelEvent,
+    PointerDownEvent, PointerMoveEvent, PointerUpEvent, Render, ScrollWheelEvent, SharedString,
+    Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea,
+    point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -170,6 +171,34 @@ impl Interactivity {
             }));
     }
 
+    /// Bind the given callback to the pointer down event during the bubble phase.
+    /// The imperative API equivalent of [`InteractiveElement::on_pointer_down`].
+    pub fn on_pointer_down(
+        &mut self,
+        listener: impl Fn(&PointerDownEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.pointer_down_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
+    /// Bind the given callback to the pointer down event during the capture phase.
+    /// The imperative API equivalent of [`InteractiveElement::capture_any_pointer_down`].
+    pub fn capture_any_pointer_down(
+        &mut self,
+        listener: impl Fn(&PointerDownEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.pointer_down_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
     /// Bind the given callback to the mouse pressure event, during the bubble phase
     /// the imperative API equivalent to [`InteractiveElement::on_mouse_pressure`].
     ///
@@ -301,6 +330,48 @@ impl Interactivity {
         listener: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static,
     ) {
         self.mouse_move_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind the given callback to the pointer move event during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_pointer_move`].
+    pub fn on_pointer_move(
+        &mut self,
+        listener: impl Fn(&PointerMoveEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.pointer_move_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind the given callback to the pointer up event during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_pointer_up`].
+    pub fn on_pointer_up(
+        &mut self,
+        listener: impl Fn(&PointerUpEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.pointer_up_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind the given callback to the pointer cancel event during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_pointer_cancel`].
+    pub fn on_pointer_cancel(
+        &mut self,
+        listener: impl Fn(&PointerCancelEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.pointer_cancel_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
                     (listener)(event, window, cx);
@@ -565,7 +636,9 @@ impl Interactivity {
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) {
         self.long_press_listeners
-            .push(Rc::new(move |event, window, cx| listener(event, window, cx)));
+            .push(Rc::new(move |event, window, cx| {
+                listener(event, window, cx)
+            }));
     }
 
     /// Bind the given callback to non-primary click events of this element.
@@ -805,6 +878,26 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Bind the given callback to the pointer down event during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_pointer_down`].
+    fn on_pointer_down(
+        mut self,
+        listener: impl Fn(&PointerDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_pointer_down(listener);
+        self
+    }
+
+    /// Bind the given callback to the pointer down event during the capture phase.
+    /// The fluent API equivalent to [`Interactivity::capture_any_pointer_down`].
+    fn capture_any_pointer_down(
+        mut self,
+        listener: impl Fn(&PointerDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_any_pointer_down(listener);
+        self
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     /// Set a key that can be used to look up this element's bounds
     /// in the [`crate::VisualTestContext::debug_bounds`] map
@@ -932,6 +1025,36 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().on_mouse_move(listener);
+        self
+    }
+
+    /// Bind the given callback to the pointer move event during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_pointer_move`].
+    fn on_pointer_move(
+        mut self,
+        listener: impl Fn(&PointerMoveEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_pointer_move(listener);
+        self
+    }
+
+    /// Bind the given callback to the pointer up event during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_pointer_up`].
+    fn on_pointer_up(
+        mut self,
+        listener: impl Fn(&PointerUpEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_pointer_up(listener);
+        self
+    }
+
+    /// Bind the given callback to the pointer cancel event during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_pointer_cancel`].
+    fn on_pointer_cancel(
+        mut self,
+        listener: impl Fn(&PointerCancelEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_pointer_cancel(listener);
         self
     }
 
@@ -1395,6 +1518,14 @@ pub(crate) type MouseDownListener =
     Box<dyn Fn(&MouseDownEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 pub(crate) type MouseUpListener =
     Box<dyn Fn(&MouseUpEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+pub(crate) type PointerDownListener =
+    Box<dyn Fn(&PointerDownEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+pub(crate) type PointerMoveListener =
+    Box<dyn Fn(&PointerMoveEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+pub(crate) type PointerUpListener =
+    Box<dyn Fn(&PointerUpEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+pub(crate) type PointerCancelListener =
+    Box<dyn Fn(&PointerCancelEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 pub(crate) type MousePressureListener =
     Box<dyn Fn(&MousePressureEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 pub(crate) type MouseMoveListener =
@@ -1408,8 +1539,7 @@ pub(crate) type PinchListener =
 
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
-pub(crate) type LongPressListener =
-    Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
+pub(crate) type LongPressListener = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) type DragListener =
     Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>;
@@ -1760,6 +1890,10 @@ pub struct Interactivity {
     pub(crate) group_drag_over_styles: Vec<(TypeId, GroupStyle)>,
     pub(crate) mouse_down_listeners: Vec<MouseDownListener>,
     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
+    pub(crate) pointer_down_listeners: Vec<PointerDownListener>,
+    pub(crate) pointer_move_listeners: Vec<PointerMoveListener>,
+    pub(crate) pointer_up_listeners: Vec<PointerUpListener>,
+    pub(crate) pointer_cancel_listeners: Vec<PointerCancelListener>,
     pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
@@ -1967,6 +2101,10 @@ impl Interactivity {
             || self.group_hover_style.is_some()
             || self.hover_listener.is_some()
             || !self.mouse_up_listeners.is_empty()
+            || !self.pointer_down_listeners.is_empty()
+            || !self.pointer_move_listeners.is_empty()
+            || !self.pointer_up_listeners.is_empty()
+            || !self.pointer_cancel_listeners.is_empty()
             || !self.mouse_pressure_listeners.is_empty()
             || !self.mouse_down_listeners.is_empty()
             || !self.mouse_move_listeners.is_empty()
@@ -2316,6 +2454,34 @@ impl Interactivity {
         for listener in self.mouse_up_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.pointer_down_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_pointer_event(move |event: &PointerDownEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.pointer_move_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_pointer_event(move |event: &PointerMoveEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.pointer_up_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_pointer_event(move |event: &PointerUpEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.pointer_cancel_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_pointer_event(move |event: &PointerCancelEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
         }
@@ -3021,8 +3187,7 @@ pub struct InteractiveElementState {
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     /// Pending long-press state: (touch-down position, cancellation task).
     /// Dropping the Task cancels the timer before it fires.
-    pub(crate) pending_long_press:
-        Option<Rc<RefCell<Option<(Point<Pixels>, Task<()>)>>>>,
+    pub(crate) pending_long_press: Option<Rc<RefCell<Option<(Point<Pixels>, Task<()>)>>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.

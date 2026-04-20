@@ -3,8 +3,9 @@ use std::rc::Rc;
 use gpui::{
     Capslock, DispatchEventResult, ExternalPaths, FileDropEvent, KeyDownEvent, KeyUpEvent,
     Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, PointerButton,
+    PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent, PointerUpEvent,
+    ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
 };
 use smallvec::smallvec;
 use wasm_bindgen::prelude::*;
@@ -55,6 +56,7 @@ impl WebWindowInner {
         let mut closures = vec![
             self.register_pointer_down(),
             self.register_pointer_up(),
+            self.register_pointer_cancel(),
             self.register_pointer_move(),
             self.register_pointer_leave(),
             self.register_wheel(),
@@ -150,6 +152,14 @@ impl WebWindowInner {
                 current_state.modifiers = modifiers;
             }
 
+            this.dispatch_input(PlatformInput::PointerDown(PointerDownEvent {
+                pointer_id: event.pointer_id() as u64,
+                kind: pointer_kind_from_dom_event(&event),
+                is_primary: event.is_primary(),
+                button: dom_pointer_button_to_gpui(event.button()),
+                position,
+                modifiers,
+            }));
             this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
                 button,
                 position,
@@ -179,11 +189,46 @@ impl WebWindowInner {
                 current_state.modifiers = modifiers;
             }
 
+            this.dispatch_input(PlatformInput::PointerUp(PointerUpEvent {
+                pointer_id: event.pointer_id() as u64,
+                kind: pointer_kind_from_dom_event(&event),
+                is_primary: event.is_primary(),
+                button: dom_pointer_button_to_gpui(event.button()),
+                position,
+                modifiers,
+            }));
             this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
                 button,
                 position,
                 modifiers,
                 click_count,
+            }));
+        })
+    }
+
+    fn register_pointer_cancel(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
+        let this = Rc::clone(self);
+        self.listen("pointercancel", move |event: JsValue| {
+            let event: web_sys::PointerEvent = event.unchecked_into();
+            event.prevent_default();
+
+            let position = pointer_position_in_element(&event);
+            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+
+            this.pressed_button.set(None);
+
+            {
+                let mut current_state = this.state.borrow_mut();
+                current_state.mouse_position = position;
+                current_state.modifiers = modifiers;
+            }
+
+            this.dispatch_input(PlatformInput::PointerCancel(PointerCancelEvent {
+                pointer_id: event.pointer_id() as u64,
+                kind: pointer_kind_from_dom_event(&event),
+                is_primary: event.is_primary(),
+                position,
+                modifiers,
             }));
         })
     }
@@ -204,6 +249,14 @@ impl WebWindowInner {
                 current_state.modifiers = modifiers;
             }
 
+            this.dispatch_input(PlatformInput::PointerMove(PointerMoveEvent {
+                pointer_id: event.pointer_id() as u64,
+                kind: pointer_kind_from_dom_event(&event),
+                is_primary: event.is_primary(),
+                pressed_button: current_pressed.map(PointerButton::from),
+                position,
+                modifiers,
+            }));
             this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
                 position,
                 pressed_button: current_pressed,
@@ -561,6 +614,26 @@ fn dom_mouse_button_to_gpui(button: i16) -> MouseButton {
         3 => MouseButton::Navigate(NavigationDirection::Back),
         4 => MouseButton::Navigate(NavigationDirection::Forward),
         _ => MouseButton::Left,
+    }
+}
+
+fn dom_pointer_button_to_gpui(button: i16) -> PointerButton {
+    match button {
+        0 => PointerButton::Primary,
+        1 => PointerButton::Auxiliary,
+        2 => PointerButton::Secondary,
+        3 => PointerButton::Navigate(NavigationDirection::Back),
+        4 => PointerButton::Navigate(NavigationDirection::Forward),
+        _ => PointerButton::Primary,
+    }
+}
+
+fn pointer_kind_from_dom_event(event: &web_sys::PointerEvent) -> PointerKind {
+    match event.pointer_type().as_str() {
+        "mouse" => PointerKind::Mouse,
+        "touch" => PointerKind::Touch,
+        "pen" => PointerKind::Stylus,
+        _ => PointerKind::Unknown,
     }
 }
 

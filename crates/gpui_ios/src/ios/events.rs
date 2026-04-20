@@ -8,9 +8,11 @@
 //! - Pinch gesture → Zoom events (if supported)
 //! - Touch move → MouseMove events
 
+use core_graphics::geometry::CGPoint;
 use gpui::{
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput,
-    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, px,
+    Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent,
+    PointerUpEvent, ScrollDelta, ScrollWheelEvent, TouchPhase, px,
 };
 use core_graphics::geometry::CGPoint;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
@@ -98,6 +100,22 @@ pub fn touch_began_to_mouse_down(
     })
 }
 
+/// Convert a single touch began event to a pointer down event.
+pub fn touch_began_to_pointer_down(
+    position: Point<Pixels>,
+    pointer_id: u64,
+    modifiers: Modifiers,
+) -> PlatformInput {
+    PlatformInput::PointerDown(PointerDownEvent {
+        pointer_id,
+        kind: PointerKind::Touch,
+        is_primary: true,
+        button: PointerButton::Primary,
+        position,
+        modifiers,
+    })
+}
+
 /// Convert a touch ended event to a mouse up event
 pub fn touch_ended_to_mouse_up(
     position: Point<Pixels>,
@@ -112,6 +130,22 @@ pub fn touch_ended_to_mouse_up(
     })
 }
 
+/// Convert a touch ended event to a pointer up event.
+pub fn touch_ended_to_pointer_up(
+    position: Point<Pixels>,
+    pointer_id: u64,
+    modifiers: Modifiers,
+) -> PlatformInput {
+    PlatformInput::PointerUp(PointerUpEvent {
+        pointer_id,
+        kind: PointerKind::Touch,
+        is_primary: true,
+        button: PointerButton::Primary,
+        position,
+        modifiers,
+    })
+}
+
 /// Convert a touch moved event to a mouse move event
 pub fn touch_moved_to_mouse_move(
     position: Point<Pixels>,
@@ -122,6 +156,37 @@ pub fn touch_moved_to_mouse_move(
         position,
         modifiers,
         pressed_button,
+    })
+}
+
+/// Convert a touch moved event to a pointer move event.
+pub fn touch_moved_to_pointer_move(
+    position: Point<Pixels>,
+    pointer_id: u64,
+    modifiers: Modifiers,
+) -> PlatformInput {
+    PlatformInput::PointerMove(PointerMoveEvent {
+        pointer_id,
+        kind: PointerKind::Touch,
+        is_primary: true,
+        pressed_button: Some(PointerButton::Primary),
+        position,
+        modifiers,
+    })
+}
+
+/// Convert a touch cancellation into a pointer cancel event.
+pub fn touch_cancelled_to_pointer_cancel(
+    position: Point<Pixels>,
+    pointer_id: u64,
+    modifiers: Modifiers,
+) -> PlatformInput {
+    PlatformInput::PointerCancel(PointerCancelEvent {
+        pointer_id,
+        kind: PointerKind::Touch,
+        is_primary: true,
+        position,
+        modifiers,
     })
 }
 

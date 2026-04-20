@@ -1886,6 +1886,13 @@ impl IosWindow {
                     self.last_move_ts.set(0.0);
                     *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
                     *self.fling.borrow_mut() = None;
+                    if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                        callback(touch_began_to_pointer_down(
+                            position,
+                            touch_ptr as u64,
+                            modifiers,
+                        ));
+                    }
                     touch_began_to_mouse_down(position, tap_count, modifiers)
                 } else {
                     // Secondary finger down — cancel fling/velocity to prevent
@@ -1927,10 +1934,17 @@ impl IosWindow {
                 // produce ScrollWheel events; without a paired MouseMove the long-press
                 // timer runs uninterrupted through any scroll gesture, firing the delete
                 // dialog on what the user intended as a tap or swipe.
-                let move_input =
-                    touch_moved_to_mouse_move(position, modifiers, Some(gpui::MouseButton::Left));
                 if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-                    callback(move_input);
+                    callback(touch_moved_to_pointer_move(
+                        position,
+                        touch_ptr as u64,
+                        modifiers,
+                    ));
+                    callback(touch_moved_to_mouse_move(
+                        position,
+                        modifiers,
+                        Some(gpui::MouseButton::Left),
+                    ));
                 }
                 // Use the DOWN position so DrawerHost's edge-zone check (pos_x < EDGE_ZONE)
                 // sees where the gesture started, not where the finger currently is.
@@ -1943,6 +1957,21 @@ impl IosWindow {
                 }
                 self.primary_touch_ptr.set(0);
                 self.touch_pressed.set(false);
+                if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                    if phase == UITouchPhase::Cancelled {
+                        callback(touch_cancelled_to_pointer_cancel(
+                            position,
+                            touch_ptr as u64,
+                            modifiers,
+                        ));
+                    } else {
+                        callback(touch_ended_to_pointer_up(
+                            position,
+                            touch_ptr as u64,
+                            modifiers,
+                        ));
+                    }
+                }
                 // Start fling if velocity exceeds threshold
                 if phase == UITouchPhase::Ended {
                     let vx = self.touch_velocity_x.get();
@@ -1966,7 +1995,7 @@ impl IosWindow {
                 let down_pos = self.touch_down_position.get();
                 let dx = f32::from(position.x) - f32::from(down_pos.x);
                 let dy = f32::from(position.y) - f32::from(down_pos.y);
-                if (dx * dx + dy * dy).sqrt() > TAP_SLOP {
+                if phase == UITouchPhase::Cancelled || (dx * dx + dy * dy).sqrt() > TAP_SLOP {
                     return;
                 }
                 touch_ended_to_mouse_up(position, tap_count, modifiers)

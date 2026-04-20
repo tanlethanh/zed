@@ -259,6 +259,14 @@ impl AndroidPlatform {
                 state.down_position = Some((logical_x, logical_y));
                 state.last_position = Some((logical_x, logical_y));
                 state.is_drag = false;
+                self.dispatch_input(PlatformInput::PointerDown(PointerDownEvent {
+                    pointer_id: 1,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
             }
             1 => {
                 // ACTION_UP
@@ -291,6 +299,14 @@ impl AndroidPlatform {
                         touch_phase: TouchPhase::Ended,
                     }));
                 }
+                self.dispatch_input(PlatformInput::PointerUp(PointerUpEvent {
+                    pointer_id: 1,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
                 self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
                     button: MouseButton::Left,
                     position,
@@ -322,6 +338,14 @@ impl AndroidPlatform {
                         (None, false)
                     }
                 };
+                self.dispatch_input(PlatformInput::PointerMove(PointerMoveEvent {
+                    pointer_id: 1,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    pressed_button: Some(PointerButton::Primary),
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
                 if should_scroll {
                     if let Some((dx, dy)) = scroll_delta {
                         self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
@@ -339,6 +363,13 @@ impl AndroidPlatform {
                 state.last_position = None;
                 state.down_position = None;
                 state.is_drag = false;
+                self.dispatch_input(PlatformInput::PointerCancel(PointerCancelEvent {
+                    pointer_id: 1,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
             }
             _ => {}
         }

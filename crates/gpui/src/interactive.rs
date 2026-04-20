@@ -17,6 +17,9 @@ pub trait KeyEvent: InputEvent {}
 /// A mouse event from the platform.
 pub trait MouseEvent: InputEvent {}
 
+/// A pointer event from the platform.
+pub trait PointerEvent: InputEvent {}
+
 /// A gesture event from the platform.
 pub trait GestureEvent: InputEvent {}
 
@@ -395,6 +398,183 @@ pub enum NavigationDirection {
     Forward,
 }
 
+/// A stable identifier for an active pointer contact.
+pub type PointerId = u64;
+
+/// A high-level pointer source.
+#[derive(Hash, Default, PartialEq, Eq, Copy, Clone, Debug)]
+pub enum PointerKind {
+    /// A traditional mouse or trackpad-backed pointer.
+    #[default]
+    Mouse,
+    /// A direct finger contact.
+    Touch,
+    /// A stylus or digital pen.
+    Stylus,
+    /// A pointer whose source is not known.
+    Unknown,
+}
+
+/// A pointer button or contact role.
+#[derive(Hash, Default, PartialEq, Eq, Copy, Clone, Debug)]
+pub enum PointerButton {
+    /// The platform-primary pointer button or direct touch contact.
+    #[default]
+    Primary,
+    /// The platform-secondary pointer button.
+    Secondary,
+    /// The platform-auxiliary pointer button.
+    Auxiliary,
+    /// A navigation button, such as back or forward.
+    Navigate(NavigationDirection),
+}
+
+impl From<MouseButton> for PointerButton {
+    fn from(button: MouseButton) -> Self {
+        match button {
+            MouseButton::Left => PointerButton::Primary,
+            MouseButton::Right => PointerButton::Secondary,
+            MouseButton::Middle => PointerButton::Auxiliary,
+            MouseButton::Navigate(direction) => PointerButton::Navigate(direction),
+        }
+    }
+}
+
+impl From<PointerButton> for MouseButton {
+    fn from(button: PointerButton) -> Self {
+        match button {
+            PointerButton::Primary => MouseButton::Left,
+            PointerButton::Secondary => MouseButton::Right,
+            PointerButton::Auxiliary => MouseButton::Middle,
+            PointerButton::Navigate(direction) => MouseButton::Navigate(direction),
+        }
+    }
+}
+
+/// A pointer down event from the platform.
+#[derive(Clone, Debug, Default)]
+pub struct PointerDownEvent {
+    /// The logical pointer identifier.
+    pub pointer_id: PointerId,
+
+    /// The source device for this pointer.
+    pub kind: PointerKind,
+
+    /// Whether this is the platform-primary pointer.
+    pub is_primary: bool,
+
+    /// Which pointer button or contact became active.
+    pub button: PointerButton,
+
+    /// The position of the pointer on the window.
+    pub position: Point<Pixels>,
+
+    /// The modifiers that were held down when the pointer was pressed.
+    pub modifiers: Modifiers,
+}
+
+impl Sealed for PointerDownEvent {}
+impl InputEvent for PointerDownEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::PointerDown(self)
+    }
+}
+impl PointerEvent for PointerDownEvent {}
+
+/// A pointer move event from the platform.
+#[derive(Clone, Debug, Default)]
+pub struct PointerMoveEvent {
+    /// The logical pointer identifier.
+    pub pointer_id: PointerId,
+
+    /// The source device for this pointer.
+    pub kind: PointerKind,
+
+    /// Whether this is the platform-primary pointer.
+    pub is_primary: bool,
+
+    /// The pointer button or contact currently held, if any.
+    pub pressed_button: Option<PointerButton>,
+
+    /// The position of the pointer on the window.
+    pub position: Point<Pixels>,
+
+    /// The modifiers that were held down when the pointer moved.
+    pub modifiers: Modifiers,
+}
+
+impl Sealed for PointerMoveEvent {}
+impl InputEvent for PointerMoveEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::PointerMove(self)
+    }
+}
+impl PointerEvent for PointerMoveEvent {}
+
+impl PointerMoveEvent {
+    /// Returns true if the primary button or touch contact is currently held down.
+    pub fn dragging(&self) -> bool {
+        self.pressed_button == Some(PointerButton::Primary)
+    }
+}
+
+/// A pointer up event from the platform.
+#[derive(Clone, Debug, Default)]
+pub struct PointerUpEvent {
+    /// The logical pointer identifier.
+    pub pointer_id: PointerId,
+
+    /// The source device for this pointer.
+    pub kind: PointerKind,
+
+    /// Whether this is the platform-primary pointer.
+    pub is_primary: bool,
+
+    /// Which pointer button or contact ended.
+    pub button: PointerButton,
+
+    /// The position of the pointer on the window.
+    pub position: Point<Pixels>,
+
+    /// The modifiers that were held down when the pointer was released.
+    pub modifiers: Modifiers,
+}
+
+impl Sealed for PointerUpEvent {}
+impl InputEvent for PointerUpEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::PointerUp(self)
+    }
+}
+impl PointerEvent for PointerUpEvent {}
+
+/// A pointer cancel event from the platform.
+#[derive(Clone, Debug, Default)]
+pub struct PointerCancelEvent {
+    /// The logical pointer identifier.
+    pub pointer_id: PointerId,
+
+    /// The source device for this pointer.
+    pub kind: PointerKind,
+
+    /// Whether this is the platform-primary pointer.
+    pub is_primary: bool,
+
+    /// The last known position of the pointer on the window.
+    pub position: Point<Pixels>,
+
+    /// The modifiers that were held down when the pointer was cancelled.
+    pub modifiers: Modifiers,
+}
+
+impl Sealed for PointerCancelEvent {}
+impl InputEvent for PointerCancelEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::PointerCancel(self)
+    }
+}
+impl PointerEvent for PointerCancelEvent {}
+
 /// A mouse move event from the platform.
 #[derive(Clone, Debug, Default)]
 pub struct MouseMoveEvent {
@@ -654,6 +834,14 @@ pub enum PlatformInput {
     KeyUp(KeyUpEvent),
     /// The keyboard modifiers were changed.
     ModifiersChanged(ModifiersChangedEvent),
+    /// A pointer contact began.
+    PointerDown(PointerDownEvent),
+    /// A pointer moved.
+    PointerMove(PointerMoveEvent),
+    /// A pointer contact ended.
+    PointerUp(PointerUpEvent),
+    /// A pointer contact was cancelled by the platform.
+    PointerCancel(PointerCancelEvent),
     /// The mouse was pressed.
     MouseDown(MouseDownEvent),
     /// The mouse was released.
@@ -673,11 +861,35 @@ pub enum PlatformInput {
 }
 
 impl PlatformInput {
+    pub(crate) fn pointer_event(&self) -> Option<&dyn Any> {
+        match self {
+            PlatformInput::PointerDown(event) => Some(event),
+            PlatformInput::PointerMove(event) => Some(event),
+            PlatformInput::PointerUp(event) => Some(event),
+            PlatformInput::PointerCancel(event) => Some(event),
+            PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::MouseUp(_)
+            | PlatformInput::MouseMove(_)
+            | PlatformInput::MousePressure(_)
+            | PlatformInput::MouseExited(_)
+            | PlatformInput::ScrollWheel(_)
+            | PlatformInput::Pinch(_)
+            | PlatformInput::FileDrop(_) => None,
+        }
+    }
+
     pub(crate) fn mouse_event(&self) -> Option<&dyn Any> {
         match self {
             PlatformInput::KeyDown { .. } => None,
             PlatformInput::KeyUp { .. } => None,
             PlatformInput::ModifiersChanged { .. } => None,
+            PlatformInput::PointerDown(_) => None,
+            PlatformInput::PointerMove(_) => None,
+            PlatformInput::PointerUp(_) => None,
+            PlatformInput::PointerCancel(_) => None,
             PlatformInput::MouseDown(event) => Some(event),
             PlatformInput::MouseUp(event) => Some(event),
             PlatformInput::MouseMove(event) => Some(event),
@@ -694,6 +906,10 @@ impl PlatformInput {
             PlatformInput::KeyDown(event) => Some(event),
             PlatformInput::KeyUp(event) => Some(event),
             PlatformInput::ModifiersChanged(event) => Some(event),
+            PlatformInput::PointerDown(_) => None,
+            PlatformInput::PointerMove(_) => None,
+            PlatformInput::PointerUp(_) => None,
+            PlatformInput::PointerCancel(_) => None,
             PlatformInput::MouseDown(_) => None,
             PlatformInput::MouseUp(_) => None,
             PlatformInput::MouseMove(_) => None,
