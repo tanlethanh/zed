@@ -126,15 +126,16 @@ impl WgpuContext {
             .features()
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
+        // TODO: fix android integration
         // MoltenVK through the emulator's Vulkan proxy reports DSB as
         // available but requesting it triggers device lost.
-        if dual_source_blending_available && Self::is_android_emulator() {
-            log::info!(
-                "[gpui_wgpu] skipping dual-source blending on emulator \
-                (MoltenVK proxy does not reliably support it)"
-            );
-            dual_source_blending_available = false;
-        }
+        // if dual_source_blending_available && Self::is_android_emulator() {
+        //     log::info!(
+        //         "[gpui_wgpu] skipping dual-source blending on emulator \
+        //         (MoltenVK proxy does not reliably support it)"
+        //     );
+        //     dual_source_blending_available = false;
+        // }
 
         let mut required_features = wgpu::Features::empty();
         if dual_source_blending {
