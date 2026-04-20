@@ -2031,6 +2031,44 @@ impl IosWindow {
         }
     }
 
+    pub(super) fn inject_scroll(
+        &self,
+        position: Point<Pixels>,
+        delta: Point<Pixels>,
+        velocity: Point<Pixels>,
+        touch_phase: TouchPhase,
+    ) {
+        match touch_phase {
+            TouchPhase::Moved => {
+                *self.fling.borrow_mut() = None;
+            }
+            TouchPhase::Ended => {
+                let vx = f32::from(velocity.x);
+                let vy = f32::from(velocity.y);
+                if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
+                    *self.fling.borrow_mut() = Some(TouchFling {
+                        velocity_x: vx,
+                        velocity_y: vy,
+                        last_time: std::time::Instant::now(),
+                        position,
+                    });
+                } else {
+                    *self.fling.borrow_mut() = None;
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+            callback(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(delta),
+                modifiers: Modifiers::default(),
+                touch_phase,
+            }));
+        }
+    }
+
     /// Get the safe area insets
     pub fn safe_area_insets(&self) -> (f32, f32, f32, f32) {
         unsafe {

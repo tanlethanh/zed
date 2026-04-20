@@ -4,7 +4,7 @@
 //! Objective-C code in the iOS app delegate to initialize and control
 //! the GPUI application lifecycle.
 
-use gpui::RequestFrameOptions;
+use gpui::*;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
@@ -393,6 +393,35 @@ pub extern "C" fn gpui_ios_request_frame_forced(window_ptr: *mut c_void) {
         cb(RequestFrameOptions { force_render: true, ..Default::default() });
         window.request_frame_callback.borrow_mut().replace(cb);
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_inject_scroll(
+    window_ptr: *mut c_void,
+    origin_x: f32,
+    origin_y: f32,
+    delta_x: f32,
+    delta_y: f32,
+    velocity_x: f32,
+    velocity_y: f32,
+    phase: i32,
+) {
+    if window_ptr.is_null() {
+        return;
+    }
+
+    let touch_phase = match phase {
+        2 => TouchPhase::Ended,
+        _ => TouchPhase::Moved,
+    };
+
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.inject_scroll(
+        point(px(origin_x), px(origin_y)),
+        point(px(delta_x), px(delta_y)),
+        point(px(velocity_x), px(velocity_y)),
+        touch_phase,
+    );
 }
 
 /// Returns true when the software keyboard is visible (view is first responder).
