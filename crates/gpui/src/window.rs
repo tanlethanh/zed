@@ -4756,6 +4756,21 @@ impl Window {
         self.platform_window.minimize();
     }
 
+    /// Show the soft keyboard for the current window if the platform supports it.
+    pub fn show_soft_keyboard(&self) {
+        self.platform_window.show_soft_keyboard();
+    }
+
+    /// Hide the soft keyboard for the current window if the platform supports it.
+    pub fn hide_soft_keyboard(&self) {
+        self.platform_window.hide_soft_keyboard();
+    }
+
+    /// Returns whether the soft keyboard is visible for the current window.
+    pub fn is_soft_keyboard_visible(&self) -> bool {
+        self.platform_window.is_soft_keyboard_visible()
+    }
+
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();

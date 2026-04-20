@@ -2366,6 +2366,18 @@ impl PlatformWindow for IosWindow {
         handler
     }
 
+    fn show_soft_keyboard(&self) {
+        self.show_keyboard();
+    }
+
+    fn hide_soft_keyboard(&self) {
+        self.hide_keyboard();
+    }
+
+    fn is_soft_keyboard_visible(&self) -> bool {
+        self.is_keyboard_shown()
+    }
+
     fn prompt(
         &self,
         _level: PromptLevel,

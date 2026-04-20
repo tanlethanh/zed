@@ -608,6 +608,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
+    fn show_soft_keyboard(&self) {}
+    fn hide_soft_keyboard(&self) {}
+    fn is_soft_keyboard_visible(&self) -> bool {
+        false
+    }
     fn prompt(
         &self,
         level: PromptLevel,
