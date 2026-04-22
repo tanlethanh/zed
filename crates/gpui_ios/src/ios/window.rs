@@ -1928,7 +1928,6 @@ impl IosWindow {
         let touch_ptr = touch as usize;
         let position = touch_location_in_view(touch, self.view);
         let phase = touch_phase(touch);
-        let tap_count = touch_tap_count(touch);
         let modifiers = self.modifiers.get();
 
         self.mouse_position.set(position);
@@ -1959,7 +1958,7 @@ impl IosWindow {
                             modifiers,
                         ));
                     }
-                    touch_began_to_mouse_down(position, tap_count, modifiers)
+                    None
                 } else {
                     // Secondary finger down — cancel fling/velocity to prevent
                     // cross-contamination with the primary finger's scroll state.
@@ -1995,27 +1994,22 @@ impl IosWindow {
                 self.touch_velocity_y
                     .set(self.touch_velocity_y.get() * 0.7 + instant_vy * 0.3);
                 *self.touch_last_time.borrow_mut() = Some(now);
-                // Send a MouseMove so GPUI's long-press move-threshold handler can
-                // cancel the timer when the finger drifts. iOS touch moves only
-                // produce ScrollWheel events; without a paired MouseMove the long-press
-                // timer runs uninterrupted through any scroll gesture, firing the delete
-                // dialog on what the user intended as a tap or swipe.
                 if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
                     callback(touch_moved_to_pointer_move(
                         position,
                         touch_ptr as u64,
                         modifiers,
                     ));
-                    callback(touch_moved_to_mouse_move(
-                        position,
-                        modifiers,
-                        Some(gpui::MouseButton::Left),
-                    ));
                 }
                 // Use the DOWN position so DrawerHost's edge-zone check (pos_x < EDGE_ZONE)
                 // sees where the gesture started, not where the finger currently is.
                 let down_pos = self.touch_down_position.get();
-                pan_gesture_to_scroll(down_pos, delta, modifiers, phase.into())
+                Some(pan_gesture_to_scroll(
+                    down_pos,
+                    delta,
+                    modifiers,
+                    phase.into(),
+                ))
             }
             UITouchPhase::Ended | UITouchPhase::Cancelled => {
                 if touch_ptr != self.primary_touch_ptr.get() {
@@ -2051,25 +2045,14 @@ impl IosWindow {
                         });
                     }
                 }
-                // Suppress MouseUp (and therefore any click) when the finger moved
-                // beyond TAP_SLOP. Repaints triggered by ScrollWheel events are
-                // deferred to the next display-link tick, so element hitboxes are
-                // stale at the time MouseUp arrives. Without this guard, on_click
-                // handlers fire on scroll release because the row is still at its
-                // pre-scroll hitbox position.
-                const TAP_SLOP: f32 = 8.0;
-                let down_pos = self.touch_down_position.get();
-                let dx = f32::from(position.x) - f32::from(down_pos.x);
-                let dy = f32::from(position.y) - f32::from(down_pos.y);
-                if phase == UITouchPhase::Cancelled || (dx * dx + dy * dy).sqrt() > TAP_SLOP {
-                    return;
-                }
-                touch_ended_to_mouse_up(position, tap_count, modifiers)
+                None
             }
             UITouchPhase::Stationary => unreachable!(),
         };
 
-        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+        if let Some(platform_input) = platform_input
+            && let Some(callback) = self.input_callback.borrow_mut().as_mut()
+        {
             callback(platform_input);
         }
     }

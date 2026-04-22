@@ -22,10 +22,10 @@ use crate::{
     GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero,
     KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId,
     ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
-    MousePressureEvent, MouseUpEvent, Overflow, ParentElement, Pixels, Point, PointerCancelEvent,
-    PointerDownEvent, PointerMoveEvent, PointerUpEvent, Render, ScrollWheelEvent, SharedString,
-    Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea,
-    point, px, size,
+    MousePressureEvent, MouseUpEvent, Overflow, ParentElement, Pixels, Point, PointerButton,
+    PointerCancelEvent, PointerDownEvent, PointerId, PointerKind, PointerMoveEvent, PointerUpEvent,
+    PressEvent, Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
+    TooltipId, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -50,8 +50,21 @@ const DRAG_THRESHOLD: f64 = 2.;
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
 const LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
+const PRESS_MOVE_THRESHOLD: f64 = 8.;
 /// How far (logical px) a touch may drift before a long press is cancelled.
 const LONG_PRESS_MOVE_THRESHOLD: f64 = 8.;
+
+fn is_direct_primary_pointer_down(event: &PointerDownEvent) -> bool {
+    event.button == PointerButton::Primary && event.kind != PointerKind::Mouse
+}
+
+fn is_direct_primary_pointer_up(event: &PointerUpEvent) -> bool {
+    event.button == PointerButton::Primary && event.kind != PointerKind::Mouse
+}
+
+fn is_direct_pointer_kind(kind: PointerKind) -> bool {
+    kind != PointerKind::Mouse
+}
 
 /// The styling information for a given group.
 pub struct GroupStyle {
@@ -626,6 +639,42 @@ impl Interactivity {
         }));
     }
 
+    /// Bind the given callback to press events on this element (fires on
+    /// pointer up if the interaction remained within the press movement
+    /// threshold and no long-press consumed it).
+    pub fn on_press(&mut self, listener: impl Fn(&PressEvent, &mut Window, &mut App) + 'static)
+    where
+        Self: Sized,
+    {
+        self.press_listeners.push(Rc::new(move |event, window, cx| {
+            listener(event, window, cx)
+        }));
+    }
+
+    /// Bind the given callback to press-in events on this element (fires on
+    /// primary pointer down when the interaction begins inside the element).
+    pub fn on_press_in(&mut self, listener: impl Fn(&PressEvent, &mut Window, &mut App) + 'static)
+    where
+        Self: Sized,
+    {
+        self.press_in_listeners
+            .push(Rc::new(move |event, window, cx| {
+                listener(event, window, cx)
+            }));
+    }
+
+    /// Bind the given callback to press-out events on this element (fires when
+    /// a tracked press interaction ends or is cancelled).
+    pub fn on_press_out(&mut self, listener: impl Fn(&PressEvent, &mut Window, &mut App) + 'static)
+    where
+        Self: Sized,
+    {
+        self.press_out_listeners
+            .push(Rc::new(move |event, window, cx| {
+                listener(event, window, cx)
+            }));
+    }
+
     /// Bind the given callback to long-press events on this element (fires after the pointer has
     /// been held down without moving for [`LONG_PRESS_DURATION`]).
     /// The imperative API equivalent to [`StatefulInteractiveElement::on_long_press`].
@@ -633,7 +682,7 @@ impl Interactivity {
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_long_press(
         &mut self,
-        listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+        listener: impl Fn(&PressEvent, &mut Window, &mut App) + 'static,
     ) {
         self.long_press_listeners
             .push(Rc::new(move |event, window, cx| {
@@ -885,6 +934,56 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&PointerDownEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().on_pointer_down(listener);
+        self
+    }
+
+    /// Bind the given callback to press events on this element.
+    /// The fluent API equivalent to [`Interactivity::on_press`].
+    fn on_press(mut self, listener: impl Fn(&PressEvent, &mut Window, &mut App) + 'static) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_press(listener);
+        self
+    }
+
+    /// Bind the given callback to press-in events on this element.
+    /// The fluent API equivalent to [`Interactivity::on_press_in`].
+    fn on_press_in(
+        mut self,
+        listener: impl Fn(&PressEvent, &mut Window, &mut App) + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_press_in(listener);
+        self
+    }
+
+    /// Bind the given callback to press-out events on this element.
+    /// The fluent API equivalent to [`Interactivity::on_press_out`].
+    fn on_press_out(
+        mut self,
+        listener: impl Fn(&PressEvent, &mut Window, &mut App) + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_press_out(listener);
+        self
+    }
+
+    /// Bind the given callback to long-press events on this element (fires after the pointer has
+    /// been held down without moving for 500ms).
+    /// The fluent API equivalent to [`Interactivity::on_long_press`].
+    fn on_long_press(
+        mut self,
+        listener: impl Fn(&PressEvent, &mut Window, &mut App) + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_long_press(listener);
         self
     }
 
@@ -1424,22 +1523,6 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Bind the given callback to long-press events on this element (fires after the pointer has
-    /// been held down without moving for 500ms).
-    /// The fluent API equivalent to [`Interactivity::on_long_press`].
-    ///
-    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
-    fn on_long_press(
-        mut self,
-        listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    ) -> Self
-    where
-        Self: Sized,
-    {
-        self.interactivity().on_long_press(listener);
-        self
-    }
-
     /// Bind the given callback to non-primary click events of this element.
     /// The fluent API equivalent to [`Interactivity::on_aux_click`].
     ///
@@ -1539,7 +1622,13 @@ pub(crate) type PinchListener =
 
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
-pub(crate) type LongPressListener = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
+pub(crate) type PressListener = Rc<dyn Fn(&PressEvent, &mut Window, &mut App) + 'static>;
+
+pub(crate) type PressInListener = Rc<dyn Fn(&PressEvent, &mut Window, &mut App) + 'static>;
+
+pub(crate) type PressOutListener = Rc<dyn Fn(&PressEvent, &mut Window, &mut App) + 'static>;
+
+pub(crate) type LongPressListener = Rc<dyn Fn(&PressEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) type DragListener =
     Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>;
@@ -1905,6 +1994,9 @@ pub struct Interactivity {
     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
     pub(crate) click_listeners: Vec<ClickListener>,
+    pub(crate) press_listeners: Vec<PressListener>,
+    pub(crate) press_in_listeners: Vec<PressInListener>,
+    pub(crate) press_out_listeners: Vec<PressOutListener>,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) long_press_listeners: Vec<LongPressListener>,
     pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
@@ -1962,6 +2054,9 @@ impl Interactivity {
                 {
                     if let Some(pending_mouse_down) = element_state.pending_mouse_down.as_ref() {
                         *pending_mouse_down.borrow_mut() = None;
+                    }
+                    if let Some(pending_press) = element_state.pending_press.as_ref() {
+                        pending_press.borrow_mut().take();
                     }
                     if let Some(clicked_state) = element_state.clicked_state.as_ref() {
                         *clicked_state.borrow_mut() = ElementClickedState::default();
@@ -2109,6 +2204,9 @@ impl Interactivity {
             || !self.mouse_down_listeners.is_empty()
             || !self.mouse_move_listeners.is_empty()
             || !self.click_listeners.is_empty()
+            || !self.press_listeners.is_empty()
+            || !self.press_in_listeners.is_empty()
+            || !self.press_out_listeners.is_empty()
             || !self.aux_click_listeners.is_empty()
             || !self.long_press_listeners.is_empty()
             || !self.scroll_wheel_listeners.is_empty()
@@ -2430,10 +2528,25 @@ impl Interactivity {
         // that will automatically transfer focus when hitting the element.
         // This behavior can be suppressed by using `cx.prevent_default()`.
         if let Some(focus_handle) = self.tracked_focus_handle.clone() {
-            let hitbox = hitbox.clone();
+            let mouse_focus_hitbox = hitbox.clone();
+            let mouse_focus_handle = focus_handle.clone();
             window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble
-                    && hitbox.is_hovered(window)
+                    && mouse_focus_hitbox.is_hovered(window)
+                    && !window.default_prevented()
+                {
+                    window.focus(&mouse_focus_handle, cx);
+                    // If there is a parent that is also focusable, prevent it
+                    // from transferring focus because we already did so.
+                    window.prevent_default();
+                }
+            });
+
+            let pointer_focus_hitbox = hitbox.clone();
+            window.on_pointer_event(move |event: &PointerDownEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble
+                    && is_direct_primary_pointer_down(event)
+                    && pointer_focus_hitbox.is_hovered(window)
                     && !window.default_prevented()
                 {
                     window.focus(&focus_handle, cx);
@@ -2569,6 +2682,9 @@ impl Interactivity {
         let mut drag_listener = mem::take(&mut self.drag_listener);
         let drop_listeners = mem::take(&mut self.drop_listeners);
         let click_listeners = mem::take(&mut self.click_listeners);
+        let press_listeners = mem::take(&mut self.press_listeners);
+        let press_in_listeners = mem::take(&mut self.press_in_listeners);
+        let press_out_listeners = mem::take(&mut self.press_out_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
         let long_press_listeners = mem::take(&mut self.long_press_listeners);
         let can_drop_predicate = mem::take(&mut self.can_drop_predicate);
@@ -2751,9 +2867,17 @@ impl Interactivity {
                 });
             }
 
-            if !long_press_listeners.is_empty() {
-                let pending_long_press = element_state
-                    .pending_long_press
+            if !press_listeners.is_empty()
+                || !press_in_listeners.is_empty()
+                || !press_out_listeners.is_empty()
+                || !long_press_listeners.is_empty()
+            {
+                let has_press_listeners = !press_listeners.is_empty();
+                let has_press_in_listeners = !press_in_listeners.is_empty();
+                let has_press_out_listeners = !press_out_listeners.is_empty();
+                let has_long_press_listeners = !long_press_listeners.is_empty();
+                let pending_press = element_state
+                    .pending_press
                     .get_or_insert_with(Default::default)
                     .clone();
                 // If click listeners were registered they share this pending_mouse_down
@@ -2761,64 +2885,168 @@ impl Interactivity {
                 // also fire when the finger is eventually lifted.
                 let pending_click_to_cancel = element_state.pending_mouse_down.clone();
 
-                window.on_mouse_event({
-                    let pending_long_press = pending_long_press.clone();
+                window.on_pointer_event({
+                    let pending_press = pending_press.clone();
                     let hitbox = hitbox.clone();
+                    let press_in_listeners = press_in_listeners.clone();
                     let long_press_listeners = long_press_listeners.clone();
-                    move |event: &MouseDownEvent, phase, window, cx| {
+                    move |event: &PointerDownEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble
-                            && event.button == MouseButton::Left
+                            && event.button == PointerButton::Primary
                             && hitbox.is_hovered(window)
                         {
-                            let down_position = event.position;
-                            let event = event.clone();
-                            let task = window.spawn(cx, {
-                                let pending_long_press = pending_long_press.clone();
-                                let pending_click_to_cancel = pending_click_to_cancel.clone();
-                                let long_press_listeners = long_press_listeners.clone();
-                                async move |cx| {
-                                    cx.background_executor().timer(LONG_PRESS_DURATION).await;
-                                    cx.update(|window, cx| {
-                                        pending_long_press.borrow_mut().take();
-                                        if let Some(pending_click) = &pending_click_to_cancel {
-                                            pending_click.borrow_mut().take();
-                                        }
-                                        for listener in &long_press_listeners {
-                                            listener(&event, window, cx);
-                                        }
-                                        window.refresh();
-                                    })
-                                    .ok();
-                                }
+                            let press_event = PressEvent {
+                                down: event.clone(),
+                                up: None,
+                            };
+                            let task = if long_press_listeners.is_empty() {
+                                None
+                            } else {
+                                Some(window.spawn(cx, {
+                                    let pending_press = pending_press.clone();
+                                    let pending_click_to_cancel = pending_click_to_cancel.clone();
+                                    let long_press_listeners = long_press_listeners.clone();
+                                    let press_event = press_event.clone();
+                                    let pointer_id = event.pointer_id;
+                                    async move |cx| {
+                                        cx.background_executor().timer(LONG_PRESS_DURATION).await;
+                                        cx.update(|window, cx| {
+                                            let mut pending_press = pending_press.borrow_mut();
+                                            let Some(state) = pending_press.as_mut() else {
+                                                return;
+                                            };
+                                            if state.pointer_id != pointer_id
+                                                || state.long_press_fired
+                                            {
+                                                return;
+                                            }
+                                            state.long_press_fired = true;
+                                            if let Some(pending_click) = &pending_click_to_cancel {
+                                                pending_click.borrow_mut().take();
+                                            }
+                                            for listener in &long_press_listeners {
+                                                listener(&press_event, window, cx);
+                                            }
+                                            window.refresh();
+                                        })
+                                        .ok();
+                                    }
+                                }))
+                            };
+                            *pending_press.borrow_mut() = Some(PendingPressState {
+                                press_event: press_event.clone(),
+                                down_position: event.position,
+                                pointer_id: event.pointer_id,
+                                long_press_fired: false,
+                                _task: task,
                             });
-                            *pending_long_press.borrow_mut() = Some((down_position, task));
-                        }
-                    }
-                });
-
-                window.on_mouse_event({
-                    let pending_long_press = pending_long_press.clone();
-                    move |_: &MouseUpEvent, _phase, _window, _cx| {
-                        pending_long_press.borrow_mut().take();
-                    }
-                });
-
-                window.on_mouse_event({
-                    move |event: &MouseMoveEvent, phase, _window, _cx| {
-                        if phase == DispatchPhase::Capture {
-                            return;
-                        }
-                        let down_position =
-                            pending_long_press.borrow().as_ref().map(|(pos, _)| *pos);
-                        if let Some(down_position) = down_position {
-                            if (event.position - down_position).magnitude()
-                                > LONG_PRESS_MOVE_THRESHOLD
-                            {
-                                pending_long_press.borrow_mut().take();
+                            if has_press_in_listeners {
+                                for listener in &press_in_listeners {
+                                    listener(&press_event, window, cx);
+                                }
                             }
                         }
                     }
                 });
+
+                if has_press_listeners || has_press_out_listeners || has_long_press_listeners {
+                    window.on_pointer_event({
+                        let pending_press = pending_press.clone();
+                        let hitbox = hitbox.clone();
+                        let press_listeners = press_listeners.clone();
+                        let press_out_listeners = press_out_listeners.clone();
+                        move |event: &PointerUpEvent, phase, window, cx| match phase {
+                            DispatchPhase::Capture => {}
+                            DispatchPhase::Bubble => {
+                                let pending = pending_press.borrow_mut().take();
+                                if let Some(pending) = pending {
+                                    if pending.pointer_id != event.pointer_id {
+                                        *pending_press.borrow_mut() = Some(pending);
+                                        return;
+                                    }
+
+                                    let press_event = PressEvent {
+                                        down: pending.press_event.down.clone(),
+                                        up: Some(event.clone()),
+                                    };
+                                    if has_press_out_listeners {
+                                        for listener in &press_out_listeners {
+                                            listener(&press_event, window, cx);
+                                        }
+                                    }
+
+                                    if has_press_listeners
+                                        && hitbox.is_hovered(window)
+                                        && (event.position - pending.down_position).magnitude()
+                                            <= PRESS_MOVE_THRESHOLD
+                                        && !pending.long_press_fired
+                                    {
+                                        for listener in &press_listeners {
+                                            listener(&press_event, window, cx);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    window.on_pointer_event({
+                        let pending_press = pending_press.clone();
+                        let press_out_listeners = press_out_listeners.clone();
+                        move |event: &PointerCancelEvent, _phase, window, cx| {
+                            let pending = pending_press.borrow_mut().take();
+                            if let Some(pending) = pending {
+                                if pending.pointer_id != event.pointer_id {
+                                    *pending_press.borrow_mut() = Some(pending);
+                                    return;
+                                }
+
+                                if has_press_out_listeners {
+                                    let press_event = PressEvent {
+                                        down: pending.press_event.down,
+                                        up: None,
+                                    };
+                                    for listener in &press_out_listeners {
+                                        listener(&press_event, window, cx);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                if has_long_press_listeners || has_press_out_listeners {
+                    window.on_pointer_event({
+                        let pending_press = pending_press.clone();
+                        let press_out_listeners = press_out_listeners.clone();
+                        move |event: &PointerMoveEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Capture {
+                                return;
+                            }
+                            let should_cancel = pending_press
+                                .borrow()
+                                .as_ref()
+                                .filter(|state| state.pointer_id == event.pointer_id)
+                                .is_some_and(|state| {
+                                    (event.position - state.down_position).magnitude()
+                                        > LONG_PRESS_MOVE_THRESHOLD
+                                });
+                            if should_cancel
+                                && let Some(pending) = pending_press.borrow_mut().take()
+                            {
+                                if has_press_out_listeners {
+                                    let press_event = PressEvent {
+                                        down: pending.press_event.down,
+                                        up: None,
+                                    };
+                                    for listener in &press_out_listeners {
+                                        listener(&press_event, window, cx);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
             }
 
             if let Some(hover_listener) = self.hover_listener.take() {
@@ -2908,13 +3136,66 @@ impl Interactivity {
             }
 
             {
+                let active_state = active_state.clone();
+                window.on_pointer_event(move |event: &PointerUpEvent, phase, window, _cx| {
+                    if phase == DispatchPhase::Capture
+                        && is_direct_primary_pointer_up(event)
+                        && active_state.borrow().is_clicked()
+                    {
+                        *active_state.borrow_mut() = ElementClickedState::default();
+                        window.refresh();
+                    }
+                });
+            }
+
+            {
+                let active_state = active_state.clone();
+                window.on_pointer_event(move |event: &PointerCancelEvent, phase, window, _cx| {
+                    if phase == DispatchPhase::Capture
+                        && is_direct_pointer_kind(event.kind)
+                        && active_state.borrow().is_clicked()
+                    {
+                        *active_state.borrow_mut() = ElementClickedState::default();
+                        window.refresh();
+                    }
+                });
+            }
+
+            {
                 let active_group_hitbox = self
                     .group_active_style
                     .as_ref()
                     .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
                 let hitbox = hitbox.clone();
+                let active_state = active_state.clone();
                 window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
                     if phase == DispatchPhase::Bubble && !window.default_prevented() {
+                        let group_hovered = active_group_hitbox
+                            .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
+                        let element_hovered = hitbox.is_hovered(window);
+                        if group_hovered || element_hovered {
+                            *active_state.borrow_mut() = ElementClickedState {
+                                group: group_hovered,
+                                element: element_hovered,
+                            };
+                            window.refresh();
+                        }
+                    }
+                });
+            }
+
+            {
+                let active_group_hitbox = self
+                    .group_active_style
+                    .as_ref()
+                    .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
+                let hitbox = hitbox.clone();
+                let active_state = active_state.clone();
+                window.on_pointer_event(move |event: &PointerDownEvent, phase, window, _cx| {
+                    if phase == DispatchPhase::Bubble
+                        && is_direct_primary_pointer_down(event)
+                        && !window.default_prevented()
+                    {
                         let group_hovered = active_group_hitbox
                             .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
                         let element_hovered = hitbox.is_hovered(window);
@@ -3183,11 +3464,17 @@ pub struct InteractiveElementState {
     pub(crate) hover_state: Option<Rc<RefCell<ElementHoverState>>>,
     pub(crate) hover_listener_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
+    pub(crate) pending_press: Option<Rc<RefCell<Option<PendingPressState>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
-    /// Pending long-press state: (touch-down position, cancellation task).
-    /// Dropping the Task cancels the timer before it fires.
-    pub(crate) pending_long_press: Option<Rc<RefCell<Option<(Point<Pixels>, Task<()>)>>>>,
+}
+
+pub(crate) struct PendingPressState {
+    pub(crate) press_event: PressEvent,
+    pub(crate) down_position: Point<Pixels>,
+    pub(crate) pointer_id: PointerId,
+    pub(crate) long_press_fired: bool,
+    pub(crate) _task: Option<Task<()>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.

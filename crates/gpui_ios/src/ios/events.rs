@@ -1,18 +1,15 @@
 //! iOS event handling - converting UIKit events to GPUI's event types.
 //!
-//! iOS uses touch-based input rather than mouse input, so we need to map
-//! touch gestures to appropriate GPUI events:
-//! - Single tap → MouseDown + MouseUp (left button)
-//! - Long press → MouseDown + MouseUp (right button) for context menus
+//! iOS uses touch-based input rather than mouse input, so we map touches to
+//! GPUI pointer and scroll events directly:
+//! - Single tap → PointerDown + PointerUp
 //! - Pan gesture → ScrollWheel events
-//! - Pinch gesture → Zoom events (if supported)
-//! - Touch move → MouseMove events
+//! - Touch move → PointerMove events
 
 use core_graphics::geometry::CGPoint;
 use gpui::{
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput,
-    Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent,
-    PointerUpEvent, ScrollDelta, ScrollWheelEvent, TouchPhase, px,
+    Modifiers, Pixels, PlatformInput, Point, PointerButton, PointerCancelEvent, PointerDownEvent,
+    PointerKind, PointerMoveEvent, PointerUpEvent, ScrollDelta, ScrollWheelEvent, TouchPhase, px,
 };
 use objc::{msg_send, runtime::Object, sel, sel_impl};
 
@@ -68,35 +65,12 @@ pub fn touch_phase(touch: *mut Object) -> UITouchPhase {
     }
 }
 
-/// Get the number of taps for a touch (for detecting double-tap, etc.)
-pub fn touch_tap_count(touch: *mut Object) -> u32 {
-    unsafe {
-        let count: i64 = msg_send![touch, tapCount];
-        count as u32
-    }
-}
-
 /// Get the previous location of a UITouch in the given view (for computing scroll delta)
 pub fn touch_previous_location_in_view(touch: *mut Object, view: *mut Object) -> Point<Pixels> {
     unsafe {
         let location: CGPoint = msg_send![touch, previousLocationInView: view];
         Point::new(px(location.x as f32), px(location.y as f32))
     }
-}
-
-/// Convert a single touch began event to a mouse down event
-pub fn touch_began_to_mouse_down(
-    position: Point<Pixels>,
-    tap_count: u32,
-    modifiers: Modifiers,
-) -> PlatformInput {
-    PlatformInput::MouseDown(MouseDownEvent {
-        button: MouseButton::Left,
-        position,
-        modifiers,
-        click_count: tap_count as usize,
-        first_mouse: false,
-    })
 }
 
 /// Convert a single touch began event to a pointer down event.
@@ -115,20 +89,6 @@ pub fn touch_began_to_pointer_down(
     })
 }
 
-/// Convert a touch ended event to a mouse up event
-pub fn touch_ended_to_mouse_up(
-    position: Point<Pixels>,
-    tap_count: u32,
-    modifiers: Modifiers,
-) -> PlatformInput {
-    PlatformInput::MouseUp(MouseUpEvent {
-        button: MouseButton::Left,
-        position,
-        modifiers,
-        click_count: tap_count as usize,
-    })
-}
-
 /// Convert a touch ended event to a pointer up event.
 pub fn touch_ended_to_pointer_up(
     position: Point<Pixels>,
@@ -142,19 +102,6 @@ pub fn touch_ended_to_pointer_up(
         button: PointerButton::Primary,
         position,
         modifiers,
-    })
-}
-
-/// Convert a touch moved event to a mouse move event
-pub fn touch_moved_to_mouse_move(
-    position: Point<Pixels>,
-    modifiers: Modifiers,
-    pressed_button: Option<MouseButton>,
-) -> PlatformInput {
-    PlatformInput::MouseMove(MouseMoveEvent {
-        position,
-        modifiers,
-        pressed_button,
     })
 }
 
@@ -212,31 +159,4 @@ pub fn get_current_modifiers() -> Modifiers {
     // For now, return empty modifiers - this can be enhanced later
     // to read from UIKeyModifierFlags when available
     Modifiers::default()
-}
-
-/// Check if a long press should trigger a context menu (right-click equivalent)
-pub fn is_long_press_for_context_menu(touch: *mut Object) -> bool {
-    unsafe {
-        // Check the force of the touch (3D Touch / Haptic Touch)
-        let force: f64 = msg_send![touch, force];
-        let max_force: f64 = msg_send![touch, maximumPossibleForce];
-
-        // If force touch is available and pressed hard enough
-        if max_force > 0.0 && force / max_force > 0.5 {
-            return true;
-        }
-
-        false
-    }
-}
-
-/// Convert a force touch to a right-click for context menus
-pub fn force_touch_to_right_click(position: Point<Pixels>, modifiers: Modifiers) -> PlatformInput {
-    PlatformInput::MouseDown(MouseDownEvent {
-        button: MouseButton::Right,
-        position,
-        modifiers,
-        click_count: 1,
-        first_mouse: false,
-    })
 }

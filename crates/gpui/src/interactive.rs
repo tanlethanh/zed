@@ -575,6 +575,49 @@ impl InputEvent for PointerCancelEvent {
 }
 impl PointerEvent for PointerCancelEvent {}
 
+/// A press interaction event.
+///
+/// `down` is always present. `up` is `Some(...)` for a completed press and
+/// `None` for a fired long-press.
+#[derive(Clone, Debug, Default)]
+pub struct PressEvent {
+    /// The pointer-down event that started the interaction.
+    pub down: PointerDownEvent,
+
+    /// The pointer-up event that completed the interaction, if any.
+    pub up: Option<PointerUpEvent>,
+}
+
+impl PressEvent {
+    /// Returns the pointer kind that initiated the press.
+    pub fn kind(&self) -> PointerKind {
+        self.down.kind
+    }
+
+    /// Returns the modifiers for the most recent stage of the interaction.
+    pub fn modifiers(&self) -> Modifiers {
+        self.up.as_ref().map_or(self.down.modifiers, |up| up.modifiers)
+    }
+
+    /// Returns the current position for the interaction.
+    ///
+    /// For long-press this is the down position. For a completed press this is
+    /// the up position.
+    pub fn position(&self) -> Point<Pixels> {
+        self.up.as_ref().map_or(self.down.position, |up| up.position)
+    }
+
+    /// Returns true when this event represents a completed press.
+    pub fn completed(&self) -> bool {
+        self.up.is_some()
+    }
+
+    /// Returns true when this event represents a long-press firing.
+    pub fn long_press(&self) -> bool {
+        self.up.is_none()
+    }
+}
+
 /// A mouse move event from the platform.
 #[derive(Clone, Debug, Default)]
 pub struct MouseMoveEvent {

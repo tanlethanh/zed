@@ -12,12 +12,12 @@ use ndk::looper::ThreadLooper;
 
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DispatchEventResult,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, Modifiers, MouseButton,
-    MouseDownEvent, MouseUpEvent, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
-    PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind,
-    PointerMoveEvent, PointerUpEvent, RequestFrameOptions, RunnableVariant, ScrollDelta,
-    ScrollWheelEvent, Task, ThermalState, TouchPhase, WindowAppearance, WindowParams, point, px,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, Modifiers, OwnedMenu,
+    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformInput, PlatformKeyboardLayout,
+    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Point, PointerButton,
+    PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent, PointerUpEvent,
+    RequestFrameOptions, RunnableVariant, ScrollDelta, ScrollWheelEvent, Task, ThermalState,
+    TouchPhase, WindowAppearance, WindowParams, point, px,
 };
 use gpui_wgpu::WgpuContext;
 
@@ -281,27 +281,20 @@ impl AndroidPlatform {
             }
             1 => {
                 // ACTION_UP
-                let (is_drag, _last_pos) = {
+                let is_drag = {
                     let mut state = self.touch_state.borrow_mut();
                     let is_drag = state.is_drag;
                     let last_pos = state.last_position;
                     state.last_position = None;
                     state.down_position = None;
                     state.is_drag = false;
-                    (is_drag, last_pos)
+                    is_drag
                 };
                 if !is_drag {
                     // Discard any fling: Java forwards velocity unconditionally, but
                     // tap classification happens here. A fling after a tap would cause
                     // spurious scrolling.
                     self.touch_state.borrow_mut().fling = None;
-                    self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                        button: MouseButton::Left,
-                        position,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                        first_mouse: false,
-                    }));
                 } else {
                     self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
@@ -317,12 +310,6 @@ impl AndroidPlatform {
                     button: PointerButton::Primary,
                     position,
                     modifiers: Modifiers::default(),
-                }));
-                self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Left,
-                    position,
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
                 }));
             }
             2 => {
