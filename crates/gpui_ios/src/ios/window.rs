@@ -1444,6 +1444,10 @@ pub(super) fn set_software_keyboard_visible(visible: bool) {
     SOFTWARE_KEYBOARD_VISIBLE.store(visible, std::sync::atomic::Ordering::Relaxed);
 }
 
+fn software_keyboard_visible() -> bool {
+    SOFTWARE_KEYBOARD_VISIBLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Handle touch events from the GPUIMetalView
 fn handle_touches(view: &mut Object, touches: *mut Object, event: *mut Object) {
     unsafe {
@@ -2174,6 +2178,11 @@ impl IosWindow {
         unsafe { msg_send![self.view, isFirstResponder] }
     }
 
+    /// Whether UIKit reports the software keyboard itself as visible.
+    pub fn is_software_keyboard_visible(&self) -> bool {
+        software_keyboard_visible()
+    }
+
     /// Show the software keyboard
     pub fn show_keyboard(&self) {
         let already = self.is_keyboard_shown();
@@ -2475,6 +2484,11 @@ impl PlatformWindow for IosWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         let handler = self.input_handler.borrow_mut().take();
+        if handler.is_none() {
+            // When the focused view stops registering an input handler, the next
+            // focus session should be able to auto-show the keyboard again.
+            self.keyboard_shown.set(false);
+        }
         // Note: Don't hide keyboard here! take_input_handler is called every frame
         // as part of GPUI's rendering cycle (see window.rs line 2006).
         // The keyboard should only be hidden when the view resigns first responder,
@@ -2491,7 +2505,7 @@ impl PlatformWindow for IosWindow {
     }
 
     fn is_soft_keyboard_visible(&self) -> bool {
-        self.is_keyboard_shown()
+        self.is_software_keyboard_visible()
     }
 
     fn prompt(

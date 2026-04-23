@@ -427,14 +427,14 @@ pub extern "C" fn gpui_ios_inject_scroll(
     );
 }
 
-/// Returns true when the software keyboard is visible (view is first responder).
+/// Returns true when UIKit reports the software keyboard is visible.
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_is_keyboard_visible(window_ptr: *mut c_void) -> bool {
     if window_ptr.is_null() {
         return false;
     }
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
-    window.is_keyboard_shown()
+    window.is_software_keyboard_visible()
 }
 
 /// Show the software keyboard.
