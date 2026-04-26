@@ -32,6 +32,8 @@ pub(crate) struct TestWindowState {
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
+    selection_handler: Option<PlatformInputHandler>,
+    soft_keyboard_visible: bool,
     is_fullscreen: bool,
 }
 
@@ -83,6 +85,8 @@ impl TestWindow {
             resize_callback: None,
             moved_callback: None,
             input_handler: None,
+            selection_handler: None,
+            soft_keyboard_visible: false,
             is_fullscreen: false,
         })))
     }
@@ -119,6 +123,16 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_selection_handler(&self) -> bool {
+        self.0.lock().selection_handler.is_some()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn take_selection_handler_for_test(&self) -> Option<PlatformInputHandler> {
+        self.0.lock().selection_handler.take()
     }
 }
 
@@ -174,6 +188,34 @@ impl PlatformWindow for TestWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.0.lock().input_handler.take()
+    }
+
+    fn clear_input_handler(&mut self) {
+        self.0.lock().input_handler.take();
+    }
+
+    fn set_selection_handler(&mut self, input_handler: PlatformInputHandler) {
+        self.0.lock().selection_handler = Some(input_handler);
+    }
+
+    fn take_selection_handler(&mut self) -> Option<PlatformInputHandler> {
+        self.0.lock().selection_handler.take()
+    }
+
+    fn clear_selection_handler(&mut self) {
+        self.0.lock().selection_handler.take();
+    }
+
+    fn show_soft_keyboard(&self) {
+        self.0.lock().soft_keyboard_visible = true;
+    }
+
+    fn hide_soft_keyboard(&self) {
+        self.0.lock().soft_keyboard_visible = false;
+    }
+
+    fn is_soft_keyboard_visible(&self) -> bool {
+        self.0.lock().soft_keyboard_visible
     }
 
     fn prompt(

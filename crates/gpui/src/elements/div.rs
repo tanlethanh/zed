@@ -1676,6 +1676,18 @@ pub struct Div {
 }
 
 impl Div {
+    /// Promote this `Div` into a logical selection boundary for its subtree.
+    #[track_caller]
+    pub fn selection_area(self) -> crate::SelectionAreaElement {
+        crate::selection_area(self)
+    }
+
+    /// Alias for `selection_area`.
+    #[track_caller]
+    pub fn selection_container(self) -> crate::SelectionAreaElement {
+        crate::selection_area(self)
+    }
+
     /// Add a listener to be called when the children of this `Div` are prepainted.
     /// This allows you to store the [`Bounds`] of the children for later use.
     pub fn on_children_prepainted(

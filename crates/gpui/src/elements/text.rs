@@ -2,8 +2,9 @@ use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    TextRun, TextSelectionFragment, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window,
+    WrappedLine, WrappedLineLayout, point, px, register_tooltip_mouse_handlers,
+    set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -17,6 +18,13 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+
+#[derive(Clone, Default)]
+struct SelectableTextOptions {
+    enabled: bool,
+    order: Option<u64>,
+    separator_after: SharedString,
+}
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;
@@ -161,6 +169,7 @@ pub struct StyledText {
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
     layout: TextLayout,
+    selection: SelectableTextOptions,
 }
 
 impl StyledText {
@@ -172,12 +181,31 @@ impl StyledText {
             delayed_highlights: None,
             delayed_font_family_overrides: None,
             layout: TextLayout::default(),
+            selection: SelectableTextOptions::default(),
         }
     }
 
     /// Get the layout for this element. This can be used to map indices to pixels and vice versa.
     pub fn layout(&self) -> &TextLayout {
         &self.layout
+    }
+
+    /// Mark this text as participating in the current `SelectionArea`.
+    pub fn selectable(mut self) -> Self {
+        self.selection.enabled = true;
+        self
+    }
+
+    /// Override this fragment's ordering within the surrounding selection area.
+    pub fn selection_order(mut self, order: u64) -> Self {
+        self.selection.order = Some(order);
+        self
+    }
+
+    /// Append text after this fragment when copying across fragment boundaries.
+    pub fn selection_separator_after(mut self, separator: impl Into<SharedString>) -> Self {
+        self.selection.separator_after = separator.into();
+        self
     }
 
     /// Set the styling attributes for the given text, as well as
@@ -364,7 +392,18 @@ impl Element for StyledText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.layout.paint(&self.text, window, cx)
+        self.layout.paint(&self.text, window, cx);
+
+        if self.selection.enabled && window.current_selection_area().is_some() {
+            let fragment = TextSelectionFragment::new(self.text.clone(), self.layout.clone())
+                .separator_after(self.selection.separator_after.clone());
+            let fragment = if let Some(order) = self.selection.order {
+                fragment.order(order)
+            } else {
+                fragment
+            };
+            window.register_text_selection_fragment(fragment);
+        }
     }
 }
 
@@ -655,6 +694,76 @@ impl TextLayout {
         self.0.borrow().as_ref().unwrap().bounds.unwrap()
     }
 
+    /// The visual selection rects for the given byte range.
+    pub fn rects_for_range(&self, range: Range<usize>) -> SmallVec<[Bounds<Pixels>; 4]> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+        let line_height = element_state.line_height;
+
+        let mut rects = SmallVec::new();
+        let mut line_origin = bounds.origin;
+        let mut line_start_ix = 0;
+
+        for line in &element_state.lines {
+            let wrapped_line = &line.layout;
+            let wrapped_end_indices = wrapped_line
+                .wrap_boundaries()
+                .iter()
+                .map(|boundary| {
+                    let run = &wrapped_line.unwrapped_layout.runs[boundary.run_ix];
+                    let glyph = &run.glyphs[boundary.glyph_ix];
+                    glyph.index
+                })
+                .chain([line.len()])
+                .collect::<SmallVec<[usize; 4]>>();
+
+            let mut wrapped_start_ix = 0;
+            for (wrapped_ix, wrapped_end_ix) in wrapped_end_indices.into_iter().enumerate() {
+                let global_start_ix = line_start_ix + wrapped_start_ix;
+                let global_end_ix = line_start_ix + wrapped_end_ix;
+
+                if range.end <= global_start_ix {
+                    break;
+                }
+
+                if range.start < global_end_ix && range.end > global_start_ix {
+                    let local_start_ix =
+                        range.start.saturating_sub(global_start_ix) + wrapped_start_ix;
+                    let local_end_ix =
+                        range.end.min(global_end_ix) - global_start_ix + wrapped_start_ix;
+
+                    let wrapped_start_x =
+                        wrapped_line.unwrapped_layout.x_for_index(wrapped_start_ix);
+                    let start_x =
+                        wrapped_line.unwrapped_layout.x_for_index(local_start_ix) - wrapped_start_x;
+                    let end_x =
+                        wrapped_line.unwrapped_layout.x_for_index(local_end_ix) - wrapped_start_x;
+                    let y = line_origin.y + line_height * wrapped_ix as f32;
+
+                    rects.push(Bounds::from_corners(
+                        point(line_origin.x + start_x, y),
+                        point(
+                            line_origin.x + end_x.max(start_x + px(2.0)),
+                            y + line_height,
+                        ),
+                    ));
+                }
+
+                wrapped_start_ix = wrapped_end_ix;
+            }
+
+            line_origin.y += line.size(line_height).height;
+            line_start_ix += line.len() + 1;
+        }
+
+        rects
+    }
+
     /// The line height for this layout.
     pub fn line_height(&self) -> Pixels {
         self.0.borrow().as_ref().unwrap().line_height
@@ -882,11 +991,11 @@ impl Element for InteractiveText {
                         window.set_cursor_style(crate::CursorStyle::PointingHand, hitbox)
                     }
 
-                    let text_layout = text_layout.clone();
                     let mouse_down = interactive_state.mouse_down_index.clone();
                     if let Some(mouse_down_index) = mouse_down.get() {
                         let hitbox = hitbox.clone();
                         let clickable_ranges = mem::take(&mut self.clickable_ranges);
+                        let text_layout = text_layout.clone();
                         window.on_mouse_event(
                             move |event: &MouseUpEvent, phase, window: &mut Window, cx| {
                                 if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
@@ -911,6 +1020,7 @@ impl Element for InteractiveText {
                         );
                     } else {
                         let hitbox = hitbox.clone();
+                        let text_layout = text_layout.clone();
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _| {
                             if phase == DispatchPhase::Bubble
                                 && hitbox.is_hovered(window)

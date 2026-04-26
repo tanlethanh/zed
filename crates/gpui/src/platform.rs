@@ -608,6 +608,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
+    fn clear_input_handler(&mut self) {}
+    fn set_selection_handler(&mut self, _input_handler: PlatformInputHandler) {}
+    fn take_selection_handler(&mut self) -> Option<PlatformInputHandler> {
+        None
+    }
+    fn clear_selection_handler(&mut self) {}
     fn show_soft_keyboard(&self) {}
     fn hide_soft_keyboard(&self) {}
     fn is_soft_keyboard_visible(&self) -> bool {
@@ -709,6 +715,20 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+}
+
+/// Returns whether a newly focused text input handler should implicitly request the soft keyboard.
+///
+/// Elements that use manual focus still receive text input, but they own when the keyboard appears
+/// via explicit [`Window::show_soft_keyboard`](crate::Window::show_soft_keyboard) calls. This keeps
+/// terminal-style surfaces from showing the keyboard just because they became focused or stayed
+/// focused across a render pass.
+pub fn should_auto_request_soft_keyboard(
+    accepts_text_input: bool,
+    uses_manual_focus: bool,
+    had_input_handler: bool,
+) -> bool {
+    accepts_text_input && !uses_manual_focus && !had_input_handler
 }
 
 /// A renderer for headless windows that can produce real rendered output.
@@ -1117,6 +1137,8 @@ impl From<TileId> for etagere::AllocId {
 pub struct PlatformInputHandler {
     cx: AsyncWindowContext,
     handler: Rc<RefCell<Box<dyn InputHandler>>>,
+    accepts_text_input: bool,
+    uses_manual_focus: bool,
 }
 
 #[expect(missing_docs)]
@@ -1128,10 +1150,17 @@ pub struct PlatformInputHandler {
     allow(dead_code)
 )]
 impl PlatformInputHandler {
-    pub fn new(cx: AsyncWindowContext, handler: Box<dyn InputHandler>) -> Self {
+    pub fn new(
+        cx: AsyncWindowContext,
+        handler: Box<dyn InputHandler>,
+        accepts_text_input: bool,
+        uses_manual_focus: bool,
+    ) -> Self {
         Self {
             cx,
             handler: Rc::new(RefCell::new(handler)),
+            accepts_text_input,
+            uses_manual_focus,
         }
     }
 
@@ -1223,6 +1252,16 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    pub fn rects_for_range(&mut self, range_utf16: Range<usize>) -> SmallVec<[Bounds<Pixels>; 4]> {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .rects_for_range(range_utf16, window, cx)
+            })
+            .unwrap_or_default()
+    }
+
     #[allow(dead_code)]
     pub fn apple_press_and_hold_enabled(&mut self) -> bool {
         self.handler.borrow_mut().apple_press_and_hold_enabled()
@@ -1267,9 +1306,12 @@ impl PlatformInputHandler {
 
     #[allow(dead_code)]
     pub fn query_accepts_text_input(&mut self) -> bool {
-        self.cx
-            .update(|window, cx| self.handler.borrow_mut().accepts_text_input(window, cx))
-            .unwrap_or(true)
+        self.accepts_text_input
+    }
+
+    #[allow(dead_code)]
+    pub fn query_uses_manual_focus(&mut self) -> bool {
+        self.uses_manual_focus
     }
 
     #[allow(dead_code)]
@@ -1281,6 +1323,16 @@ impl PlatformInputHandler {
                     .prefers_ime_for_printable_keys(window, cx)
             })
             .unwrap_or(false)
+    }
+
+    pub fn set_selected_text_range(&mut self, range: std::ops::Range<usize>) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .set_selected_text_range(range, window, cx);
+            })
+            .ok();
     }
 }
 
@@ -1372,6 +1424,22 @@ pub trait InputHandler: 'static {
         cx: &mut App,
     ) -> Option<Bounds<Pixels>>;
 
+    /// Get the visual selection rects for the given document range in screen coordinates.
+    fn rects_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> SmallVec<[Bounds<Pixels>; 4]> {
+        if range_utf16.is_empty() {
+            SmallVec::new()
+        } else {
+            self.bounds_for_range(range_utf16, window, cx)
+                .into_iter()
+                .collect()
+        }
+    }
+
     /// Get the character offset for the given point in terms of UTF16 characters
     ///
     /// Corresponds to [characterIndexForPoint:](https://developer.apple.com/documentation/appkit/nstextinputclient/characterindex(for:))
@@ -1406,6 +1474,16 @@ pub trait InputHandler: 'static {
     /// The terminal keeps the default `false` so that raw keys reach the terminal process.
     fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         false
+    }
+
+    /// Called when the platform sets a new text selection range (e.g. UIKit drag handles).
+    /// Default is a no-op; override to update selection state.
+    fn set_selected_text_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
     }
 }
 
@@ -2228,6 +2306,31 @@ impl From<String> for ClipboardString {
             text: value,
             metadata: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::should_auto_request_soft_keyboard;
+
+    #[test]
+    fn editable_text_input_auto_requests_keyboard_on_new_focus() {
+        assert!(should_auto_request_soft_keyboard(true, false, false));
+    }
+
+    #[test]
+    fn existing_input_handler_does_not_re_request_keyboard() {
+        assert!(!should_auto_request_soft_keyboard(true, false, true));
+    }
+
+    #[test]
+    fn manual_focus_input_requires_explicit_keyboard_request() {
+        assert!(!should_auto_request_soft_keyboard(true, true, false));
+    }
+
+    #[test]
+    fn non_text_input_never_auto_requests_keyboard() {
+        assert!(!should_auto_request_soft_keyboard(false, false, false));
     }
 }
 

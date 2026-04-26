@@ -1,24 +1,26 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
-    DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PointerCancelEvent, PointerEvent, PointerUpEvent,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+    Action, ActiveSelectionArea, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
+    AppContext, Arena, Asset, AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PointerCancelEvent, PointerEvent, PointerUpEvent, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, RegisteredSelectionArea, RegisteredTextSelectionFragment, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
+    SelectionArea, SelectionState, Shadow, SharedString, Size, StrikethroughStyle, Style,
+    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextSelectionFragment, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    WindowOptions, WindowParams, WindowSelectionHandler, WindowTextSystem, point, prelude::*, px,
+    rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -739,6 +741,7 @@ pub(crate) struct DeferredDraw {
     priority: usize,
     parent_node: DispatchNodeId,
     element_id_stack: SmallVec<[ElementId; 32]>,
+    selection_area_stack: Vec<ActiveSelectionArea>,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
     rem_size: Pixels,
@@ -760,6 +763,9 @@ pub(crate) struct Frame {
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
+    pub(crate) manual_focus_handles: Vec<FocusId>,
+    pub(crate) selection_areas: Vec<RegisteredSelectionArea>,
+    pub(crate) selection_fragments: Vec<RegisteredTextSelectionFragment>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
@@ -786,6 +792,9 @@ pub(crate) struct PaintIndex {
     scene_index: usize,
     mouse_listeners_index: usize,
     input_handlers_index: usize,
+    manual_focus_handles_index: usize,
+    selection_areas_index: usize,
+    selection_fragments_index: usize,
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
@@ -806,6 +815,9 @@ impl Frame {
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
+            manual_focus_handles: Vec::new(),
+            selection_areas: Vec::new(),
+            selection_fragments: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
 
@@ -828,6 +840,9 @@ impl Frame {
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
+        self.manual_focus_handles.clear();
+        self.selection_areas.clear();
+        self.selection_fragments.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
@@ -942,6 +957,8 @@ pub struct Window {
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
+    pub(crate) selection_area_stack: Vec<ActiveSelectionArea>,
+    pub(crate) selection_state: SelectionState,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
@@ -1249,19 +1266,18 @@ impl Window {
                 };
 
                 let now = Instant::now();
-                if let Some(min_interval) = min_frame_interval {
-                    if let Some(last_frame) = last_frame_time.get()
-                        && now.duration_since(last_frame) < min_interval
-                    {
-                        // Must still complete the frame on platforms that require it.
-                        // On Wayland, `surface.frame()` was already called to request the
-                        // next frame callback, so we must call `surface.commit()` (via
-                        // `complete_frame`) or the compositor won't send another callback.
-                        handle
-                            .update(&mut cx, |_, window, _| window.complete_frame())
-                            .log_err();
-                        return;
-                    }
+                if let Some(min_interval) = min_frame_interval
+                    && let Some(last_frame) = last_frame_time.get()
+                    && now.duration_since(last_frame) < min_interval
+                {
+                    // Must still complete the frame on platforms that require it.
+                    // On Wayland, `surface.frame()` was already called to request the
+                    // next frame callback, so we must call `surface.commit()` (via
+                    // `complete_frame`) or the compositor won't send another callback.
+                    handle
+                        .update(&mut cx, |_, window, _| window.complete_frame())
+                        .log_err();
+                    return;
                 }
                 last_frame_time.set(Some(now));
 
@@ -1469,6 +1485,8 @@ impl Window {
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
+            selection_area_stack: Vec::new(),
+            selection_state: SelectionState::default(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
@@ -2311,6 +2329,20 @@ impl Window {
         if let Some(input_handler) = self.next_frame.input_handlers.pop() {
             self.platform_window
                 .set_input_handler(input_handler.unwrap());
+        } else {
+            self.platform_window.clear_input_handler();
+        }
+        if self.next_frame.selection_fragments.is_empty() {
+            self.selection_state = SelectionState::default();
+            self.platform_window.clear_selection_handler();
+        } else {
+            self.platform_window
+                .set_selection_handler(PlatformInputHandler::new(
+                    self.to_async(cx),
+                    Box::new(WindowSelectionHandler),
+                    false,
+                    false,
+                ));
         }
 
         self.layout_engine.as_mut().unwrap().clear();
@@ -2556,6 +2588,8 @@ impl Window {
                 let deferred_draw = &mut deferred_draws[deferred_draw_ix];
                 self.element_id_stack
                     .clone_from(&deferred_draw.element_id_stack);
+                self.selection_area_stack
+                    .clone_from(&deferred_draw.selection_area_stack);
                 self.text_style_stack
                     .clone_from(&deferred_draw.text_style_stack);
                 self.next_frame
@@ -2585,6 +2619,7 @@ impl Window {
             completed_draws.append(&mut deferred_draws);
 
             self.element_id_stack.clear();
+            self.selection_area_stack.clear();
             self.text_style_stack.clear();
         }
 
@@ -2607,6 +2642,8 @@ impl Window {
             let mut deferred_draw = &mut deferred_draws[deferred_draw_ix];
             self.element_id_stack
                 .clone_from(&deferred_draw.element_id_stack);
+            self.selection_area_stack
+                .clone_from(&deferred_draw.selection_area_stack);
             self.next_frame
                 .dispatch_tree
                 .set_active_node(deferred_draw.parent_node);
@@ -2629,6 +2666,7 @@ impl Window {
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
+        self.selection_area_stack.clear();
     }
 
     fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
@@ -2688,6 +2726,7 @@ impl Window {
                     current_view: deferred_draw.current_view,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
+                    selection_area_stack: deferred_draw.selection_area_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask.clone(),
                     rem_size: deferred_draw.rem_size,
@@ -2705,6 +2744,9 @@ impl Window {
             scene_index: self.next_frame.scene.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
+            manual_focus_handles_index: self.next_frame.manual_focus_handles.len(),
+            selection_areas_index: self.next_frame.selection_areas.len(),
+            selection_fragments_index: self.next_frame.selection_fragments.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
@@ -2724,6 +2766,24 @@ impl Window {
                 [range.start.input_handlers_index..range.end.input_handlers_index]
                 .iter_mut()
                 .map(|handler| handler.take()),
+        );
+        self.next_frame.manual_focus_handles.extend(
+            self.rendered_frame.manual_focus_handles
+                [range.start.manual_focus_handles_index..range.end.manual_focus_handles_index]
+                .iter()
+                .copied(),
+        );
+        self.next_frame.selection_areas.extend(
+            self.rendered_frame.selection_areas
+                [range.start.selection_areas_index..range.end.selection_areas_index]
+                .iter()
+                .cloned(),
+        );
+        self.next_frame.selection_fragments.extend(
+            self.rendered_frame.selection_fragments
+                [range.start.selection_fragments_index..range.end.selection_fragments_index]
+                .iter()
+                .cloned(),
         );
         self.next_frame.mouse_listeners.extend(
             self.rendered_frame.mouse_listeners
@@ -2769,6 +2829,80 @@ impl Window {
         } else {
             f(self)
         }
+    }
+
+    /// Push a selection area onto the stack for the duration of `f`.
+    pub fn with_selection_area<F, R>(
+        &mut self,
+        area: Option<&SelectionArea>,
+        global_id: Option<&GlobalElementId>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        if let Some(area) = area {
+            self.selection_area_stack
+                .push(ActiveSelectionArea::new(area.clone(), global_id.cloned()));
+            let result = f(self);
+            self.selection_area_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    /// Returns the nearest active logical selection area, if any.
+    pub fn current_selection_area(&self) -> Option<&SelectionArea> {
+        self.selection_area_stack
+            .last()
+            .map(ActiveSelectionArea::selection_area)
+    }
+
+    pub(crate) fn current_active_selection_area(&self) -> Option<&ActiveSelectionArea> {
+        self.selection_area_stack.last()
+    }
+
+    /// Register a logical selection area for the current frame.
+    pub fn register_selection_area(
+        &mut self,
+        selection_area: &SelectionArea,
+        global_id: Option<&GlobalElementId>,
+    ) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .selection_areas
+            .push(RegisteredSelectionArea::new(
+                selection_area.clone(),
+                global_id.cloned(),
+                self.current_view(),
+            ));
+    }
+
+    /// Returns the selection areas registered during the last rendered frame.
+    pub fn selection_areas(&self) -> &[RegisteredSelectionArea] {
+        &self.rendered_frame.selection_areas
+    }
+
+    /// Register a text fragment for the current selection area.
+    pub fn register_text_selection_fragment(&mut self, fragment: TextSelectionFragment) {
+        self.invalidator.debug_assert_paint();
+        let Some(active_area) = self.current_active_selection_area().cloned() else {
+            return;
+        };
+        self.next_frame
+            .selection_fragments
+            .push(RegisteredTextSelectionFragment::new(
+                active_area,
+                self.current_view(),
+                fragment,
+            ));
+    }
+
+    /// Returns the selection fragments registered during the last rendered frame.
+    pub fn selection_fragments(&self) -> &[RegisteredTextSelectionFragment] {
+        &self.rendered_frame.selection_fragments
     }
 
     /// Updates the cursor style at the platform level. This method should only be called
@@ -3190,6 +3324,7 @@ impl Window {
             current_view: self.current_view(),
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
+            selection_area_stack: self.selection_area_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             content_mask,
             rem_size: self.rem_size(),
@@ -3970,16 +4105,26 @@ impl Window {
     pub fn handle_input(
         &mut self,
         focus_handle: &FocusHandle,
-        input_handler: impl InputHandler,
-        cx: &App,
+        mut input_handler: impl InputHandler,
+        cx: &mut App,
     ) {
         self.invalidator.debug_assert_paint();
 
         if focus_handle.is_focused(self) {
+            let accepts_text_input = input_handler.accepts_text_input(self, cx);
+            let uses_manual_focus = self
+                .next_frame
+                .manual_focus_handles
+                .contains(&focus_handle.id);
             let cx = self.to_async(cx);
             self.next_frame
                 .input_handlers
-                .push(Some(PlatformInputHandler::new(cx, Box::new(input_handler))));
+                .push(Some(PlatformInputHandler::new(
+                    cx,
+                    Box::new(input_handler),
+                    accepts_text_input,
+                    uses_manual_focus,
+                )));
         }
     }
 
@@ -5858,4 +6003,43 @@ pub fn outline(
         border_color: border_color.into(),
         border_style,
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Empty, TestAppContext};
+
+    #[test]
+    fn reuse_paint_replays_manual_focus_handles() {
+        let mut cx = TestAppContext::single();
+        let window_handle = cx.add_window(|_, _| Empty);
+
+        cx.update_window(window_handle.into(), |_, window, cx| {
+            let focus_handle = cx.focus_handle();
+            let start = PaintIndex {
+                manual_focus_handles_index: 0,
+                ..Default::default()
+            };
+            window
+                .rendered_frame
+                .manual_focus_handles
+                .push(focus_handle.id);
+            let end = PaintIndex {
+                manual_focus_handles_index: 1,
+                ..Default::default()
+            };
+
+            window.reuse_paint(start..end);
+
+            assert!(
+                window
+                    .next_frame
+                    .manual_focus_handles
+                    .contains(&focus_handle.id)
+            );
+        })
+        .unwrap();
+    }
+
 }

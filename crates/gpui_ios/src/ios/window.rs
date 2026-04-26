@@ -26,7 +26,7 @@ use gpui::{
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent, Size,
     TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowParams, px, size,
+    WindowParams, px, should_auto_request_soft_keyboard, size,
 };
 use objc::{
     Encode, Encoding, class,
@@ -39,6 +39,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, UiKitDisplayHandle, U
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
+    ops::Range,
     panic::{self, AssertUnwindSafe},
     ptr::{self, NonNull},
     rc::Rc,
@@ -49,6 +50,124 @@ const GPUI_VIEW_IVAR: &str = "gpui_view";
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
 
 const FLING_THRESHOLD: f32 = 50.0;
+const TEXT_INTERACTION_NONE: i8 = -1;
+const TEXT_INTERACTION_NONEDITABLE: i8 = 0;
+const TEXT_INTERACTION_EDITABLE: i8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditMenuActionPolicy {
+    CopySelection,
+    DelegateToSystem,
+}
+
+fn edit_menu_action_policy(interaction_mode: i8, is_copy_action: bool) -> EditMenuActionPolicy {
+    if interaction_mode == TEXT_INTERACTION_NONEDITABLE && is_copy_action {
+        EditMenuActionPolicy::CopySelection
+    } else {
+        EditMenuActionPolicy::DelegateToSystem
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextInputResponderAction {
+    None,
+    ShowKeyboard,
+    ResignActiveResponder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextInputRefreshPlan {
+    keyboard_session_requested: bool,
+    target_interaction_mode: i8,
+    responder_action: TextInputResponderAction,
+}
+
+fn text_input_refresh_plan(
+    has_input_handler: bool,
+    has_selection_handler: bool,
+    input_accepts_text_input: bool,
+    input_uses_manual_focus: bool,
+    keyboard_session_requested: bool,
+    software_keyboard_visible: bool,
+) -> TextInputRefreshPlan {
+    let target_interaction_mode =
+        if has_input_handler && input_accepts_text_input && !input_uses_manual_focus {
+            TEXT_INTERACTION_EDITABLE
+        } else if has_selection_handler {
+            TEXT_INTERACTION_NONEDITABLE
+        } else {
+            TEXT_INTERACTION_NONE
+        };
+
+    let should_show_keyboard =
+        has_input_handler && input_accepts_text_input && keyboard_session_requested;
+    let keyboard_session_requested = if keyboard_session_requested && !has_input_handler {
+        true
+    } else {
+        should_show_keyboard
+    };
+    let responder_action = if should_show_keyboard {
+        if software_keyboard_visible {
+            TextInputResponderAction::None
+        } else {
+            TextInputResponderAction::ShowKeyboard
+        }
+    } else if keyboard_session_requested && !has_input_handler {
+        TextInputResponderAction::None
+    } else if target_interaction_mode == TEXT_INTERACTION_NONEDITABLE {
+        if software_keyboard_visible {
+            TextInputResponderAction::ResignActiveResponder
+        } else {
+            TextInputResponderAction::None
+        }
+    } else {
+        TextInputResponderAction::ResignActiveResponder
+    };
+
+    TextInputRefreshPlan {
+        keyboard_session_requested,
+        target_interaction_mode,
+        responder_action,
+    }
+}
+
+/// Chooses the UIKit `UITextInteraction` that should be installed for the
+/// current responder state. Editable interaction belongs to the first-responder
+/// session; noneditable interaction can remain available for read-only selection.
+fn installed_text_interaction_mode_for_state(
+    target_interaction_mode: i8,
+    has_selection_handler: bool,
+    is_first_responder: bool,
+) -> i8 {
+    match target_interaction_mode {
+        TEXT_INTERACTION_EDITABLE if is_first_responder => TEXT_INTERACTION_EDITABLE,
+        TEXT_INTERACTION_EDITABLE if has_selection_handler => TEXT_INTERACTION_NONEDITABLE,
+        TEXT_INTERACTION_EDITABLE => TEXT_INTERACTION_NONE,
+        TEXT_INTERACTION_NONEDITABLE => TEXT_INTERACTION_NONEDITABLE,
+        _ => TEXT_INTERACTION_NONE,
+    }
+}
+
+fn should_clear_keyboard_request_when_clearing_input_handler(
+    had_input_handler: bool,
+    had_callback_input_handler: bool,
+) -> bool {
+    had_input_handler || had_callback_input_handler
+}
+
+fn handles_native_touch_selection(interaction_mode: i8) -> bool {
+    matches!(
+        interaction_mode,
+        TEXT_INTERACTION_EDITABLE | TEXT_INTERACTION_NONEDITABLE
+    )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SelectionGeometry {
+    range: Range<usize>,
+    bounds: Option<Bounds<Pixels>>,
+    rects: Vec<Bounds<Pixels>>,
+}
 
 struct TouchFling {
     velocity_x: f32,
@@ -140,6 +259,7 @@ unsafe impl Encode for IOSCGSize {
 const NS_NOT_FOUND: u64 = u64::MAX;
 
 static METAL_VIEW_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
+static TEXT_SELECTION_RECT_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
 
 /// Global pointer to the UIView displayed above the software keyboard (inputAccessoryView).
 /// Set from Obj-C via `gpui_ios_set_keyboard_accessory_view`.
@@ -195,6 +315,98 @@ fn ios_log_format(message: &str) {
     }
 }
 
+fn register_text_selection_rect_class() -> &'static Class {
+    TEXT_SELECTION_RECT_CLASS_REGISTERED.call_once(|| {
+        let superclass = class!(UITextSelectionRect);
+        let mut decl = ClassDecl::new("GPUITextSelectionRect", superclass).unwrap();
+
+        decl.add_ivar::<f64>("rect_x");
+        decl.add_ivar::<f64>("rect_y");
+        decl.add_ivar::<f64>("rect_width");
+        decl.add_ivar::<f64>("rect_height");
+        decl.add_ivar::<bool>("contains_start");
+        decl.add_ivar::<bool>("contains_end");
+
+        extern "C" fn rect(this: &Object, _sel: Sel) -> IOSCGRect {
+            let x: f64 = unsafe { *this.get_ivar("rect_x") };
+            let y: f64 = unsafe { *this.get_ivar("rect_y") };
+            let width: f64 = unsafe { *this.get_ivar("rect_width") };
+            let height: f64 = unsafe { *this.get_ivar("rect_height") };
+            IOSCGRect::new(IOSCGPoint::new(x, y), IOSCGSize::new(width, height))
+        }
+
+        extern "C" fn writing_direction(_this: &Object, _sel: Sel) -> i64 {
+            0
+        }
+
+        extern "C" fn contains_start(this: &Object, _sel: Sel) -> BOOL {
+            if unsafe { *this.get_ivar("contains_start") } {
+                YES
+            } else {
+                NO
+            }
+        }
+
+        extern "C" fn contains_end(this: &Object, _sel: Sel) -> BOOL {
+            if unsafe { *this.get_ivar("contains_end") } {
+                YES
+            } else {
+                NO
+            }
+        }
+
+        extern "C" fn is_vertical(_this: &Object, _sel: Sel) -> BOOL {
+            NO
+        }
+
+        unsafe {
+            decl.add_method(sel!(rect), rect as extern "C" fn(&Object, Sel) -> IOSCGRect);
+            decl.add_method(
+                sel!(writingDirection),
+                writing_direction as extern "C" fn(&Object, Sel) -> i64,
+            );
+            decl.add_method(
+                sel!(containsStart),
+                contains_start as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            decl.add_method(
+                sel!(containsEnd),
+                contains_end as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            decl.add_method(
+                sel!(isVertical),
+                is_vertical as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+        }
+
+        decl.register();
+    });
+
+    class!(GPUITextSelectionRect)
+}
+
+fn create_text_selection_rect(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    contains_start: bool,
+    contains_end: bool,
+) -> *mut Object {
+    unsafe {
+        let class = register_text_selection_rect_class();
+        let rect: *mut Object = msg_send![class, alloc];
+        let rect: *mut Object = msg_send![rect, init];
+        (*rect).set_ivar("rect_x", x);
+        (*rect).set_ivar("rect_y", y);
+        (*rect).set_ivar("rect_width", width);
+        (*rect).set_ivar("rect_height", height);
+        (*rect).set_ivar("contains_start", contains_start);
+        (*rect).set_ivar("contains_end", contains_end);
+        rect
+    }
+}
+
 /// Safely access the input handler for a view.
 ///
 /// IMPORTANT: This function takes the handler OUT of the RefCell before
@@ -215,6 +427,12 @@ fn with_input_handler<F, R>(view: &Object, f: F) -> Option<R>
 where
     F: FnOnce(&mut PlatformInputHandler) -> R,
 {
+    #[derive(Copy, Clone)]
+    enum HandlerSlot {
+        Input,
+        Selection,
+    }
+
     unsafe {
         let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
         if window_ptr.is_null() {
@@ -224,36 +442,159 @@ where
 
         let window = &*(window_ptr as *const IosWindow);
 
+        let take_handler = |slot: HandlerSlot| -> Option<PlatformInputHandler> {
+            match slot {
+                HandlerSlot::Input => {
+                    let Ok(mut borrow) = window.callback_input_handler.try_borrow_mut() else {
+                        ios_log_cstr(
+                            c"GPUI iOS: with_input_handler - BORROW CONFLICT during input take!",
+                        );
+                        return None;
+                    };
+                    borrow.take()
+                }
+                HandlerSlot::Selection => {
+                    let Ok(mut borrow) = window.callback_selection_handler.try_borrow_mut() else {
+                        ios_log_cstr(
+                            c"GPUI iOS: with_input_handler - BORROW CONFLICT during selection take!",
+                        );
+                        return None;
+                    };
+                    borrow.take()
+                }
+            }
+        };
+
         // Take the handler out of the RefCell in a scoped block.
         // This releases the borrow before callback execution.
-        let mut handler = {
-            let Ok(mut borrow) = window.callback_input_handler.try_borrow_mut() else {
-                ios_log_cstr(c"GPUI iOS: with_input_handler - BORROW CONFLICT during take!");
-                return None;
-            };
-            let taken = borrow.take();
-            if taken.is_none() {
-                ios_log_cstr(c"GPUI iOS: with_input_handler - no handler set (None)");
+        let preferred_slot = match window.active_text_interaction_mode.get() {
+            TEXT_INTERACTION_EDITABLE => Some(HandlerSlot::Input),
+            TEXT_INTERACTION_NONEDITABLE => Some(HandlerSlot::Selection),
+            _ => None,
+        };
+        let (mut handler, restore_slot) = match preferred_slot {
+            Some(slot) => (take_handler(slot)?, slot),
+            None => {
+                if let Some(handler) = take_handler(HandlerSlot::Input) {
+                    (handler, HandlerSlot::Input)
+                } else {
+                    (
+                        take_handler(HandlerSlot::Selection)?,
+                        HandlerSlot::Selection,
+                    )
+                }
             }
-            taken
-        }?;
+        };
         // Borrow is now released - handler is owned, not borrowed
 
         // Execute callback with exclusive access to handler
         let result = f(&mut handler);
 
         // Restore handler back into RefCell
-        {
-            let Ok(mut borrow) = window.callback_input_handler.try_borrow_mut() else {
-                // This should never happen since we released the borrow above,
-                // but log an error if it does
-                ios_log_cstr(c"GPUI iOS: with_input_handler - BORROW CONFLICT during restore!");
-                return Some(result);
-            };
-            *borrow = Some(handler);
+        match restore_slot {
+            HandlerSlot::Input => {
+                let Ok(mut borrow) = window.callback_input_handler.try_borrow_mut() else {
+                    ios_log_cstr(
+                        c"GPUI iOS: with_input_handler - BORROW CONFLICT during input restore!",
+                    );
+                    return Some(result);
+                };
+                *borrow = Some(handler);
+            }
+            HandlerSlot::Selection => {
+                let Ok(mut borrow) = window.callback_selection_handler.try_borrow_mut() else {
+                    ios_log_cstr(
+                        c"GPUI iOS: with_input_handler - BORROW CONFLICT during selection restore!",
+                    );
+                    return Some(result);
+                };
+                *borrow = Some(handler);
+            }
         }
 
         Some(result)
+    }
+}
+
+fn text_input_delegate(view: &Object) -> *mut Object {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return ptr::null_mut();
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window.input_delegate.get()
+    }
+}
+
+fn active_text_interaction_mode(view: &Object) -> i8 {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return TEXT_INTERACTION_NONE;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window.active_text_interaction_mode.get()
+    }
+}
+
+fn sync_text_interaction_for_view(view: &Object) {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window.sync_text_interaction_for_current_responder_state();
+    }
+}
+
+fn can_become_first_responder_for_gpui(view: &Object) -> bool {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return false;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window.input_accepts_text_input.get()
+            || matches!(
+                window.target_text_interaction_mode.get(),
+                TEXT_INTERACTION_NONEDITABLE | TEXT_INTERACTION_EDITABLE
+            )
+    }
+}
+
+fn notify_selection_change<F>(view: &Object, f: F)
+where
+    F: FnOnce(),
+{
+    unsafe {
+        let delegate = text_input_delegate(view);
+        if !delegate.is_null() {
+            let _: () = msg_send![delegate, selectionWillChange: view];
+        }
+        f();
+        if !delegate.is_null() {
+            let _: () = msg_send![delegate, selectionDidChange: view];
+        }
+    }
+}
+
+fn notify_text_and_selection_change<F>(view: &Object, f: F)
+where
+    F: FnOnce(),
+{
+    unsafe {
+        let delegate = text_input_delegate(view);
+        if !delegate.is_null() {
+            let _: () = msg_send![delegate, textWillChange: view];
+            let _: () = msg_send![delegate, selectionWillChange: view];
+        }
+        f();
+        if !delegate.is_null() {
+            let _: () = msg_send![delegate, selectionDidChange: view];
+            let _: () = msg_send![delegate, textDidChange: view];
+        }
     }
 }
 
@@ -321,9 +662,36 @@ fn register_metal_view_class() -> &'static Class {
             handle_touches(this, touches, event);
         }
 
-        // Make view focusable for keyboard input
-        extern "C" fn can_become_first_responder(_this: &Object, _sel: Sel) -> bool {
-            true
+        extern "C" fn can_become_first_responder(this: &Object, _sel: Sel) -> bool {
+            can_become_first_responder_for_gpui(this)
+        }
+
+        // Keep UIKit text interactions in sync after responder transitions, as
+        // recommended for custom views that support editable and read-only text.
+        extern "C" fn become_first_responder(this: &mut Object, _sel: Sel) -> BOOL {
+            unsafe {
+                let was_first_responder: BOOL = msg_send![this, isFirstResponder];
+                let superclass = class!(UIView);
+                let result: BOOL = msg_send![super(this, superclass), becomeFirstResponder];
+                let is_first_responder: BOOL = msg_send![this, isFirstResponder];
+                if was_first_responder == NO && is_first_responder == YES {
+                    sync_text_interaction_for_view(this);
+                }
+                result
+            }
+        }
+
+        extern "C" fn resign_first_responder(this: &mut Object, _sel: Sel) -> BOOL {
+            unsafe {
+                let was_first_responder: BOOL = msg_send![this, isFirstResponder];
+                let superclass = class!(UIView);
+                let result: BOOL = msg_send![super(this, superclass), resignFirstResponder];
+                let is_first_responder: BOOL = msg_send![this, isFirstResponder];
+                if was_first_responder == YES && is_first_responder == NO {
+                    sync_text_interaction_for_view(this);
+                }
+                result
+            }
         }
 
         // Return the view shown above the software keyboard (set via gpui_ios_set_keyboard_accessory_view).
@@ -409,11 +777,12 @@ fn register_metal_view_class() -> &'static Class {
                     // This is the preferred path for software keyboard input.
                     // Uses with_input_handler which releases the borrow during callback
                     // to prevent conflicts when iOS queries multiple UITextInput methods.
-                    if with_input_handler(this, |handler| {
-                        handler.replace_text_in_range(None, &text_str);
-                    })
-                    .is_some()
-                    {
+                    if with_input_handler(this, |_handler| ()).is_some() {
+                        notify_text_and_selection_change(this, || {
+                            let _ = with_input_handler(this, |handler| {
+                                handler.replace_text_in_range(None, &text_str);
+                            });
+                        });
                         return;
                     }
 
@@ -488,23 +857,25 @@ fn register_metal_view_class() -> &'static Class {
 
                 // Route software-keyboard deletes through the active GPUI input handler.
                 // The callback mirror keeps this available across GPUI's per-frame take/set cycle.
-                let _ = with_input_handler(this, |handler| {
-                    // Get current selection
-                    if let Some(selection) = handler.selected_text_range(false) {
-                        if selection.range.is_empty() {
-                            // No selection - delete one character before cursor
-                            if selection.range.start > 0 {
-                                let delete_range = selection.range.start - 1..selection.range.start;
-                                handler.replace_text_in_range(Some(delete_range), "");
-                                return;
+                if with_input_handler(this, |_handler| ()).is_some() {
+                    notify_text_and_selection_change(this, || {
+                        let _ = with_input_handler(this, |handler| {
+                            if let Some(selection) = handler.selected_text_range(false) {
+                                if selection.range.is_empty() {
+                                    if selection.range.start > 0 {
+                                        let delete_range =
+                                            selection.range.start - 1..selection.range.start;
+                                        handler.replace_text_in_range(Some(delete_range), "");
+                                        return;
+                                    }
+                                } else {
+                                    handler.replace_text_in_range(Some(selection.range), "");
+                                    return;
+                                }
                             }
-                        } else {
-                            // Has selection - delete the selection
-                            handler.replace_text_in_range(Some(selection.range), "");
-                            return;
-                        }
-                    }
-                });
+                        });
+                    });
+                }
             }));
         }
 
@@ -573,45 +944,111 @@ fn register_metal_view_class() -> &'static Class {
             }
         }
 
-        // UITextInput - selectedTextRange (CRITICAL - must not return nil!)
+        // UITextInput - selectedTextRange
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn selected_text_range(this: &Object, _sel: Sel) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let range = with_input_handler(this, |handler| handler.selected_text_range(false))
                     .flatten();
+                let interaction_mode = active_text_interaction_mode(this);
 
                 match range {
                     Some(selection) => {
                         create_text_range(selection.range.start, selection.range.end)
                     }
-                    // Return empty range at start, never nil!
+                    None if interaction_mode == TEXT_INTERACTION_NONEDITABLE => ptr::null_mut(),
                     None => create_text_range(0, 0),
                 }
             }));
 
             match result {
                 Ok(ptr) => ptr,
-                Err(_) => create_text_range(0, 0), // Return empty range at start on panic
+                Err(_) => {
+                    if active_text_interaction_mode(this) == TEXT_INTERACTION_NONEDITABLE {
+                        ptr::null_mut()
+                    } else {
+                        create_text_range(0, 0)
+                    }
+                }
             }
         }
 
         // UITextInput - setSelectedTextRange:
-        // iOS calls this to sync the cursor/selection position.
-        // We need to be careful here:
-        // - After deleteBackward: iOS sends the OLD position which would cause double-delete
-        // - After insertText: iOS sends the NEW position which we need to track
-        //
-        // Solution: Only process if this is setting a cursor position (empty range),
-        // and track it as a "pending" selection that we verify matches our internal state.
-        extern "C" fn set_selected_text_range(_this: &mut Object, _sel: Sel, range: *mut Object) {
+        // Propagated only while a native editable or read-only text interaction is active.
+        extern "C" fn set_selected_text_range(this: &mut Object, _sel: Sel, range: *mut Object) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                if let Some((_start, _end)) = get_range_indices(range) {
-                    // We intentionally ignore this call.
-                    // Our text operations (insertText, deleteBackward) already update the cursor.
-                    // Calling replace_text_in_range here interferes with the deduplication logic
-                    // and can cause issues with subsequent text insertions.
+                if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                    return;
+                }
+                if let Some((start, end)) = get_range_indices(range) {
+                    notify_selection_change(this, || {
+                        let _ = with_input_handler(this, |handler| {
+                            handler.set_selected_text_range(start..end);
+                        });
+                    });
                 }
             }));
+        }
+
+        // UIResponder - copy:
+        // Called by UIKit's edit menu when the user taps "Copy".
+        extern "C" fn copy_action(this: &Object, _sel: Sel, _sender: *mut Object) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                with_input_handler(this, |handler| {
+                    let selection = handler.selected_text_range(false)?;
+                    if selection.range.is_empty() {
+                        return None;
+                    }
+                    let mut adj = None;
+                    let text = handler.text_for_range(selection.range, &mut adj)?;
+                    unsafe {
+                        use std::ffi::CString;
+                        if let Ok(cstr) = CString::new(text) {
+                            let ns_string: *mut Object =
+                                msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+                            if !ns_string.is_null() {
+                                let pb: *mut Object =
+                                    msg_send![class!(UIPasteboard), generalPasteboard];
+                                let _: () = msg_send![pb, setString: ns_string];
+                            }
+                        }
+                    }
+                    Some(())
+                });
+            }));
+        }
+
+        // UIResponder - canPerformAction:withSender:
+        // Override only the non-editable copy action. Delegate standard edit
+        // menu actions back to UIKit/UITextInput so editable fields keep Paste,
+        // Cut, Select, and Select All, and read-only selection can still expose
+        // native actions such as Select All.
+        extern "C" fn can_perform_action(
+            this: &mut Object,
+            _sel: Sel,
+            action: Sel,
+            sender: *mut Object,
+        ) -> BOOL {
+            match edit_menu_action_policy(active_text_interaction_mode(this), action == sel!(copy:))
+            {
+                EditMenuActionPolicy::CopySelection => {
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let has_selection = with_input_handler(this, |handler| {
+                            handler
+                                .selected_text_range(false)
+                                .map(|s| !s.range.is_empty())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                        if has_selection { YES } else { NO }
+                    }));
+                    result.unwrap_or(NO)
+                }
+                EditMenuActionPolicy::DelegateToSystem => unsafe {
+                    let superclass = class!(UIView);
+                    msg_send![super(this, superclass), canPerformAction: action withSender: sender]
+                },
+            }
         }
 
         // UITextInput - markedTextRange (returns nil when no marked text)
@@ -645,13 +1082,20 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // UITextInput - inputDelegate (store reference to delegate)
-        extern "C" fn input_delegate(_this: &Object, _sel: Sel) -> *mut Object {
-            std::ptr::null_mut()
+        extern "C" fn input_delegate(this: &Object, _sel: Sel) -> *mut Object {
+            text_input_delegate(this)
         }
 
         // UITextInput - setInputDelegate:
-        extern "C" fn set_input_delegate(_this: &mut Object, _sel: Sel, _delegate: *mut Object) {
-            // Could store delegate for notifications if needed
+        extern "C" fn set_input_delegate(this: &mut Object, _sel: Sel, delegate: *mut Object) {
+            unsafe {
+                let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
+                if window_ptr.is_null() {
+                    return;
+                }
+                let window = &*(window_ptr as *const IosWindow);
+                window.input_delegate.set(delegate);
+            }
         }
 
         // UITextInput - tokenizer (use default string tokenizer)
@@ -722,13 +1166,10 @@ fn register_metal_view_class() -> &'static Class {
                     }
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
 
-                    ios_log_format(&format!(
-                        "GPUI iOS: replaceRange:withText: range={}..{}, text={:?}",
-                        start, end, text_str
-                    ));
-
-                    with_input_handler(this, |handler| {
-                        handler.replace_text_in_range(Some(start..end), &text_str);
+                    notify_text_and_selection_change(this, || {
+                        let _ = with_input_handler(this, |handler| {
+                            handler.replace_text_in_range(Some(start..end), &text_str);
+                        });
                     });
                 }
             }));
@@ -747,8 +1188,10 @@ fn register_metal_view_class() -> &'static Class {
                     if marked_text.is_null() {
                         ios_log_cstr(c"GPUI iOS: setMarkedText - unmarking (null text)");
                         // Unmark text
-                        with_input_handler(this, |handler| {
-                            handler.unmark_text();
+                        notify_text_and_selection_change(this, || {
+                            let _ = with_input_handler(this, |handler| {
+                                handler.unmark_text();
+                            });
                         });
                         return;
                     }
@@ -769,13 +1212,6 @@ fn register_metal_view_class() -> &'static Class {
                     }
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
 
-                    ios_log_format(&format!(
-                        "GPUI iOS: setMarkedText - text={:?}, selected_range={}..{}",
-                        text_str,
-                        selected_range.location,
-                        selected_range.location + selected_range.length
-                    ));
-
                     let selected = if selected_range.location != NS_NOT_FOUND {
                         Some(
                             selected_range.location as usize
@@ -785,8 +1221,10 @@ fn register_metal_view_class() -> &'static Class {
                         None
                     };
 
-                    with_input_handler(this, |handler| {
-                        handler.replace_and_mark_text_in_range(None, &text_str, selected);
+                    notify_text_and_selection_change(this, || {
+                        let _ = with_input_handler(this, |handler| {
+                            handler.replace_and_mark_text_in_range(None, &text_str, selected);
+                        });
                     });
                 }
             }));
@@ -796,8 +1234,10 @@ fn register_metal_view_class() -> &'static Class {
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn unmark_text(this: &mut Object, _sel: Sel) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                with_input_handler(this, |handler| {
-                    handler.unmark_text();
+                notify_text_and_selection_change(this, || {
+                    let _ = with_input_handler(this, |handler| {
+                        handler.unmark_text();
+                    });
                 });
             }));
         }
@@ -1014,13 +1454,17 @@ fn register_metal_view_class() -> &'static Class {
             _sel: Sel,
             position: *mut Object,
         ) -> IOSCGRect {
-            let default_rect =
-                IOSCGRect::new(IOSCGPoint::new(20.0, 100.0), IOSCGSize::new(2.0, 20.0));
+            let default_rect = IOSCGRect::new(IOSCGPoint::new(0.0, 0.0), IOSCGSize::new(0.0, 0.0));
 
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let interaction_mode = active_text_interaction_mode(this);
                 let Some(index) = get_position_index(position) else {
                     return default_rect;
                 };
+
+                if interaction_mode != TEXT_INTERACTION_EDITABLE {
+                    return default_rect;
+                }
 
                 let bounds =
                     with_input_handler(this, |handler| handler.bounds_for_range(index..index))
@@ -1050,8 +1494,12 @@ fn register_metal_view_class() -> &'static Class {
         ) -> IOSCGRect {
             let default_rect =
                 IOSCGRect::new(IOSCGPoint::new(20.0, 100.0), IOSCGSize::new(100.0, 20.0));
+            let empty_rect = IOSCGRect::new(IOSCGPoint::new(0.0, 0.0), IOSCGSize::new(0.0, 0.0));
 
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                    return empty_rect;
+                }
                 let Some((start, end)) = get_range_indices(range) else {
                     return default_rect;
                 };
@@ -1077,12 +1525,49 @@ fn register_metal_view_class() -> &'static Class {
 
         // UITextInput - selectionRectsForRange: (for selection handles)
         extern "C" fn selection_rects_for_range(
-            _this: &Object,
+            this: &Object,
             _sel: Sel,
-            _range: *mut Object,
+            range: *mut Object,
         ) -> *mut Object {
-            // Return empty array - we handle selection rendering ourselves
-            unsafe { msg_send![class!(NSArray), array] }
+            let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+                if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                    return msg_send![class!(NSArray), array];
+                }
+                let Some((start, end)) = get_range_indices(range) else {
+                    return msg_send![class!(NSArray), array];
+                };
+                if start == end {
+                    return msg_send![class!(NSArray), array];
+                }
+
+                let rects = with_input_handler(this, |handler| handler.rects_for_range(start..end))
+                    .unwrap_or_default();
+
+                if rects.is_empty() {
+                    return msg_send![class!(NSArray), array];
+                }
+
+                let array: *mut Object = msg_send![class!(NSMutableArray), array];
+                let rect_count = rects.len();
+                for (ix, bounds) in rects.into_iter().enumerate() {
+                    let rect = create_text_selection_rect(
+                        bounds.origin.x.as_f32() as f64,
+                        bounds.origin.y.as_f32() as f64,
+                        bounds.size.width.as_f32() as f64,
+                        bounds.size.height.as_f32() as f64,
+                        ix == 0,
+                        ix + 1 == rect_count,
+                    );
+                    let _: () = msg_send![array, addObject: rect];
+                    let _: () = msg_send![rect, release];
+                }
+                array
+            }));
+
+            match result {
+                Ok(array) => array,
+                Err(_) => unsafe { msg_send![class!(NSArray), array] },
+            }
         }
 
         // UITextInput - closestPositionToPoint:
@@ -1093,6 +1578,9 @@ fn register_metal_view_class() -> &'static Class {
             point: IOSCGPoint,
         ) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                    return ptr::null_mut();
+                }
                 let index = with_input_handler(this, |handler| {
                     handler.character_index_for_point(Point::new(
                         px(point.x as f32),
@@ -1101,12 +1589,16 @@ fn register_metal_view_class() -> &'static Class {
                 })
                 .flatten();
 
-                create_text_position(index.unwrap_or(0))
+                if let Some(index) = index {
+                    create_text_position(index)
+                } else {
+                    ptr::null_mut()
+                }
             }));
 
             match result {
                 Ok(ptr) => ptr,
-                Err(_) => create_text_position(0),
+                Err(_) => ptr::null_mut(),
             }
         }
 
@@ -1136,6 +1628,9 @@ fn register_metal_view_class() -> &'static Class {
             _sel: Sel,
             point: IOSCGPoint,
         ) -> *mut Object {
+            if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                return std::ptr::null_mut();
+            }
             let pos = closest_position_to_point(this, _sel, point);
             let Some(index) = get_position_index(pos) else {
                 return std::ptr::null_mut();
@@ -1194,6 +1689,14 @@ fn register_metal_view_class() -> &'static Class {
             decl.add_method(
                 sel!(canBecomeFirstResponder),
                 can_become_first_responder as extern "C" fn(&Object, Sel) -> bool,
+            );
+            decl.add_method(
+                sel!(becomeFirstResponder),
+                become_first_responder as extern "C" fn(&mut Object, Sel) -> BOOL,
+            );
+            decl.add_method(
+                sel!(resignFirstResponder),
+                resign_first_responder as extern "C" fn(&mut Object, Sel) -> BOOL,
             );
 
             // Add UITextInputTraits protocol methods
@@ -1420,6 +1923,16 @@ fn register_metal_view_class() -> &'static Class {
                 sel!(inputAccessoryView),
                 input_accessory_view as extern "C" fn(&Object, Sel) -> *mut Object,
             );
+
+            // UIResponder - copy action and capability query for selection copy menu.
+            decl.add_method(
+                sel!(copy:),
+                copy_action as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(canPerformAction:withSender:),
+                can_perform_action as extern "C" fn(&mut Object, Sel, Sel, *mut Object) -> BOOL,
+            );
         }
 
         decl.register();
@@ -1500,11 +2013,6 @@ fn handle_presses(view: &mut Object, presses: *mut Object, is_key_down: bool) {
 
             // Get modifier flags
             let modifier_flags: u64 = msg_send![key, modifierFlags];
-
-            ios_log_format(&format!(
-                "GPUI iOS: handle_presses - key_code=0x{:02X} ({}), modifiers=0x{:X}, is_down={}",
-                key_code, key_code, modifier_flags, is_key_down
-            ));
 
             // Convert modifier flags to our format
             let mut modifiers: u32 = 0;
@@ -1589,8 +2097,26 @@ pub(crate) struct IosWindow {
     input_handler: RefCell<Option<PlatformInputHandler>>,
     /// Stable mirror used by UIKit callbacks while GPUI is between frame phases.
     callback_input_handler: RefCell<Option<PlatformInputHandler>>,
-    /// Whether the keyboard is currently shown (tracked to avoid show/hide flicker)
-    keyboard_shown: Cell<bool>,
+    /// Selection-only handler for non-editable text surfaces.
+    selection_handler: RefCell<Option<PlatformInputHandler>>,
+    /// Stable mirror used by UIKit callbacks for selection-only surfaces.
+    callback_selection_handler: RefCell<Option<PlatformInputHandler>>,
+    /// Whether the active editable handler currently accepts inserted text.
+    input_accepts_text_input: Cell<bool>,
+    /// Whether the active input handler belongs to a manual-focus surface.
+    input_uses_manual_focus: Cell<bool>,
+    /// Whether UIKit should keep the software keyboard up for the active input handler.
+    keyboard_session_requested: Cell<bool>,
+    /// Weak text input delegate assigned by UIKit.
+    input_delegate: Cell<*mut Object>,
+    /// Native text interactions used for editable and non-editable selection modes.
+    editable_text_interaction: *mut Object,
+    noneditable_text_interaction: *mut Object,
+    /// GPUI's desired interaction mode from the current input/selection handlers.
+    target_text_interaction_mode: Cell<i8>,
+    /// The UIKit interaction currently installed on `view`.
+    active_text_interaction_mode: Cell<i8>,
+    last_selection_geometry: RefCell<Option<SelectionGeometry>>,
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
     pub(super) request_frame_callback: RefCell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
@@ -1700,6 +2226,17 @@ impl IosWindow {
             let _: () = msg_send![view, setUserInteractionEnabled: YES];
             let _: () = msg_send![view, setMultipleTouchEnabled: YES];
 
+            let editable_text_interaction: *mut Object =
+                msg_send![class!(UITextInteraction), textInteractionForMode: 0_i64];
+            let editable_text_interaction: *mut Object =
+                msg_send![editable_text_interaction, retain];
+            let _: () = msg_send![editable_text_interaction, setTextInput: view];
+            let noneditable_text_interaction: *mut Object =
+                msg_send![class!(UITextInteraction), textInteractionForMode: 1_i64];
+            let noneditable_text_interaction: *mut Object =
+                msg_send![noneditable_text_interaction, retain];
+            let _: () = msg_send![noneditable_text_interaction, setTextInput: view];
+
             // Set the view as the view controller's view
             let _: () = msg_send![view_controller, setView: view];
 
@@ -1732,7 +2269,17 @@ impl IosWindow {
                 appearance: Cell::new(WindowAppearance::Light),
                 input_handler: RefCell::new(None),
                 callback_input_handler: RefCell::new(None),
-                keyboard_shown: Cell::new(false),
+                selection_handler: RefCell::new(None),
+                callback_selection_handler: RefCell::new(None),
+                input_accepts_text_input: Cell::new(false),
+                input_uses_manual_focus: Cell::new(false),
+                keyboard_session_requested: Cell::new(false),
+                input_delegate: Cell::new(ptr::null_mut()),
+                editable_text_interaction,
+                noneditable_text_interaction,
+                target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
                 input_callback: RefCell::new(None),
                 active_status_callback: RefCell::new(None),
@@ -1815,6 +2362,16 @@ impl IosWindow {
             let _: () = msg_send![layer, setDrawableSize: drawable_size];
             let _: () = msg_send![view, setUserInteractionEnabled: YES];
             let _: () = msg_send![view, setMultipleTouchEnabled: YES];
+            let editable_text_interaction: *mut Object =
+                msg_send![class!(UITextInteraction), textInteractionForMode: 0_i64];
+            let editable_text_interaction: *mut Object =
+                msg_send![editable_text_interaction, retain];
+            let _: () = msg_send![editable_text_interaction, setTextInput: view];
+            let noneditable_text_interaction: *mut Object =
+                msg_send![class!(UITextInteraction), textInteractionForMode: 1_i64];
+            let noneditable_text_interaction: *mut Object =
+                msg_send![noneditable_text_interaction, retain];
+            let _: () = msg_send![noneditable_text_interaction, setTextInput: view];
             let _: () = msg_send![view_controller, setView: view];
 
             // Flexible width/height so UIKit layout changes on the parent propagate to the
@@ -1845,7 +2402,17 @@ impl IosWindow {
                 appearance: Cell::new(WindowAppearance::Light),
                 input_handler: RefCell::new(None),
                 callback_input_handler: RefCell::new(None),
-                keyboard_shown: Cell::new(false),
+                selection_handler: RefCell::new(None),
+                callback_selection_handler: RefCell::new(None),
+                input_accepts_text_input: Cell::new(false),
+                input_uses_manual_focus: Cell::new(false),
+                keyboard_session_requested: Cell::new(false),
+                input_delegate: Cell::new(ptr::null_mut()),
+                editable_text_interaction,
+                noneditable_text_interaction,
+                target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
                 input_callback: RefCell::new(None),
                 active_status_callback: RefCell::new(None),
@@ -1926,6 +2493,150 @@ impl IosWindow {
     /// Get the UIWindow pointer for this window.
     pub fn ui_window(&self) -> *mut Object {
         self.window
+    }
+
+    fn input_responder_view(&self) -> *mut Object {
+        self.view
+    }
+
+    fn active_first_responder_view(&self) -> Option<*mut Object> {
+        unsafe {
+            let view_is_fr: BOOL = msg_send![self.view, isFirstResponder];
+            if view_is_fr == YES {
+                return Some(self.view);
+            }
+        }
+        None
+    }
+
+    /// Adds/removes UIKit interactions without changing GPUI's desired mode.
+    fn install_text_interaction_mode(&self, mode: i8) {
+        let previous_mode = self.active_text_interaction_mode.get();
+        if previous_mode == mode {
+            return;
+        }
+        if previous_mode == TEXT_INTERACTION_NONEDITABLE {
+            self.last_selection_geometry.borrow_mut().take();
+        }
+
+        unsafe {
+            if previous_mode == TEXT_INTERACTION_EDITABLE {
+                let _: () = msg_send![self.view, removeInteraction: self.editable_text_interaction];
+            } else if previous_mode == TEXT_INTERACTION_NONEDITABLE {
+                let _: () =
+                    msg_send![self.view, removeInteraction: self.noneditable_text_interaction];
+            }
+
+            match mode {
+                TEXT_INTERACTION_EDITABLE => {
+                    let _: () =
+                        msg_send![self.view, addInteraction: self.editable_text_interaction];
+                }
+                TEXT_INTERACTION_NONEDITABLE => {
+                    let _: () =
+                        msg_send![self.view, addInteraction: self.noneditable_text_interaction];
+                }
+                _ => {}
+            }
+        }
+
+        self.active_text_interaction_mode.set(mode);
+    }
+
+    /// Applies the desired interaction mode to UIKit for the current responder state.
+    fn sync_text_interaction_for_current_responder_state(&self) {
+        let target_interaction_mode = self.target_text_interaction_mode.get();
+        let has_selection_handler = self.selection_handler.borrow().is_some();
+        let is_first_responder = self.active_first_responder_view().is_some();
+        let installed_mode = installed_text_interaction_mode_for_state(
+            target_interaction_mode,
+            has_selection_handler,
+            is_first_responder,
+        );
+        self.install_text_interaction_mode(installed_mode);
+    }
+
+    fn resign_first_responder_preserving_handler(&self) {
+        let responder = self.active_first_responder_view();
+        let Some(responder) = responder else {
+            self.sync_text_interaction_for_current_responder_state();
+            return;
+        };
+        let _: BOOL = unsafe { msg_send![responder, resignFirstResponder] };
+        self.sync_text_interaction_for_current_responder_state();
+    }
+
+    fn refresh_text_input_state(&self) {
+        let has_input_handler = self.input_handler.borrow().is_some();
+        let has_selection_handler = self.selection_handler.borrow().is_some();
+        let input_accepts_text_input = self.input_accepts_text_input.get();
+        let input_uses_manual_focus = self.input_uses_manual_focus.get();
+        let keyboard_session_requested = self.keyboard_session_requested.get();
+        let software_keyboard_visible = self.is_software_keyboard_visible();
+
+        let plan = text_input_refresh_plan(
+            has_input_handler,
+            has_selection_handler,
+            input_accepts_text_input,
+            input_uses_manual_focus,
+            keyboard_session_requested,
+            software_keyboard_visible,
+        );
+        self.keyboard_session_requested
+            .set(plan.keyboard_session_requested);
+
+        self.target_text_interaction_mode
+            .set(plan.target_interaction_mode);
+
+        match plan.responder_action {
+            TextInputResponderAction::ShowKeyboard => {
+                self.show_keyboard();
+            }
+            TextInputResponderAction::ResignActiveResponder => {
+                self.resign_first_responder_preserving_handler();
+            }
+            TextInputResponderAction::None => {}
+        }
+
+        self.sync_text_interaction_for_current_responder_state();
+    }
+
+    fn refresh_selection_geometry(&self) {
+        if self.active_text_interaction_mode.get() != TEXT_INTERACTION_NONEDITABLE {
+            return;
+        }
+
+        let view = unsafe { &*self.view };
+        let selection =
+            with_input_handler(view, |handler| handler.selected_text_range(false)).flatten();
+        let Some(selection) = selection else {
+            self.last_selection_geometry.borrow_mut().take();
+            return;
+        };
+        if selection.range.is_empty() {
+            self.last_selection_geometry.borrow_mut().take();
+            return;
+        }
+
+        let Some((bounds, rects)) = with_input_handler(view, |handler| {
+            (
+                handler.bounds_for_range(selection.range.clone()),
+                handler.rects_for_range(selection.range.clone()),
+            )
+        }) else {
+            return;
+        };
+        let geometry = SelectionGeometry {
+            range: selection.range.clone(),
+            bounds,
+            rects: rects.iter().cloned().collect(),
+        };
+        let geometry_changed = self.last_selection_geometry.borrow().as_ref() != Some(&geometry);
+
+        if geometry_changed {
+            *self.last_selection_geometry.borrow_mut() = Some(geometry);
+            notify_text_and_selection_change(view, || {});
+        }
     }
 
     pub fn handle_touch(&self, touch: *mut Object, _event: *mut Object) {
@@ -2175,7 +2886,7 @@ impl IosWindow {
 
     /// Whether the software keyboard is currently visible (view is first responder).
     pub fn is_keyboard_shown(&self) -> bool {
-        unsafe { msg_send![self.view, isFirstResponder] }
+        self.active_first_responder_view().is_some()
     }
 
     /// Whether UIKit reports the software keyboard itself as visible.
@@ -2185,26 +2896,20 @@ impl IosWindow {
 
     /// Show the software keyboard
     pub fn show_keyboard(&self) {
-        let already = self.is_keyboard_shown();
-        log::info!(
-            "GPUI iOS: show_keyboard called (already_first_responder={})",
-            already
-        );
+        let responder = self.input_responder_view();
         unsafe {
-            let _: BOOL = msg_send![self.view, becomeFirstResponder];
+            let _: BOOL = msg_send![responder, becomeFirstResponder];
         }
+        self.sync_text_interaction_for_current_responder_state();
     }
 
     /// Hide the software keyboard
     pub fn hide_keyboard(&self) {
-        let is_fr = self.is_keyboard_shown();
-        log::info!("GPUI iOS: Hiding keyboard (is_first_responder={})", is_fr);
-        let result: BOOL = unsafe { msg_send![self.view, resignFirstResponder] };
-        log::info!("GPUI iOS: resignFirstResponder returned {}", result == YES);
-        self.callback_input_handler.borrow_mut().take();
-        // Do NOT reset keyboard_shown here. set_input_handler is called every frame for
-        // focused views, so resetting to false would cause it to immediately re-show the
-        // keyboard on the next render pass, making explicit dismissal impossible.
+        let responder = self
+            .active_first_responder_view()
+            .unwrap_or_else(|| self.input_responder_view());
+        let _: BOOL = unsafe { msg_send![responder, resignFirstResponder] };
+        self.sync_text_interaction_for_current_responder_state();
     }
 
     /// Handle text input from the software keyboard
@@ -2223,8 +2928,6 @@ impl IosWindow {
             let text_str = std::ffi::CStr::from_ptr(utf8)
                 .to_string_lossy()
                 .into_owned();
-
-            log::info!("GPUI iOS: handle_text_input (fallback): {:?}", text_str);
 
             // Send as key events
             for c in text_str.chars() {
@@ -2256,12 +2959,6 @@ impl IosWindow {
 
         let key = key_code_to_string(key_code);
         let modifiers = modifier_flags_to_modifiers(modifier_flags);
-
-        // Enhanced logging for debugging arrow key and other key mapping issues
-        ios_log_format(&format!(
-            "GPUI iOS: handle_key_event - code=0x{:02X}, key={}, modifiers={:?}, down={}",
-            key_code, key, modifiers, is_key_down
-        ));
 
         // Handle arrow keys directly via input handler for cursor navigation
         // This bypasses GPUI's key event dispatch which may not work correctly on iOS
@@ -2390,6 +3087,14 @@ impl IosWindow {
 
 impl Drop for IosWindow {
     fn drop(&mut self) {
+        unsafe {
+            if !self.editable_text_interaction.is_null() {
+                let _: () = msg_send![self.editable_text_interaction, release];
+            }
+            if !self.noneditable_text_interaction.is_null() {
+                let _: () = msg_send![self.noneditable_text_interaction, release];
+            }
+        }
         super::ffi::unregister_window(self as *const Self);
     }
 }
@@ -2470,37 +3175,67 @@ impl PlatformWindow for IosWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
+        let had_input_handler = self.callback_input_handler.borrow().is_some();
+        let mut input_handler = input_handler;
+        let accepts_text_input = input_handler.query_accepts_text_input();
+        let uses_manual_focus = input_handler.query_uses_manual_focus();
+        let should_auto_request_keyboard = should_auto_request_soft_keyboard(
+            accepts_text_input,
+            uses_manual_focus,
+            had_input_handler,
+        );
+
         *self.callback_input_handler.borrow_mut() = Some(input_handler.clone());
         *self.input_handler.borrow_mut() = Some(input_handler);
-        // Only show keyboard if we haven't already shown it.
-        // Note: set_input_handler and take_input_handler are called every frame
-        // as part of GPUI's rendering cycle, so we use keyboard_shown flag to
-        // track state and avoid show/hide flicker.
-        if !self.keyboard_shown.get() {
-            self.keyboard_shown.set(true);
-            self.show_keyboard();
+        self.input_accepts_text_input.set(accepts_text_input);
+        self.input_uses_manual_focus.set(uses_manual_focus);
+        if should_auto_request_keyboard {
+            self.keyboard_session_requested.set(true);
         }
+        self.refresh_text_input_state();
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
-        let handler = self.input_handler.borrow_mut().take();
-        if handler.is_none() {
-            // When the focused view stops registering an input handler, the next
-            // focus session should be able to auto-show the keyboard again.
-            self.keyboard_shown.set(false);
+        self.input_handler.borrow_mut().take()
+    }
+
+    fn clear_input_handler(&mut self) {
+        let had_input_handler = self.input_handler.borrow_mut().take().is_some();
+        let had_callback_input_handler = self.callback_input_handler.borrow_mut().take().is_some();
+        self.input_accepts_text_input.set(false);
+        self.input_uses_manual_focus.set(false);
+        if should_clear_keyboard_request_when_clearing_input_handler(
+            had_input_handler,
+            had_callback_input_handler,
+        ) {
+            self.keyboard_session_requested.set(false);
         }
-        // Note: Don't hide keyboard here! take_input_handler is called every frame
-        // as part of GPUI's rendering cycle (see window.rs line 2006).
-        // The keyboard should only be hidden when the view resigns first responder,
-        // not on every frame. The keyboard_shown flag stays true.
-        handler
+        self.refresh_text_input_state();
+    }
+
+    fn set_selection_handler(&mut self, input_handler: PlatformInputHandler) {
+        *self.callback_selection_handler.borrow_mut() = Some(input_handler.clone());
+        *self.selection_handler.borrow_mut() = Some(input_handler);
+        self.refresh_text_input_state();
+    }
+
+    fn take_selection_handler(&mut self) -> Option<PlatformInputHandler> {
+        self.selection_handler.borrow_mut().take()
+    }
+
+    fn clear_selection_handler(&mut self) {
+        self.selection_handler.borrow_mut().take();
+        self.callback_selection_handler.borrow_mut().take();
+        self.refresh_text_input_state();
     }
 
     fn show_soft_keyboard(&self) {
-        self.show_keyboard();
+        self.keyboard_session_requested.set(true);
+        self.refresh_text_input_state();
     }
 
     fn hide_soft_keyboard(&self) {
+        self.keyboard_session_requested.set(false);
         self.hide_keyboard();
     }
 
@@ -2663,6 +3398,10 @@ impl PlatformWindow for IosWindow {
         self.renderer.borrow_mut().draw(scene);
     }
 
+    fn completed_frame(&self) {
+        self.refresh_selection_geometry();
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.renderer.borrow().sprite_atlas().clone()
     }
@@ -2682,5 +3421,144 @@ impl PlatformWindow for IosWindow {
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         // iOS handles IME positioning automatically
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editable_edit_menu_actions_delegate_to_system() {
+        assert_eq!(
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true),
+            EditMenuActionPolicy::DelegateToSystem
+        );
+        assert_eq!(
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false),
+            EditMenuActionPolicy::DelegateToSystem
+        );
+    }
+
+    #[test]
+    fn noneditable_copy_uses_selection_policy_but_other_actions_delegate() {
+        assert_eq!(
+            edit_menu_action_policy(TEXT_INTERACTION_NONEDITABLE, true),
+            EditMenuActionPolicy::CopySelection
+        );
+        assert_eq!(
+            edit_menu_action_policy(TEXT_INTERACTION_NONEDITABLE, false),
+            EditMenuActionPolicy::DelegateToSystem
+        );
+    }
+
+    #[test]
+    fn native_touch_selection_is_disabled_without_text_interaction() {
+        assert!(!handles_native_touch_selection(TEXT_INTERACTION_NONE));
+    }
+
+    #[test]
+    fn native_touch_selection_is_enabled_for_text_interactions() {
+        assert!(handles_native_touch_selection(TEXT_INTERACTION_EDITABLE));
+        assert!(handles_native_touch_selection(TEXT_INTERACTION_NONEDITABLE));
+    }
+
+    #[test]
+    fn explicit_keyboard_request_survives_until_input_handler_arrives() {
+        let plan = text_input_refresh_plan(false, false, false, false, true, false);
+
+        assert!(plan.keyboard_session_requested);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
+        assert_eq!(plan.responder_action, TextInputResponderAction::None);
+    }
+
+    #[test]
+    fn stale_keyboard_request_resigns_when_handler_is_cleared() {
+        let plan = text_input_refresh_plan(false, false, false, false, false, true);
+
+        assert!(!plan.keyboard_session_requested);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
+        assert_eq!(
+            plan.responder_action,
+            TextInputResponderAction::ResignActiveResponder
+        );
+    }
+
+    #[test]
+    fn clearing_existing_input_handler_clears_keyboard_request() {
+        assert!(should_clear_keyboard_request_when_clearing_input_handler(
+            true, false
+        ));
+        assert!(should_clear_keyboard_request_when_clearing_input_handler(
+            false, true
+        ));
+    }
+
+    #[test]
+    fn clearing_without_existing_input_handler_preserves_pre_handler_request() {
+        assert!(!should_clear_keyboard_request_when_clearing_input_handler(
+            false, false
+        ));
+    }
+
+    #[test]
+    fn explicit_keyboard_request_shows_when_manual_focus_handler_arrives() {
+        let plan = text_input_refresh_plan(true, false, true, true, true, false);
+
+        assert!(plan.keyboard_session_requested);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
+        assert_eq!(
+            plan.responder_action,
+            TextInputResponderAction::ShowKeyboard
+        );
+    }
+
+    #[test]
+    fn explicit_keyboard_request_does_not_reopen_when_keyboard_is_visible() {
+        let plan = text_input_refresh_plan(true, false, true, true, true, true);
+
+        assert!(plan.keyboard_session_requested);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
+        assert_eq!(plan.responder_action, TextInputResponderAction::None);
+    }
+
+    #[test]
+    fn keyboard_request_clears_when_non_text_handler_arrives() {
+        let plan = text_input_refresh_plan(true, false, false, false, true, false);
+
+        assert!(!plan.keyboard_session_requested);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
+        assert_eq!(
+            plan.responder_action,
+            TextInputResponderAction::ResignActiveResponder
+        );
+    }
+
+    #[test]
+    fn editable_interaction_installs_only_while_first_responder() {
+        assert_eq!(
+            installed_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, true),
+            TEXT_INTERACTION_EDITABLE
+        );
+        assert_eq!(
+            installed_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, false),
+            TEXT_INTERACTION_NONEDITABLE
+        );
+        assert_eq!(
+            installed_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, false, false),
+            TEXT_INTERACTION_NONE
+        );
+    }
+
+    #[test]
+    fn noneditable_interaction_remains_installed_outside_first_responder() {
+        assert_eq!(
+            installed_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, false),
+            TEXT_INTERACTION_NONEDITABLE
+        );
+        assert_eq!(
+            installed_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, true),
+            TEXT_INTERACTION_NONEDITABLE
+        );
     }
 }
