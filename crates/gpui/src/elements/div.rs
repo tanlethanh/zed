@@ -836,11 +836,27 @@ pub trait InteractiveElement: Sized {
     }
 
     /// Track the focus state of the given focus handle on this element.
-    /// If the focus handle is focused by the application, this element will
-    /// apply its focused styles.
+    ///
+    /// This registers the focus handle in the window focus tree, applies focused
+    /// styles when the handle is focused, and installs the default pointer-down
+    /// behavior that focuses this handle when the element is tapped or clicked.
+    ///
+    /// To suppress the default pointer-down focus transfer, use [`Self::manual_focus`]
+    /// for elements that always own focus changes themselves, or call
+    /// [`Window::prevent_default`] from an earlier pointer/mouse-down handler.
     fn track_focus(mut self, focus_handle: &FocusHandle) -> Self {
         self.interactivity().focusable = true;
         self.interactivity().tracked_focus_handle = Some(focus_handle.clone());
+        self
+    }
+
+    /// Keep the element focusable but do not focus it automatically on pointer down.
+    ///
+    /// This is useful for surfaces such as terminals that use press handlers to
+    /// implement custom focus/keyboard toggle behavior. Pointer down inside the
+    /// element still prevents ancestor default focus transfer.
+    fn manual_focus(mut self) -> Self {
+        self.interactivity().manual_focus = true;
         self
     }
 
@@ -1970,6 +1986,7 @@ pub struct Interactivity {
     pub(crate) key_context: Option<KeyContext>,
     pub(crate) focusable: bool,
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
+    pub(crate) manual_focus: bool,
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
@@ -2334,6 +2351,9 @@ impl Interactivity {
                 }
                 if let Some(focus_handle) = &self.tracked_focus_handle {
                     window.next_frame.tab_stops.insert(focus_handle);
+                    if self.manual_focus {
+                        window.next_frame.manual_focus_handles.push(focus_handle.id);
+                    }
                 }
 
                 window.with_element_opacity(style.opacity, |window| {
@@ -2536,37 +2556,60 @@ impl Interactivity {
             .map(|handle| handle.is_focused(window))
             .unwrap_or(false);
 
-        // If this element can be focused, register a mouse down listener
-        // that will automatically transfer focus when hitting the element.
-        // This behavior can be suppressed by using `cx.prevent_default()`.
+        // If this element can be focused, register mouse/pointer down listeners
+        // that transfer focus when hitting the element. This behavior can be
+        // suppressed with `manual_focus` or an earlier `prevent_default`.
         if let Some(focus_handle) = self.tracked_focus_handle.clone() {
-            let mouse_focus_hitbox = hitbox.clone();
-            let mouse_focus_handle = focus_handle.clone();
-            window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble
-                    && mouse_focus_hitbox.is_hovered(window)
-                    && !window.default_prevented()
-                {
-                    window.focus(&mouse_focus_handle, cx);
-                    // If there is a parent that is also focusable, prevent it
-                    // from transferring focus because we already did so.
-                    window.prevent_default();
-                }
-            });
+            if self.manual_focus {
+                let mouse_focus_hitbox = hitbox.clone();
+                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
+                    if phase == DispatchPhase::Bubble
+                        && mouse_focus_hitbox.is_hovered(window)
+                        && !window.default_prevented()
+                    {
+                        window.prevent_default();
+                    }
+                });
 
-            let pointer_focus_hitbox = hitbox.clone();
-            window.on_pointer_event(move |event: &PointerDownEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble
-                    && is_direct_primary_pointer_down(event)
-                    && pointer_focus_hitbox.is_hovered(window)
-                    && !window.default_prevented()
-                {
-                    window.focus(&focus_handle, cx);
-                    // If there is a parent that is also focusable, prevent it
-                    // from transferring focus because we already did so.
-                    window.prevent_default();
-                }
-            });
+                let pointer_focus_hitbox = hitbox.clone();
+                window.on_pointer_event(move |event: &PointerDownEvent, phase, window, _cx| {
+                    if phase == DispatchPhase::Bubble
+                        && is_direct_primary_pointer_down(event)
+                        && pointer_focus_hitbox.is_hovered(window)
+                        && !window.default_prevented()
+                    {
+                        window.prevent_default();
+                    }
+                });
+            } else {
+                let mouse_focus_hitbox = hitbox.clone();
+                let mouse_focus_handle = focus_handle.clone();
+                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble
+                        && mouse_focus_hitbox.is_hovered(window)
+                        && !window.default_prevented()
+                    {
+                        window.focus(&mouse_focus_handle, cx);
+                        // If there is a parent that is also focusable, prevent it
+                        // from transferring focus because we already did so.
+                        window.prevent_default();
+                    }
+                });
+
+                let pointer_focus_hitbox = hitbox.clone();
+                window.on_pointer_event(move |event: &PointerDownEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble
+                        && is_direct_primary_pointer_down(event)
+                        && pointer_focus_hitbox.is_hovered(window)
+                        && !window.default_prevented()
+                    {
+                        window.focus(&focus_handle, cx);
+                        // If there is a parent that is also focusable, prevent it
+                        // from transferring focus because we already did so.
+                        window.prevent_default();
+                    }
+                });
+            }
         }
 
         for listener in self.mouse_down_listeners.drain(..) {
@@ -4196,8 +4239,39 @@ impl ScrollHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppContext as _, Context, InputEvent, MouseMoveEvent, TestAppContext};
+    use crate::{
+        self as gpui, AppContext as _, Context, InputEvent, MouseMoveEvent, PointerButton,
+        PointerDownEvent, PointerKind, TestAppContext, VisualTestContext,
+    };
     use std::rc::Weak;
+
+    struct FocusTransferTestView {
+        parent_focus: FocusHandle,
+        child_focus: FocusHandle,
+        child_manual: bool,
+    }
+
+    impl Render for FocusTransferTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let child = div()
+                .id("child")
+                .w(px(100.))
+                .h(px(100.))
+                .track_focus(&self.child_focus);
+            let child = if self.child_manual {
+                child.manual_focus()
+            } else {
+                child
+            };
+
+            div()
+                .id("parent")
+                .w(px(200.))
+                .h(px(100.))
+                .track_focus(&self.parent_focus)
+                .child(child)
+        }
+    }
 
     struct TestTooltipView;
 
@@ -4301,6 +4375,79 @@ mod tests {
                 captured_active_tooltip: self.captured_active_tooltip.clone(),
             }
         }
+    }
+
+    fn draw_focus_transfer_test(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+    }
+
+    #[gpui::test]
+    fn track_focus_transfers_focus_on_mouse_down(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| FocusTransferTestView {
+            parent_focus: cx.focus_handle(),
+            child_focus: cx.focus_handle(),
+            child_manual: false,
+        });
+        draw_focus_transfer_test(cx);
+
+        cx.simulate_click(point(px(50.), px(50.)), Default::default());
+
+        let (parent_focus, child_focus) = view.read_with(cx, |view, _| {
+            (view.parent_focus.clone(), view.child_focus.clone())
+        });
+        cx.update(|window, _| {
+            assert!(child_focus.is_focused(window));
+            assert!(!parent_focus.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn manual_focus_suppresses_mouse_default_focus_transfer(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| FocusTransferTestView {
+            parent_focus: cx.focus_handle(),
+            child_focus: cx.focus_handle(),
+            child_manual: true,
+        });
+        draw_focus_transfer_test(cx);
+
+        cx.simulate_click(point(px(50.), px(50.)), Default::default());
+
+        let (parent_focus, child_focus) = view.read_with(cx, |view, _| {
+            (view.parent_focus.clone(), view.child_focus.clone())
+        });
+        cx.update(|window, _| {
+            assert!(!child_focus.is_focused(window));
+            assert!(!parent_focus.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn manual_focus_suppresses_direct_pointer_default_focus_transfer(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| FocusTransferTestView {
+            parent_focus: cx.focus_handle(),
+            child_focus: cx.focus_handle(),
+            child_manual: true,
+        });
+        draw_focus_transfer_test(cx);
+
+        cx.simulate_event(PointerDownEvent {
+            pointer_id: 1,
+            kind: PointerKind::Touch,
+            is_primary: true,
+            button: PointerButton::Primary,
+            position: point(px(50.), px(50.)),
+            modifiers: Default::default(),
+        });
+
+        let (parent_focus, child_focus) = view.read_with(cx, |view, _| {
+            (view.parent_focus.clone(), view.child_focus.clone())
+        });
+        cx.update(|window, _| {
+            assert!(!child_focus.is_focused(window));
+            assert!(!parent_focus.is_focused(window));
+        });
     }
 
     #[test]

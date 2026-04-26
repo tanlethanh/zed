@@ -447,10 +447,8 @@ pub extern "C" fn gpui_ios_show_keyboard(window_ptr: *mut c_void) {
         return;
     }
 
-    log::info!("GPUI iOS: Show keyboard requested");
-
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
-    window.show_keyboard();
+    window.show_soft_keyboard();
 }
 
 /// Set the UIView to display above the software keyboard (inputAccessoryView).
@@ -483,7 +481,7 @@ pub extern "C" fn gpui_ios_hide_keyboard(window_ptr: *mut c_void) {
     }
 
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
-    window.hide_keyboard();
+    window.hide_soft_keyboard();
 }
 
 /// Handle text input from the software keyboard.
