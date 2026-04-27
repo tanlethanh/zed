@@ -2266,8 +2266,9 @@ impl Window {
         self.text_style().line_height_in_pixels(self.rem_size())
     }
 
-    /// Call to prevent the default action of an event. Currently only used to prevent
-    /// parent elements from becoming focused on mouse down.
+    /// Call to prevent the default action of an event. This is used by widgets to
+    /// claim platform-level behavior such as default focus transfer or synthetic
+    /// touch scrolling.
     pub fn prevent_default(&mut self) {
         self.default_prevented = true;
     }

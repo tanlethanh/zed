@@ -42,6 +42,7 @@ struct TouchState {
     last_position: Option<(f32, f32)>,
     down_position: Option<(f32, f32)>,
     is_drag: bool,
+    suppress_scroll: bool,
     fling: Option<FlingState>,
 }
 
@@ -51,6 +52,7 @@ impl TouchState {
             last_position: None,
             down_position: None,
             is_drag: false,
+            suppress_scroll: false,
             fling: None,
         }
     }
@@ -270,6 +272,7 @@ impl AndroidPlatform {
                 state.down_position = Some((logical_x, logical_y));
                 state.last_position = Some((logical_x, logical_y));
                 state.is_drag = false;
+                state.suppress_scroll = false;
                 self.dispatch_input(PlatformInput::PointerDown(PointerDownEvent {
                     pointer_id: 1,
                     kind: PointerKind::Touch,
@@ -281,16 +284,16 @@ impl AndroidPlatform {
             }
             1 => {
                 // ACTION_UP
-                let is_drag = {
+                let (is_drag, suppress_scroll) = {
                     let mut state = self.touch_state.borrow_mut();
                     let is_drag = state.is_drag;
-                    let last_pos = state.last_position;
+                    let suppress_scroll = state.suppress_scroll;
                     state.last_position = None;
                     state.down_position = None;
                     state.is_drag = false;
-                    is_drag
+                    (is_drag, suppress_scroll)
                 };
-                if !is_drag {
+                if !is_drag || suppress_scroll {
                     // Discard any fling: Java forwards velocity unconditionally, but
                     // tap classification happens here. A fling after a tap would cause
                     // spurious scrolling.
@@ -336,22 +339,28 @@ impl AndroidPlatform {
                         (None, false)
                     }
                 };
-                self.dispatch_input(PlatformInput::PointerMove(PointerMoveEvent {
-                    pointer_id: 1,
-                    kind: PointerKind::Touch,
-                    is_primary: true,
-                    pressed_button: Some(PointerButton::Primary),
-                    position,
-                    modifiers: Modifiers::default(),
-                }));
+                let pointer_result =
+                    self.dispatch_input(PlatformInput::PointerMove(PointerMoveEvent {
+                        pointer_id: 1,
+                        kind: PointerKind::Touch,
+                        is_primary: true,
+                        pressed_button: Some(PointerButton::Primary),
+                        position,
+                        modifiers: Modifiers::default(),
+                    }));
+                if pointer_result.default_prevented {
+                    self.touch_state.borrow_mut().suppress_scroll = true;
+                }
                 if should_scroll {
                     if let Some((dx, dy)) = scroll_delta {
-                        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position,
-                            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
-                            modifiers: Modifiers::default(),
-                            touch_phase: TouchPhase::Moved,
-                        }));
+                        if !self.touch_state.borrow().suppress_scroll {
+                            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                position,
+                                delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                                modifiers: Modifiers::default(),
+                                touch_phase: TouchPhase::Moved,
+                            }));
+                        }
                     }
                 }
             }
@@ -361,6 +370,7 @@ impl AndroidPlatform {
                 state.last_position = None;
                 state.down_position = None;
                 state.is_drag = false;
+                state.suppress_scroll = false;
                 self.dispatch_input(PlatformInput::PointerCancel(PointerCancelEvent {
                     pointer_id: 1,
                     kind: PointerKind::Touch,
@@ -380,6 +390,10 @@ impl AndroidPlatform {
         let vy = velocity_y / scale;
 
         let mut state = self.touch_state.borrow_mut();
+        if state.suppress_scroll {
+            state.fling = None;
+            return;
+        }
         let position = state
             .last_position
             .map(|(x, y)| point(px(x), px(y)))

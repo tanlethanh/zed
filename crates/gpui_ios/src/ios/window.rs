@@ -2306,6 +2306,9 @@ pub(crate) struct IosWindow {
     /// Position where the primary touch began (used as scroll event origin so
     /// DrawerHost's edge-zone check reflects the gesture start, not current pos)
     touch_down_position: Cell<Point<Pixels>>,
+    /// True once a pointer handler claims the active touch stream and suppresses
+    /// the platform's synthetic scroll events for that stream.
+    touch_scroll_suppressed: Cell<bool>,
     /// Timestamp of the last dispatched Moved event (UITouch.timestamp, seconds since boot).
     /// Used to skip duplicate Moved callbacks that UIKit fires for the same touch sample.
     last_move_ts: Cell<f64>,
@@ -2450,6 +2453,7 @@ impl IosWindow {
                 touch_last_time: RefCell::new(None),
                 fling: RefCell::new(None),
                 touch_down_position: Cell::new(Point::default()),
+                touch_scroll_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
             };
 
@@ -2586,6 +2590,7 @@ impl IosWindow {
                 touch_last_time: RefCell::new(None),
                 fling: RefCell::new(None),
                 touch_down_position: Cell::new(Point::default()),
+                touch_scroll_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
             })
         }
@@ -2860,6 +2865,7 @@ impl IosWindow {
                     self.touch_velocity_x.set(0.0);
                     self.touch_velocity_y.set(0.0);
                     self.last_move_ts.set(0.0);
+                    self.touch_scroll_suppressed.set(false);
                     *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
                     *self.fling.borrow_mut() = None;
                     let had_selection = self.last_selection_geometry.borrow().is_some();
@@ -2910,12 +2916,21 @@ impl IosWindow {
                 self.touch_velocity_y
                     .set(self.touch_velocity_y.get() * 0.7 + instant_vy * 0.3);
                 *self.touch_last_time.borrow_mut() = Some(now);
-                if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-                    callback(touch_moved_to_pointer_move(
-                        position,
-                        touch_ptr as u64,
-                        modifiers,
-                    ));
+                let pointer_result =
+                    if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                        callback(touch_moved_to_pointer_move(
+                            position,
+                            touch_ptr as u64,
+                            modifiers,
+                        ))
+                    } else {
+                        DispatchEventResult::default()
+                    };
+                if pointer_result.default_prevented {
+                    self.touch_scroll_suppressed.set(true);
+                }
+                if self.touch_scroll_suppressed.get() {
+                    return;
                 }
                 // Use the DOWN position so DrawerHost's edge-zone check (pos_x < EDGE_ZONE)
                 // sees where the gesture started, not where the finger currently is.
@@ -2933,23 +2948,29 @@ impl IosWindow {
                 }
                 self.primary_touch_ptr.set(0);
                 self.touch_pressed.set(false);
-                if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-                    if phase == UITouchPhase::Cancelled {
-                        callback(touch_cancelled_to_pointer_cancel(
-                            position,
-                            touch_ptr as u64,
-                            modifiers,
-                        ));
+                let pointer_result =
+                    if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                        if phase == UITouchPhase::Cancelled {
+                            callback(touch_cancelled_to_pointer_cancel(
+                                position,
+                                touch_ptr as u64,
+                                modifiers,
+                            ))
+                        } else {
+                            callback(touch_ended_to_pointer_up(
+                                position,
+                                touch_ptr as u64,
+                                modifiers,
+                            ))
+                        }
                     } else {
-                        callback(touch_ended_to_pointer_up(
-                            position,
-                            touch_ptr as u64,
-                            modifiers,
-                        ));
-                    }
+                        DispatchEventResult::default()
+                    };
+                if pointer_result.default_prevented {
+                    self.touch_scroll_suppressed.set(true);
                 }
                 // Start fling if velocity exceeds threshold
-                if phase == UITouchPhase::Ended {
+                if phase == UITouchPhase::Ended && !self.touch_scroll_suppressed.get() {
                     let vx = self.touch_velocity_x.get();
                     let vy = self.touch_velocity_y.get();
                     if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
@@ -2961,6 +2982,7 @@ impl IosWindow {
                         });
                     }
                 }
+                self.touch_scroll_suppressed.set(false);
                 None
             }
             UITouchPhase::Stationary => unreachable!(),
