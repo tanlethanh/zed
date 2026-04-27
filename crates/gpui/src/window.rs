@@ -14,13 +14,13 @@ use crate::{
     PromptLevel, Quad, RegisteredSelectionArea, RegisteredTextSelectionFragment, Render,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
-    SelectionArea, SelectionState, Shadow, SharedString, Size, StrikethroughStyle, Style,
-    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextSelectionFragment, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowSelectionHandler, WindowTextSystem, point, prelude::*, px,
-    rems, size, transparent_black,
+    SelectableTextHitRegion, SelectionArea, SelectionState, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode,
+    TextSelectionFragment, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowSelectionHandler,
+    WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -618,6 +618,21 @@ pub struct Hitbox {
 }
 
 impl Hitbox {
+    fn interaction_bounds(&self) -> Bounds<Pixels> {
+        let slop = &self.hit_slop;
+        let interaction_bounds = Bounds {
+            origin: point(
+                self.bounds.origin.x - slop.left,
+                self.bounds.origin.y - slop.top,
+            ),
+            size: Size {
+                width: self.bounds.size.width + slop.left + slop.right,
+                height: self.bounds.size.height + slop.top + slop.bottom,
+            },
+        };
+        interaction_bounds.intersect(&self.content_mask.bounds)
+    }
+
     /// Checks if the hitbox is currently hovered. Returns `false` during keyboard input modality
     /// so that keyboard navigation suppresses hover highlights. Except when handling
     /// `ScrollWheelEvent`, this is typically what you want when determining whether to handle mouse
@@ -880,18 +895,7 @@ impl Frame {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
-            let slop = &hitbox.hit_slop;
-            let interaction_bounds = Bounds {
-                origin: point(
-                    hitbox.bounds.origin.x - slop.left,
-                    hitbox.bounds.origin.y - slop.top,
-                ),
-                size: Size {
-                    width: hitbox.bounds.size.width + slop.left + slop.right,
-                    height: hitbox.bounds.size.height + slop.top + slop.bottom,
-                },
-            };
-            let bounds = interaction_bounds.intersect(&hitbox.content_mask.bounds);
+            let bounds = hitbox.interaction_bounds();
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
@@ -928,6 +932,28 @@ impl Frame {
 
         self.scene.finish();
     }
+}
+
+fn selectable_text_occluding_bounds(
+    frame: &Frame,
+    text_bounds: Bounds<Pixels>,
+    hitbox_range: Option<&Range<usize>>,
+) -> SmallVec<[Bounds<Pixels>; 4]> {
+    let Some(hitbox_range) = hitbox_range else {
+        return SmallVec::new();
+    };
+    let hitbox_start = hitbox_range.end.min(frame.hitboxes.len());
+    if hitbox_start >= frame.hitboxes.len() {
+        return SmallVec::new();
+    }
+
+    frame.hitboxes[hitbox_start..]
+        .iter()
+        .filter_map(|hitbox| {
+            let bounds = hitbox.interaction_bounds();
+            bounds.intersects(&text_bounds).then_some(bounds)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -1670,12 +1696,23 @@ impl Window {
             .and_then(|id| FocusHandle::for_id(id, &cx.focus_handles))
     }
 
+    fn clear_active_selection(&mut self) {
+        if self.selection_state.active_area.is_none() && self.selection_state.range_utf16.is_none()
+        {
+            return;
+        }
+
+        self.selection_state = SelectionState::default();
+        self.platform_window.clear_active_selection();
+    }
+
     /// Move focus to the element associated with the given [`FocusHandle`].
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
         if !self.focus_enabled || self.focus == Some(handle.id) {
             return;
         }
 
+        self.clear_active_selection();
         self.focus = Some(handle.id);
         self.clear_pending_keystrokes();
 
@@ -1699,6 +1736,7 @@ impl Window {
             return;
         }
 
+        self.clear_active_selection();
         self.focus = None;
         self.refresh();
     }
@@ -2332,6 +2370,26 @@ impl Window {
         } else {
             self.platform_window.clear_input_handler();
         }
+        self.platform_window.set_selectable_text_hit_regions(
+            self.next_frame
+                .selection_fragments
+                .iter()
+                .map(|fragment| {
+                    let text_bounds = fragment.fragment().layout().bounds();
+                    let selection_area_bounds =
+                        fragment.selection_area_bounds().unwrap_or(text_bounds);
+                    SelectableTextHitRegion::new(
+                        text_bounds,
+                        selection_area_bounds,
+                        selectable_text_occluding_bounds(
+                            &self.next_frame,
+                            selection_area_bounds,
+                            fragment.selection_area_hitbox_range(),
+                        ),
+                    )
+                })
+                .collect(),
+        );
         if self.next_frame.selection_fragments.is_empty() {
             self.selection_state = SelectionState::default();
             self.platform_window.clear_selection_handler();
@@ -2853,6 +2911,28 @@ impl Window {
         }
     }
 
+    /// Push a selection area and its rendered interaction region onto the stack.
+    pub(crate) fn with_selection_area_region<F, R>(
+        &mut self,
+        area: &SelectionArea,
+        global_id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        hitbox_range: Range<usize>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        self.invalidator.debug_assert_paint();
+        self.selection_area_stack.push(
+            ActiveSelectionArea::new(area.clone(), global_id.cloned())
+                .with_interaction_region(bounds, hitbox_range),
+        );
+        let result = f(self);
+        self.selection_area_stack.pop();
+        result
+    }
+
     /// Returns the nearest active logical selection area, if any.
     pub fn current_selection_area(&self) -> Option<&SelectionArea> {
         self.selection_area_stack
@@ -2877,6 +2957,8 @@ impl Window {
                 selection_area.clone(),
                 global_id.cloned(),
                 self.current_view(),
+                self.current_active_selection_area()
+                    .and_then(ActiveSelectionArea::bounds),
             ));
     }
 
@@ -6041,5 +6123,4 @@ mod tests {
         })
         .unwrap();
     }
-
 }

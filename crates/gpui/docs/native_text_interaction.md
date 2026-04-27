@@ -64,9 +64,9 @@ actions delegate back to UIKit.
 
 Touch-selection methods such as `setSelectedTextRange:`,
 `firstRectForRange:`, `selectionRectsForRange:`, `closestPositionToPoint:`, and
-`characterRangeAtPoint:` are answered only when an editable or noneditable text
-interaction is active. This prevents non-selectable manual-focus surfaces from
-receiving stray native carets.
+`characterRangeAtPoint:` are answered only while read-only selection is active.
+This prevents focused input handlers and manual-focus surfaces from receiving
+stray native carets or native selection menus.
 
 Selection geometry is refreshed after each completed frame while noneditable
 interaction is active. If the selected range, bounds, or rects changed, iOS
@@ -102,15 +102,18 @@ object:
   `.manual_focus()`.
 
 Normal editable handlers auto-request the soft keyboard when newly focused.
-Manual-focus handlers still receive text input, but they do not auto-install
-editable text interaction and do not auto-show the keyboard. They must call
-`Window::show_soft_keyboard()` when they want a keyboard session.
+Manual-focus handlers still receive text input, but they do not auto-show the
+keyboard. They must call `Window::show_soft_keyboard()` when they want a
+keyboard session.
 
 On iOS, input handlers use `TEXT_INTERACTION_EDITABLE` only when the handler
 accepts text input, does not use manual focus, and the view is first responder.
-When editable text is desired but the view is not first responder, iOS falls
-back to `TEXT_INTERACTION_NONEDITABLE` if a selection handler exists. This keeps
-read-only selection available without showing an editable caret.
+This mode routes keyboard and IME callbacks to the input handler but does not
+install UIKit's editable `UITextInteraction`, does not answer touch-selection
+geometry, and suppresses UIKit's edit menu. When editable text is desired but
+the view is not first responder, iOS falls back to `TEXT_INTERACTION_NONEDITABLE`
+if a selection handler exists. This keeps read-only selection available without
+showing an editable caret.
 
 `keyboard_session_requested` is still needed on iOS to preserve an explicit
 keyboard request until the input handler arrives. It is cleared when an

@@ -24,9 +24,9 @@ use core_graphics::{
 use gpui::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent, Size,
-    TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowParams, px, should_auto_request_soft_keyboard, size,
+    PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent,
+    SelectableTextHitRegion, Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowParams, px, should_auto_request_soft_keyboard, size,
 };
 use objc::{
     Encode, Encoding, class,
@@ -36,6 +36,7 @@ use objc::{
     sel, sel_impl,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
+use smallvec::SmallVec;
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
@@ -57,12 +58,15 @@ const TEXT_INTERACTION_EDITABLE: i8 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditMenuActionPolicy {
     CopySelection,
+    DisableNativeMenu,
     DelegateToSystem,
 }
 
 fn edit_menu_action_policy(interaction_mode: i8, is_copy_action: bool) -> EditMenuActionPolicy {
     if interaction_mode == TEXT_INTERACTION_NONEDITABLE && is_copy_action {
         EditMenuActionPolicy::CopySelection
+    } else if interaction_mode == TEXT_INTERACTION_EDITABLE {
+        EditMenuActionPolicy::DisableNativeMenu
     } else {
         EditMenuActionPolicy::DelegateToSystem
     }
@@ -131,10 +135,12 @@ fn text_input_refresh_plan(
     }
 }
 
-/// Chooses the UIKit `UITextInteraction` that should be installed for the
-/// current responder state. Editable interaction belongs to the first-responder
-/// session; noneditable interaction can remain available for read-only selection.
-fn installed_text_interaction_mode_for_state(
+/// Chooses the active text callback route for the current responder state.
+///
+/// Editable mode currently routes keyboard and IME callbacks to the input handler
+/// without enabling UIKit's native touch selection UI. Noneditable mode is used
+/// for read-only native selection.
+fn active_text_interaction_mode_for_state(
     target_interaction_mode: i8,
     has_selection_handler: bool,
     is_first_responder: bool,
@@ -155,11 +161,26 @@ fn should_clear_keyboard_request_when_clearing_input_handler(
     had_input_handler || had_callback_input_handler
 }
 
+/// Read-only selection is allowed to become first responder for UIKit's copy
+/// and selection-handle UI, but only real GPUI input handlers should be allowed
+/// to attach the system keyboard.
+fn should_use_system_keyboard(
+    has_input_handler: bool,
+    has_callback_input_handler: bool,
+    input_accepts_text_input: bool,
+    keyboard_session_requested: bool,
+) -> bool {
+    keyboard_session_requested
+        && input_accepts_text_input
+        && (has_input_handler || has_callback_input_handler)
+}
+
 fn handles_native_touch_selection(interaction_mode: i8) -> bool {
-    matches!(
-        interaction_mode,
-        TEXT_INTERACTION_EDITABLE | TEXT_INTERACTION_NONEDITABLE
-    )
+    interaction_mode == TEXT_INTERACTION_NONEDITABLE
+}
+
+fn should_begin_text_interaction(interaction_mode: i8, hit_selectable_text: bool) -> bool {
+    handles_native_touch_selection(interaction_mode) && hit_selectable_text
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -264,6 +285,8 @@ static TEXT_SELECTION_RECT_CLASS_REGISTERED: std::sync::Once = std::sync::Once::
 /// Global pointer to the UIView displayed above the software keyboard (inputAccessoryView).
 /// Set from Obj-C via `gpui_ios_set_keyboard_accessory_view`.
 static KEYBOARD_ACCESSORY_VIEW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EMPTY_KEYBOARD_INPUT_VIEW: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the iOS software keyboard is currently visible (set via keyboard notifications).
@@ -538,6 +561,17 @@ fn active_text_interaction_mode(view: &Object) -> i8 {
     }
 }
 
+fn has_active_selection_geometry(view: &Object) -> bool {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return false;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window.last_selection_geometry.borrow().is_some()
+    }
+}
+
 fn sync_text_interaction_for_view(view: &Object) {
     unsafe {
         let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
@@ -546,6 +580,69 @@ fn sync_text_interaction_for_view(view: &Object) {
         }
         let window = &*(window_ptr as *const IosWindow);
         window.sync_text_interaction_for_current_responder_state();
+    }
+}
+
+fn text_input_uses_system_keyboard_for_gpui(view: &Object) -> bool {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return false;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        should_use_system_keyboard(
+            window.input_handler.borrow().is_some(),
+            window.callback_input_handler.borrow().is_some(),
+            window.input_accepts_text_input.get(),
+            window.keyboard_session_requested.get(),
+        )
+    }
+}
+
+/// Shared zero-sized custom input view used for read-only selection sessions.
+/// Returning this from `inputView` keeps UIKit first-responder selection behavior
+/// alive without emitting keyboard show notifications for noneditable text.
+fn empty_keyboard_input_view() -> *mut Object {
+    let ptr = EMPTY_KEYBOARD_INPUT_VIEW.load(std::sync::atomic::Ordering::Acquire);
+    if ptr != 0 {
+        return ptr as *mut Object;
+    }
+
+    unsafe {
+        let view: *mut Object = msg_send![class!(UIView), new];
+        let view_ptr = view as usize;
+        match EMPTY_KEYBOARD_INPUT_VIEW.compare_exchange(
+            0,
+            view_ptr,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => view,
+            Err(existing) => {
+                let _: () = msg_send![view, release];
+                existing as *mut Object
+            }
+        }
+    }
+}
+
+fn allow_gpui_touch_delivery_while_text_interaction_recognizes(view: *mut Object) {
+    unsafe {
+        let gesture_recognizers: *mut Object = msg_send![view, gestureRecognizers];
+        if gesture_recognizers.is_null() {
+            return;
+        }
+
+        let count: usize = msg_send![gesture_recognizers, count];
+        for index in 0..count {
+            let recognizer: *mut Object = msg_send![gesture_recognizers, objectAtIndex: index];
+            if recognizer.is_null() {
+                continue;
+            }
+
+            let _: () = msg_send![recognizer, setDelaysTouchesBegan: NO];
+            let _: () = msg_send![recognizer, setDelaysTouchesEnded: NO];
+        }
     }
 }
 
@@ -616,6 +713,9 @@ fn register_metal_view_class() -> &'static Class {
         {
             use objc::runtime::Protocol;
             if let Some(protocol) = Protocol::get("UITextInput") {
+                decl.add_protocol(protocol);
+            }
+            if let Some(protocol) = Protocol::get("UITextInteractionDelegate") {
                 decl.add_protocol(protocol);
             }
         }
@@ -695,12 +795,25 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // Return the view shown above the software keyboard (set via gpui_ios_set_keyboard_accessory_view).
-        // UIKit queries inputAccessoryView at becomeFirstResponder time, before
-        // UIKeyboardWillShowNotification fires, so we must return the toolbar
-        // unconditionally here. UIKit only displays it when a keyboard is on screen.
-        extern "C" fn input_accessory_view(_this: &Object, _sel: Sel) -> *mut Object {
+        // Selection-only first responder sessions must not expose the keyboard
+        // accessory, or UIKit treats the read-only selection as a keyboard session.
+        extern "C" fn input_accessory_view(this: &Object, _sel: Sel) -> *mut Object {
+            if !text_input_uses_system_keyboard_for_gpui(this) {
+                return ptr::null_mut();
+            }
             let ptr = KEYBOARD_ACCESSORY_VIEW.load(std::sync::atomic::Ordering::Relaxed);
             ptr as *mut Object
+        }
+
+        // Returning nil asks UIKit for the default system keyboard. Read-only
+        // selection still needs first-responder status for copy/selection UI, so
+        // give it an empty custom input view instead of the software keyboard.
+        extern "C" fn input_view(this: &Object, _sel: Sel) -> *mut Object {
+            if text_input_uses_system_keyboard_for_gpui(this) {
+                ptr::null_mut()
+            } else {
+                empty_keyboard_input_view()
+            }
         }
 
         // UITextInputTraits - keyboard type (default)
@@ -750,6 +863,35 @@ fn register_metal_view_class() -> &'static Class {
         // Tell iOS we want to receive keyboard input
         extern "C" fn is_user_interaction_enabled(_this: &Object, _sel: Sel) -> bool {
             true
+        }
+
+        // UITextInteractionDelegate - interactionShouldBegin:atPoint:
+        // Keep UIKit's full-view selection gestures from stealing ordinary GPUI
+        // taps. Native text interaction starts only on actual text; GPUI clears
+        // existing selection on outside touches before forwarding the press.
+        extern "C" fn interaction_should_begin(
+            this: &Object,
+            _sel: Sel,
+            _interaction: *mut Object,
+            point: IOSCGPoint,
+        ) -> BOOL {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let interaction_mode = active_text_interaction_mode(this);
+                let point = Point::new(px(point.x as f32), px(point.y as f32));
+                let hit_selectable_text = unsafe {
+                    let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
+                    if window_ptr.is_null() {
+                        false
+                    } else {
+                        let window = &*(window_ptr as *const IosWindow);
+                        window.point_hits_selectable_text(point)
+                    }
+                };
+                should_begin_text_interaction(interaction_mode, hit_selectable_text)
+            }))
+            .unwrap_or(false);
+
+            if result { YES } else { NO }
         }
 
         // UIKeyInput protocol - hasText
@@ -974,7 +1116,7 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // UITextInput - setSelectedTextRange:
-        // Propagated only while a native editable or read-only text interaction is active.
+        // Propagated only while read-only native text selection is active.
         extern "C" fn set_selected_text_range(this: &mut Object, _sel: Sel, range: *mut Object) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 if !handles_native_touch_selection(active_text_interaction_mode(this)) {
@@ -986,6 +1128,13 @@ fn register_metal_view_class() -> &'static Class {
                             handler.set_selected_text_range(start..end);
                         });
                     });
+                    unsafe {
+                        let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
+                        if !window_ptr.is_null() {
+                            let window = &*(window_ptr as *const IosWindow);
+                            window.cache_active_selection_range(start..end);
+                        }
+                    }
                 }
             }));
         }
@@ -1019,10 +1168,9 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // UIResponder - canPerformAction:withSender:
-        // Override only the non-editable copy action. Delegate standard edit
-        // menu actions back to UIKit/UITextInput so editable fields keep Paste,
-        // Cut, Select, and Select All, and read-only selection can still expose
-        // native actions such as Select All.
+        // Current GPUI input handlers do not support native text selection, so
+        // editable mode suppresses UIKit's edit menu. Read-only selection keeps
+        // native copy support for selected GPUI text.
         extern "C" fn can_perform_action(
             this: &mut Object,
             _sel: Sel,
@@ -1048,6 +1196,7 @@ fn register_metal_view_class() -> &'static Class {
                     let superclass = class!(UIView);
                     msg_send![super(this, superclass), canPerformAction: action withSender: sender]
                 },
+                EditMenuActionPolicy::DisableNativeMenu => NO,
             }
         }
 
@@ -1447,37 +1596,18 @@ fn register_metal_view_class() -> &'static Class {
         // UITextInput Protocol - Geometry Methods
         // ============================================
 
-        // UITextInput - caretRectForPosition: (CRITICAL for keyboard to appear!)
+        // UITextInput - caretRectForPosition:
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn caret_rect_for_position(
-            this: &Object,
+            _this: &Object,
             _sel: Sel,
-            position: *mut Object,
+            _position: *mut Object,
         ) -> IOSCGRect {
             let default_rect = IOSCGRect::new(IOSCGPoint::new(0.0, 0.0), IOSCGSize::new(0.0, 0.0));
 
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                let interaction_mode = active_text_interaction_mode(this);
-                let Some(index) = get_position_index(position) else {
-                    return default_rect;
-                };
-
-                if interaction_mode != TEXT_INTERACTION_EDITABLE {
-                    return default_rect;
-                }
-
-                let bounds =
-                    with_input_handler(this, |handler| handler.bounds_for_range(index..index))
-                        .flatten();
-
-                match bounds {
-                    Some(b) => IOSCGRect::new(
-                        IOSCGPoint::new(b.origin.x.as_f32() as f64, b.origin.y.as_f32() as f64),
-                        IOSCGSize::new(2.0, b.size.height.as_f32() as f64), // 2px wide caret
-                    ),
-                    None => default_rect,
-                }
-            }));
+            // GPUI inputs paint their own caret; returning a native caret rect here
+            // enables UIKit selection UI that current input handlers do not support.
+            let result = panic::catch_unwind(AssertUnwindSafe(|| default_rect));
 
             match result {
                 Ok(rect) => rect,
@@ -1581,11 +1711,16 @@ fn register_metal_view_class() -> &'static Class {
                 if !handles_native_touch_selection(active_text_interaction_mode(this)) {
                     return ptr::null_mut();
                 }
+                let point = Point::new(px(point.x as f32), px(point.y as f32));
+                let has_active_selection = has_active_selection_geometry(this);
                 let index = with_input_handler(this, |handler| {
-                    handler.character_index_for_point(Point::new(
-                        px(point.x as f32),
-                        px(point.y as f32),
-                    ))
+                    let direct_index = handler.character_index_for_point(point);
+                    let nearest_index = if direct_index.is_none() && has_active_selection {
+                        handler.nearest_character_index_for_point(point)
+                    } else {
+                        None
+                    };
+                    direct_index.or(nearest_index)
                 })
                 .flatten();
 
@@ -1923,6 +2058,16 @@ fn register_metal_view_class() -> &'static Class {
                 sel!(inputAccessoryView),
                 input_accessory_view as extern "C" fn(&Object, Sel) -> *mut Object,
             );
+            decl.add_method(
+                sel!(inputView),
+                input_view as extern "C" fn(&Object, Sel) -> *mut Object,
+            );
+
+            decl.add_method(
+                sel!(interactionShouldBegin:atPoint:),
+                interaction_should_begin
+                    as extern "C" fn(&Object, Sel, *mut Object, IOSCGPoint) -> BOOL,
+            );
 
             // UIResponder - copy action and capability query for selection copy menu.
             decl.add_method(
@@ -2109,13 +2254,15 @@ pub(crate) struct IosWindow {
     keyboard_session_requested: Cell<bool>,
     /// Weak text input delegate assigned by UIKit.
     input_delegate: Cell<*mut Object>,
-    /// Native text interactions used for editable and non-editable selection modes.
+    /// Native text interactions retained for the modes that need UIKit selection UI.
     editable_text_interaction: *mut Object,
     noneditable_text_interaction: *mut Object,
     /// GPUI's desired interaction mode from the current input/selection handlers.
     target_text_interaction_mode: Cell<i8>,
-    /// The UIKit interaction currently installed on `view`.
+    /// The active route for UIKit text callbacks; editable mode does not currently
+    /// install UIKit's editable selection interaction on `view`.
     active_text_interaction_mode: Cell<i8>,
+    selectable_text_hit_regions: RefCell<SmallVec<[SelectableTextHitRegion; 8]>>,
     last_selection_geometry: RefCell<Option<SelectionGeometry>>,
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
@@ -2231,11 +2378,13 @@ impl IosWindow {
             let editable_text_interaction: *mut Object =
                 msg_send![editable_text_interaction, retain];
             let _: () = msg_send![editable_text_interaction, setTextInput: view];
+            let _: () = msg_send![editable_text_interaction, setDelegate: view];
             let noneditable_text_interaction: *mut Object =
                 msg_send![class!(UITextInteraction), textInteractionForMode: 1_i64];
             let noneditable_text_interaction: *mut Object =
                 msg_send![noneditable_text_interaction, retain];
             let _: () = msg_send![noneditable_text_interaction, setTextInput: view];
+            let _: () = msg_send![noneditable_text_interaction, setDelegate: view];
 
             // Set the view as the view controller's view
             let _: () = msg_send![view_controller, setView: view];
@@ -2279,6 +2428,7 @@ impl IosWindow {
                 noneditable_text_interaction,
                 target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
                 active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
                 input_callback: RefCell::new(None),
@@ -2367,11 +2517,13 @@ impl IosWindow {
             let editable_text_interaction: *mut Object =
                 msg_send![editable_text_interaction, retain];
             let _: () = msg_send![editable_text_interaction, setTextInput: view];
+            let _: () = msg_send![editable_text_interaction, setDelegate: view];
             let noneditable_text_interaction: *mut Object =
                 msg_send![class!(UITextInteraction), textInteractionForMode: 1_i64];
             let noneditable_text_interaction: *mut Object =
                 msg_send![noneditable_text_interaction, retain];
             let _: () = msg_send![noneditable_text_interaction, setTextInput: view];
+            let _: () = msg_send![noneditable_text_interaction, setDelegate: view];
             let _: () = msg_send![view_controller, setView: view];
 
             // Flexible width/height so UIKit layout changes on the parent propagate to the
@@ -2412,6 +2564,7 @@ impl IosWindow {
                 noneditable_text_interaction,
                 target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
                 active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
                 input_callback: RefCell::new(None),
@@ -2509,7 +2662,11 @@ impl IosWindow {
         None
     }
 
-    /// Adds/removes UIKit interactions without changing GPUI's desired mode.
+    /// Applies the active text mode without changing GPUI's desired mode.
+    ///
+    /// Editable input stays first responder for keyboard and IME callbacks, but
+    /// does not install UIKit's editable `UITextInteraction` until GPUI supports
+    /// native selection for input handlers.
     fn install_text_interaction_mode(&self, mode: i8) {
         let previous_mode = self.active_text_interaction_mode.get();
         if previous_mode == mode {
@@ -2528,13 +2685,10 @@ impl IosWindow {
             }
 
             match mode {
-                TEXT_INTERACTION_EDITABLE => {
-                    let _: () =
-                        msg_send![self.view, addInteraction: self.editable_text_interaction];
-                }
                 TEXT_INTERACTION_NONEDITABLE => {
                     let _: () =
                         msg_send![self.view, addInteraction: self.noneditable_text_interaction];
+                    allow_gpui_touch_delivery_while_text_interaction_recognizes(self.view);
                 }
                 _ => {}
             }
@@ -2548,12 +2702,12 @@ impl IosWindow {
         let target_interaction_mode = self.target_text_interaction_mode.get();
         let has_selection_handler = self.selection_handler.borrow().is_some();
         let is_first_responder = self.active_first_responder_view().is_some();
-        let installed_mode = installed_text_interaction_mode_for_state(
+        let active_mode = active_text_interaction_mode_for_state(
             target_interaction_mode,
             has_selection_handler,
             is_first_responder,
         );
-        self.install_text_interaction_mode(installed_mode);
+        self.install_text_interaction_mode(active_mode);
     }
 
     fn resign_first_responder_preserving_handler(&self) {
@@ -2610,7 +2764,6 @@ impl IosWindow {
         let selection =
             with_input_handler(view, |handler| handler.selected_text_range(false)).flatten();
         let Some(selection) = selection else {
-            self.last_selection_geometry.borrow_mut().take();
             return;
         };
         if selection.range.is_empty() {
@@ -2637,6 +2790,49 @@ impl IosWindow {
             *self.last_selection_geometry.borrow_mut() = Some(geometry);
             notify_text_and_selection_change(view, || {});
         }
+    }
+
+    fn cache_active_selection_range(&self, range: Range<usize>) {
+        if range.is_empty() {
+            self.last_selection_geometry.borrow_mut().take();
+            return;
+        }
+
+        let mut last_selection_geometry = self.last_selection_geometry.borrow_mut();
+        if last_selection_geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.range == range)
+        {
+            return;
+        }
+        *last_selection_geometry = Some(SelectionGeometry {
+            range,
+            bounds: None,
+            rects: Vec::new(),
+        });
+    }
+
+    fn point_hits_selectable_text(&self, point: Point<Pixels>) -> bool {
+        self.selectable_text_hit_regions
+            .borrow()
+            .iter()
+            .any(|region| region.contains_text(point))
+    }
+
+    fn clear_active_text_selection(&self, clear_handler: bool) {
+        let had_geometry = self.last_selection_geometry.borrow_mut().take().is_some();
+        if !had_geometry && !clear_handler {
+            return;
+        }
+
+        let view = unsafe { &*self.view };
+        notify_selection_change(view, || {
+            if clear_handler {
+                let _ = with_input_handler(view, |handler| {
+                    handler.clear_selected_text_range();
+                });
+            }
+        });
     }
 
     pub fn handle_touch(&self, touch: *mut Object, _event: *mut Object) {
@@ -2666,6 +2862,11 @@ impl IosWindow {
                     self.last_move_ts.set(0.0);
                     *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
                     *self.fling.borrow_mut() = None;
+                    let had_selection = self.last_selection_geometry.borrow().is_some();
+                    let hit_text = self.point_hits_selectable_text(position);
+                    if had_selection && !hit_text {
+                        self.clear_active_text_selection(true);
+                    }
                     if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
                         callback(touch_began_to_pointer_down(
                             position,
@@ -2897,9 +3098,7 @@ impl IosWindow {
     /// Show the software keyboard
     pub fn show_keyboard(&self) {
         let responder = self.input_responder_view();
-        unsafe {
-            let _: BOOL = msg_send![responder, becomeFirstResponder];
-        }
+        let _: BOOL = unsafe { msg_send![responder, becomeFirstResponder] };
         self.sync_text_interaction_for_current_responder_state();
     }
 
@@ -3226,7 +3425,16 @@ impl PlatformWindow for IosWindow {
     fn clear_selection_handler(&mut self) {
         self.selection_handler.borrow_mut().take();
         self.callback_selection_handler.borrow_mut().take();
+        self.selectable_text_hit_regions.borrow_mut().clear();
         self.refresh_text_input_state();
+    }
+
+    fn clear_active_selection(&self) {
+        self.clear_active_text_selection(false);
+    }
+
+    fn set_selectable_text_hit_regions(&self, regions: SmallVec<[SelectableTextHitRegion; 8]>) {
+        *self.selectable_text_hit_regions.borrow_mut() = regions;
     }
 
     fn show_soft_keyboard(&self) {
@@ -3429,14 +3637,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn editable_edit_menu_actions_delegate_to_system() {
+    fn editable_edit_menu_actions_are_disabled_for_current_inputs() {
         assert_eq!(
             edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true),
-            EditMenuActionPolicy::DelegateToSystem
+            EditMenuActionPolicy::DisableNativeMenu
         );
         assert_eq!(
             edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false),
-            EditMenuActionPolicy::DelegateToSystem
+            EditMenuActionPolicy::DisableNativeMenu
         );
     }
 
@@ -3458,9 +3666,30 @@ mod tests {
     }
 
     #[test]
-    fn native_touch_selection_is_enabled_for_text_interactions() {
-        assert!(handles_native_touch_selection(TEXT_INTERACTION_EDITABLE));
+    fn native_touch_selection_is_enabled_for_read_only_selection() {
         assert!(handles_native_touch_selection(TEXT_INTERACTION_NONEDITABLE));
+    }
+
+    #[test]
+    fn native_touch_selection_is_disabled_for_current_input_handlers() {
+        assert!(!handles_native_touch_selection(TEXT_INTERACTION_EDITABLE));
+    }
+
+    #[test]
+    fn text_interaction_begin_requires_read_only_selection_hit() {
+        assert!(should_begin_text_interaction(
+            TEXT_INTERACTION_NONEDITABLE,
+            true
+        ));
+        assert!(!should_begin_text_interaction(
+            TEXT_INTERACTION_NONEDITABLE,
+            false
+        ));
+        assert!(!should_begin_text_interaction(
+            TEXT_INTERACTION_EDITABLE,
+            true
+        ));
+        assert!(!should_begin_text_interaction(TEXT_INTERACTION_NONE, true));
     }
 
     #[test]
@@ -3502,6 +3731,17 @@ mod tests {
     }
 
     #[test]
+    fn system_keyboard_requires_text_input_and_explicit_request() {
+        assert!(should_use_system_keyboard(true, false, true, true));
+        assert!(should_use_system_keyboard(false, true, true, true));
+        assert!(!should_use_system_keyboard(false, false, false, false));
+        assert!(!should_use_system_keyboard(false, false, false, true));
+        assert!(!should_use_system_keyboard(false, false, true, true));
+        assert!(!should_use_system_keyboard(true, false, false, true));
+        assert!(!should_use_system_keyboard(true, false, true, false));
+    }
+
+    #[test]
     fn explicit_keyboard_request_shows_when_manual_focus_handler_arrives() {
         let plan = text_input_refresh_plan(true, false, true, true, true, false);
 
@@ -3535,17 +3775,17 @@ mod tests {
     }
 
     #[test]
-    fn editable_interaction_installs_only_while_first_responder() {
+    fn editable_mode_routes_input_only_while_first_responder() {
         assert_eq!(
-            installed_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, true),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, true),
             TEXT_INTERACTION_EDITABLE
         );
         assert_eq!(
-            installed_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, false),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, false),
             TEXT_INTERACTION_NONEDITABLE
         );
         assert_eq!(
-            installed_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, false, false),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, false, false),
             TEXT_INTERACTION_NONE
         );
     }
@@ -3553,11 +3793,11 @@ mod tests {
     #[test]
     fn noneditable_interaction_remains_installed_outside_first_responder() {
         assert_eq!(
-            installed_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, false),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, false),
             TEXT_INTERACTION_NONEDITABLE
         );
         assert_eq!(
-            installed_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, true),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, true),
             TEXT_INTERACTION_NONEDITABLE
         );
     }

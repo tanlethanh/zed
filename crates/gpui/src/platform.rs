@@ -593,6 +593,46 @@ pub struct RequestFrameOptions {
     pub force_render: bool,
 }
 
+/// A frame-produced region where native platform text selection can begin.
+#[derive(Clone, Debug, Default)]
+pub struct SelectableTextHitRegion {
+    text_bounds: Bounds<Pixels>,
+    selection_area_bounds: Bounds<Pixels>,
+    occluding_bounds: SmallVec<[Bounds<Pixels>; 4]>,
+}
+
+impl SelectableTextHitRegion {
+    pub(crate) fn new(
+        text_bounds: Bounds<Pixels>,
+        selection_area_bounds: Bounds<Pixels>,
+        occluding_bounds: SmallVec<[Bounds<Pixels>; 4]>,
+    ) -> Self {
+        Self {
+            text_bounds,
+            selection_area_bounds,
+            occluding_bounds,
+        }
+    }
+
+    /// Returns whether a point can begin native text selection in this region.
+    pub fn contains_text(&self, point: Point<Pixels>) -> bool {
+        self.text_bounds.contains(&point)
+            && !self
+                .occluding_bounds
+                .iter()
+                .any(|bounds| bounds.contains(&point))
+    }
+
+    /// Returns whether a point is inside the owning selection area.
+    pub fn contains_selection_area(&self, point: Point<Pixels>) -> bool {
+        self.selection_area_bounds.contains(&point)
+            && !self
+                .occluding_bounds
+                .iter()
+                .any(|bounds| bounds.contains(&point))
+    }
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -614,6 +654,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
     fn clear_selection_handler(&mut self) {}
+    fn clear_active_selection(&self) {}
+    fn set_selectable_text_hit_regions(&self, _regions: SmallVec<[SelectableTextHitRegion; 8]>) {}
     fn show_soft_keyboard(&self) {}
     fn hide_soft_keyboard(&self) {}
     fn is_soft_keyboard_visible(&self) -> bool {
@@ -1299,6 +1341,17 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    pub fn nearest_character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .nearest_character_index_for_point(point, window, cx)
+            })
+            .ok()
+            .flatten()
+    }
+
     #[allow(dead_code)]
     pub fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
         self.handler.borrow_mut().accepts_text_input(window, cx)
@@ -1331,6 +1384,16 @@ impl PlatformInputHandler {
                 self.handler
                     .borrow_mut()
                     .set_selected_text_range(range, window, cx);
+            })
+            .ok();
+    }
+
+    pub fn clear_selected_text_range(&mut self) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .clear_selected_text_range(window, cx);
             })
             .ok();
     }
@@ -1449,6 +1512,23 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<usize>;
+
+    /// Get the nearest character offset for a point inside the active text surface.
+    ///
+    /// This is useful while native selection is already active, such as when dragging
+    /// selection handles into whitespace. Fresh selection starts should still use
+    /// [`Self::character_index_for_point`] so empty space does not begin selection.
+    fn nearest_character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.character_index_for_point(point, window, cx)
+    }
+
+    /// Clear any active platform-owned text selection for this handler.
+    fn clear_selected_text_range(&mut self, _window: &mut Window, _cx: &mut App) {}
 
     /// Allows a given input context to opt into getting raw key repeats instead of
     /// sending these to the platform.

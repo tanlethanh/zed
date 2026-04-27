@@ -2,8 +2,8 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    PromptButton, RequestFrameOptions, Scene, SelectableTextHitRegion, Size, TestPlatform, TileId,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use image::RgbaImage;
@@ -33,6 +33,7 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     selection_handler: Option<PlatformInputHandler>,
+    selectable_text_hit_regions: Vec<SelectableTextHitRegion>,
     soft_keyboard_visible: bool,
     is_fullscreen: bool,
 }
@@ -86,6 +87,7 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             selection_handler: None,
+            selectable_text_hit_regions: Vec::new(),
             soft_keyboard_visible: false,
             is_fullscreen: false,
         })))
@@ -133,6 +135,10 @@ impl TestWindow {
     #[allow(dead_code)]
     pub(crate) fn take_selection_handler_for_test(&self) -> Option<PlatformInputHandler> {
         self.0.lock().selection_handler.take()
+    }
+
+    pub(crate) fn selectable_text_hit_regions_for_test(&self) -> Vec<SelectableTextHitRegion> {
+        self.0.lock().selectable_text_hit_regions.clone()
     }
 }
 
@@ -204,6 +210,14 @@ impl PlatformWindow for TestWindow {
 
     fn clear_selection_handler(&mut self) {
         self.0.lock().selection_handler.take();
+        self.0.lock().selectable_text_hit_regions.clear();
+    }
+
+    fn set_selectable_text_hit_regions(
+        &self,
+        regions: smallvec::SmallVec<[SelectableTextHitRegion; 8]>,
+    ) {
+        self.0.lock().selectable_text_hit_regions = regions.into_vec();
     }
 
     fn show_soft_keyboard(&self) {

@@ -596,7 +596,9 @@ impl PressEvent {
 
     /// Returns the modifiers for the most recent stage of the interaction.
     pub fn modifiers(&self) -> Modifiers {
-        self.up.as_ref().map_or(self.down.modifiers, |up| up.modifiers)
+        self.up
+            .as_ref()
+            .map_or(self.down.modifiers, |up| up.modifiers)
     }
 
     /// Returns the current position for the interaction.
@@ -604,7 +606,9 @@ impl PressEvent {
     /// For long-press this is the down position. For a completed press this is
     /// the up position.
     pub fn position(&self) -> Point<Pixels> {
-        self.up.as_ref().map_or(self.down.position, |up| up.position)
+        self.up
+            .as_ref()
+            .map_or(self.down.position, |up| up.position)
     }
 
     /// Returns true when this event represents a completed press.

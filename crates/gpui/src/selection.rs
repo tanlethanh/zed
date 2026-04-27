@@ -97,6 +97,8 @@ impl Clone for SelectionAction {
 pub(crate) struct ActiveSelectionArea {
     selection_area: SelectionArea,
     global_id: Option<GlobalElementId>,
+    bounds: Option<Bounds<Pixels>>,
+    hitbox_range: Option<Range<usize>>,
 }
 
 impl ActiveSelectionArea {
@@ -104,7 +106,19 @@ impl ActiveSelectionArea {
         Self {
             selection_area,
             global_id,
+            bounds: None,
+            hitbox_range: None,
         }
+    }
+
+    pub(crate) fn with_interaction_region(
+        mut self,
+        bounds: Bounds<Pixels>,
+        hitbox_range: Range<usize>,
+    ) -> Self {
+        self.bounds = Some(bounds);
+        self.hitbox_range = Some(hitbox_range);
+        self
     }
 
     pub(crate) fn selection_area(&self) -> &SelectionArea {
@@ -114,6 +128,14 @@ impl ActiveSelectionArea {
     pub(crate) fn global_id(&self) -> Option<&GlobalElementId> {
         self.global_id.as_ref()
     }
+
+    pub(crate) fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.bounds
+    }
+
+    pub(crate) fn hitbox_range(&self) -> Option<&Range<usize>> {
+        self.hitbox_range.as_ref()
+    }
 }
 
 /// A selection area that was active during the current rendered frame.
@@ -122,6 +144,7 @@ pub struct RegisteredSelectionArea {
     selection_area: SelectionArea,
     global_id: Option<GlobalElementId>,
     view_id: EntityId,
+    bounds: Option<Bounds<Pixels>>,
 }
 
 impl RegisteredSelectionArea {
@@ -129,11 +152,13 @@ impl RegisteredSelectionArea {
         selection_area: SelectionArea,
         global_id: Option<GlobalElementId>,
         view_id: EntityId,
+        bounds: Option<Bounds<Pixels>>,
     ) -> Self {
         Self {
             selection_area,
             global_id,
             view_id,
+            bounds,
         }
     }
 
@@ -150,6 +175,11 @@ impl RegisteredSelectionArea {
     /// Returns the owning view for the registered selection area.
     pub fn view_id(&self) -> EntityId {
         self.view_id
+    }
+
+    /// Returns the rendered bounds for this selection area, if known.
+    pub fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.bounds
     }
 }
 
@@ -246,6 +276,14 @@ impl RegisteredTextSelectionFragment {
     pub fn fragment(&self) -> &TextSelectionFragment {
         &self.fragment
     }
+
+    pub(crate) fn selection_area_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.active_area.bounds()
+    }
+
+    pub(crate) fn selection_area_hitbox_range(&self) -> Option<&Range<usize>> {
+        self.active_area.hitbox_range()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -260,6 +298,13 @@ impl SelectionAreaKey {
             Self::Global(global_id.clone())
         } else {
             Self::ViewScoped(fragment.view_id(), fragment.selection_area().id().clone())
+        }
+    }
+
+    fn selection_area_id(&self) -> Option<&ElementId> {
+        match self {
+            Self::Global(global_id) => global_id.0.last(),
+            Self::ViewScoped(_, element_id) => Some(element_id),
         }
     }
 }
@@ -314,12 +359,36 @@ impl SelectionDocumentFragment {
     fn contains_point(&self, point: Point<Pixels>) -> bool {
         self.fragment.fragment().layout().bounds().contains(&point)
     }
+
+    fn vertical_distance_to_point(&self, point: Point<Pixels>) -> Pixels {
+        let bounds = self.fragment.fragment().layout().bounds();
+        if point.y < bounds.top() {
+            bounds.top() - point.y
+        } else if point.y > bounds.bottom() {
+            point.y - bounds.bottom()
+        } else {
+            Pixels::ZERO
+        }
+    }
+
+    fn horizontal_distance_to_point(&self, point: Point<Pixels>) -> Pixels {
+        let bounds = self.fragment.fragment().layout().bounds();
+        if point.x < bounds.left() {
+            bounds.left() - point.x
+        } else if point.x > bounds.right() {
+            point.x - bounds.right()
+        } else {
+            Pixels::ZERO
+        }
+    }
 }
 
 struct SelectionDocument {
     key: SelectionAreaKey,
     fragments: Vec<SelectionDocumentFragment>,
     len_utf16: usize,
+    bounds: Option<Bounds<Pixels>>,
+    hitbox_range: Option<Range<usize>>,
 }
 
 impl SelectionDocument {
@@ -349,9 +418,20 @@ impl SelectionDocument {
 
     fn active(window: &Window) -> Option<Self> {
         let active_key = window.selection_state.active_area.as_ref()?;
-        Self::all(window)
+        let mut documents = Self::all(window);
+        if let Some(index) = documents
+            .iter()
+            .position(|document| &document.key == active_key)
+        {
+            return Some(documents.remove(index));
+        }
+
+        let active_area_id = active_key.selection_area_id()?;
+        let mut matching_documents = documents
             .into_iter()
-            .find(|document| &document.key == active_key)
+            .filter(|document| document.key.selection_area_id() == Some(active_area_id));
+        let document = matching_documents.next()?;
+        matching_documents.next().is_none().then_some(document)
     }
 
     fn from_fragments(
@@ -367,6 +447,12 @@ impl SelectionDocument {
                 *source_index,
             )
         });
+        let bounds = fragments
+            .first()
+            .and_then(|(_, fragment)| fragment.selection_area_bounds());
+        let hitbox_range = fragments
+            .first()
+            .and_then(|(_, fragment)| fragment.selection_area_hitbox_range().cloned());
 
         let mut len_utf16 = 0;
         let fragments = fragments
@@ -391,6 +477,8 @@ impl SelectionDocument {
             key,
             fragments,
             len_utf16,
+            bounds,
+            hitbox_range,
         }
     }
 
@@ -421,11 +509,56 @@ impl SelectionDocument {
         text
     }
 
-    fn character_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
+    fn character_index_for_point(&self, point: Point<Pixels>, window: &Window) -> Option<usize> {
+        if self.bounds.is_some_and(|bounds| !bounds.contains(&point)) {
+            return None;
+        }
+        if self
+            .hitbox_range
+            .as_ref()
+            .is_some_and(|range| selection_area_is_occluded_at_point(window, point, range))
+        {
+            return None;
+        }
+
         self.fragments
             .iter()
             .find(|fragment| fragment.contains_point(point))
             .map(|fragment| fragment.utf16_index_for_point(point).min(self.len_utf16))
+    }
+
+    fn nearest_character_index_for_point(
+        &self,
+        point: Point<Pixels>,
+        window: &Window,
+    ) -> Option<usize> {
+        if self.bounds.is_some_and(|bounds| !bounds.contains(&point)) {
+            return None;
+        }
+        if self
+            .hitbox_range
+            .as_ref()
+            .is_some_and(|range| selection_area_is_occluded_at_point(window, point, range))
+        {
+            return None;
+        }
+
+        self.character_index_for_point(point, window).or_else(|| {
+            self.fragments
+                .iter()
+                .min_by(|a, b| {
+                    a.vertical_distance_to_point(point)
+                        .as_f32()
+                        .total_cmp(&b.vertical_distance_to_point(point).as_f32())
+                        .then_with(|| {
+                            a.horizontal_distance_to_point(point)
+                                .as_f32()
+                                .total_cmp(&b.horizontal_distance_to_point(point).as_f32())
+                        })
+                        .then_with(|| a.content_start_utf16.cmp(&b.content_start_utf16))
+                })
+                .map(|fragment| fragment.utf16_index_for_point(point).min(self.len_utf16))
+        })
     }
 
     fn bounds_for_range(&self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
@@ -615,11 +748,12 @@ impl InputHandler for WindowSelectionHandler {
         _cx: &mut App,
     ) -> Option<usize> {
         let documents = SelectionDocument::all(window);
-        let (key, index) = documents.iter().find_map(|document| {
+        let hit = documents.iter().find_map(|document| {
             document
-                .character_index_for_point(point)
+                .character_index_for_point(point, window)
                 .map(|index| (&document.key, index))
-        })?;
+        });
+        let (key, index) = hit?;
 
         let area_changed = window.selection_state.active_area.as_ref() != Some(key);
         window.selection_state.active_area = Some(key.clone());
@@ -631,6 +765,20 @@ impl InputHandler for WindowSelectionHandler {
         Some(index)
     }
 
+    fn nearest_character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        let active_document = SelectionDocument::active(window);
+        let documents = SelectionDocument::all(window);
+        active_document
+            .into_iter()
+            .chain(documents)
+            .find_map(|document| document.nearest_character_index_for_point(point, window))
+    }
+
     fn accepts_text_input(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         false
     }
@@ -639,13 +787,36 @@ impl InputHandler for WindowSelectionHandler {
         let Some(document) = SelectionDocument::active(window) else {
             return;
         };
-        window.selection_state.range_utf16 = Some(document.clamped_range(range));
+        let clamped_range = document.clamped_range(range.clone());
+        window.selection_state.range_utf16 = Some(clamped_range);
         window.selection_state.reversed = false;
+    }
+
+    fn clear_selected_text_range(&mut self, window: &mut Window, _cx: &mut App) {
+        window.selection_state = SelectionState::default();
     }
 }
 
 fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
+}
+
+fn selection_area_is_occluded_at_point(
+    window: &Window,
+    point: Point<Pixels>,
+    hitbox_range: &Range<usize>,
+) -> bool {
+    let hitbox_end = hitbox_range.end.min(window.rendered_frame.hitboxes.len());
+    if hitbox_end >= window.rendered_frame.hitboxes.len() {
+        return false;
+    }
+
+    let hit_test = window.rendered_frame.hit_test(point);
+    hit_test.ids.iter().any(|hitbox_id| {
+        window.rendered_frame.hitboxes[hitbox_end..]
+            .iter()
+            .any(|hitbox| hitbox.id == *hitbox_id)
+    })
 }
 
 fn utf16_offset_to_byte(text: &str, offset_utf16: usize) -> usize {
@@ -702,6 +873,11 @@ pub struct SelectionAreaElement {
     source_location: &'static core::panic::Location<'static>,
 }
 
+/// Prepaint state used to preserve the hitboxes owned by a selection area subtree.
+pub struct SelectionAreaPrepaintState {
+    hitbox_range: Range<usize>,
+}
+
 impl SelectionAreaElement {
     /// Create a selection-area wrapper around the provided child subtree.
     #[track_caller]
@@ -742,7 +918,7 @@ impl SelectionAreaElement {
 
 impl Element for SelectionAreaElement {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = SelectionAreaPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.selection_area.id.clone())
@@ -775,25 +951,35 @@ impl Element for SelectionAreaElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let hitbox_start = window.next_frame.hitboxes.len();
         window.with_selection_area(Some(&self.selection_area), global_id, |window| {
             self.child.prepaint(window, cx);
         });
+        SelectionAreaPrepaintState {
+            hitbox_range: hitbox_start..window.next_frame.hitboxes.len(),
+        }
     }
 
     fn paint(
         &mut self,
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_selection_area(Some(&self.selection_area), global_id, |window| {
-            window.register_selection_area(&self.selection_area, global_id);
-            self.child.paint(window, cx);
-        });
+        window.with_selection_area_region(
+            &self.selection_area,
+            global_id,
+            bounds,
+            prepaint.hitbox_range.clone(),
+            |window| {
+                window.register_selection_area(&self.selection_area, global_id);
+                self.child.paint(window, cx);
+            },
+        );
     }
 }
 
@@ -807,11 +993,14 @@ impl IntoElement for SelectionAreaElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectionDocument, SelectionState};
+    use super::{SelectionAreaKey, SelectionDocument, SelectionState};
+    use crate::EntityId;
     use crate::{
-        AppContext, Context, IntoElement, ParentElement, Render, StyledText, TestAppContext,
-        Window, div, point, px, selection_area,
+        AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement, IntoElement,
+        Modifiers, ParentElement, PointerButton, PointerDownEvent, PointerKind, PointerUpEvent,
+        Render, Styled, StyledText, TestAppContext, Window, div, point, px, selection_area,
     };
+    use std::{cell::Cell, rc::Rc};
 
     struct SelectionTestView;
 
@@ -825,6 +1014,135 @@ mod tests {
                             .selection_separator_after(" "),
                     )
                     .child(StyledText::new("world").selectable()),
+            )
+        }
+    }
+
+    struct OccludedSelectionTestView;
+
+    impl Render for OccludedSelectionTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .child(selection_area(
+                    div().child(StyledText::new("hello").selectable()),
+                ))
+                .child(div().absolute().inset_0().occlude())
+        }
+    }
+
+    struct PressableSelectionTestView {
+        header_presses: Rc<Cell<usize>>,
+        selection_presses: Rc<Cell<usize>>,
+    }
+
+    impl Render for PressableSelectionTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let header_presses = self.header_presses.clone();
+            let selection_presses = self.selection_presses.clone();
+
+            div()
+                .w(px(240.0))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("press-header")
+                        .w(px(240.0))
+                        .h(px(40.0))
+                        .on_press(move |_, _, _| {
+                            header_presses.set(header_presses.get() + 1);
+                        })
+                        .child("Header"),
+                )
+                .child(selection_area(
+                    div()
+                        .id("press-selection-body")
+                        .w(px(240.0))
+                        .h(px(80.0))
+                        .on_press(move |_, _, _| {
+                            selection_presses.set(selection_presses.get() + 1);
+                        })
+                        .child(StyledText::new("selectable").selectable()),
+                ))
+        }
+    }
+
+    struct PressableOverlaySelectionTestView {
+        overlay_presses: Rc<Cell<usize>>,
+        selection_presses: Rc<Cell<usize>>,
+    }
+
+    impl Render for PressableOverlaySelectionTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let overlay_presses = self.overlay_presses.clone();
+            let selection_presses = self.selection_presses.clone();
+
+            div()
+                .relative()
+                .w(px(240.0))
+                .h(px(80.0))
+                .child(selection_area(
+                    div()
+                        .id("press-selection-underlay")
+                        .size_full()
+                        .on_press(move |_, _, _| {
+                            selection_presses.set(selection_presses.get() + 1);
+                        })
+                        .child(StyledText::new("selectable").selectable()),
+                ))
+                .child(
+                    div()
+                        .id("press-overlay")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_press(move |_, _, _| {
+                            overlay_presses.set(overlay_presses.get() + 1);
+                        })
+                        .child("Overlay"),
+                )
+        }
+    }
+
+    struct EmptySpaceSelectionAreaTestView;
+
+    impl Render for EmptySpaceSelectionAreaTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            selection_area(
+                div().w(px(240.0)).h(px(80.0)).child(
+                    div()
+                        .h(px(20.0))
+                        .child(StyledText::new("selectable").selectable()),
+                ),
+            )
+        }
+    }
+
+    struct MultilineEmptySpaceSelectionAreaTestView;
+
+    impl Render for MultilineEmptySpaceSelectionAreaTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            selection_area(
+                div()
+                    .w(px(320.0))
+                    .h(px(120.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div().h(px(20.0)).child(
+                            StyledText::new("a")
+                                .selectable()
+                                .selection_order(0)
+                                .selection_separator_after("\n"),
+                        ),
+                    )
+                    .child(div().h(px(32.0)))
+                    .child(
+                        div()
+                            .h(px(20.0))
+                            .child(StyledText::new("bbbbbbbbbbbbbbbb").selectable()),
+                    ),
             )
         }
     }
@@ -913,6 +1231,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn selection_handler_preserves_selection_when_global_key_shifts(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|_| SelectionTestView))
+                .unwrap()
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                let area_id = document.key.selection_area_id().unwrap().clone();
+                window.selection_state = SelectionState {
+                    active_area: Some(SelectionAreaKey::ViewScoped(EntityId::from(9_999), area_id)),
+                    range_utf16: Some(0..5),
+                    reversed: false,
+                };
+            })
+            .unwrap();
+
+        let test_window = cx.test_window(*window);
+        let mut handler = test_window.take_selection_handler_for_test().unwrap();
+
+        assert_eq!(handler.selected_text_range(false).unwrap().range, 0..5);
+        assert!(handler.bounds_for_range(0..5).is_some());
+    }
+
+    #[gpui::test]
     fn selection_handler_ignores_points_outside_selection_area(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |_, cx| cx.new(|_| SelectionTestView))
@@ -927,6 +1272,348 @@ mod tests {
             handler.character_index_for_point(point(px(10_000.0), px(10_000.0))),
             None
         );
+    }
+
+    #[gpui::test]
+    fn selection_handler_ignores_points_occluded_after_selection_area(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| OccludedSelectionTestView)
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+
+        let hit_point = window
+            .update(cx, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                document.bounds_for_range(0..1).unwrap().center()
+            })
+            .unwrap();
+
+        let test_window = cx.test_window(*window);
+        let mut handler = test_window.take_selection_handler_for_test().unwrap();
+
+        assert_eq!(handler.character_index_for_point(hit_point), None);
+    }
+
+    #[gpui::test]
+    fn selection_handler_allows_on_press_outside_selection_area(cx: &mut TestAppContext) {
+        let header_presses = Rc::new(Cell::new(0));
+        let selection_presses = Rc::new(Cell::new(0));
+        let window = open_pressable_selection_test_window(
+            cx,
+            header_presses.clone(),
+            selection_presses.clone(),
+        );
+        let header_point = point(px(20.0), px(20.0));
+
+        assert!(!selection_fast_hit_cache_claims_point(
+            cx,
+            window,
+            header_point
+        ));
+        let selection_claimed_touch = selection_handler_claims_point(cx, window, header_point);
+        assert!(!selection_claimed_touch);
+        if !selection_claimed_touch {
+            simulate_primary_click(cx, window, header_point);
+        }
+
+        assert_eq!(header_presses.get(), 1);
+        assert_eq!(selection_presses.get(), 0);
+    }
+
+    #[gpui::test]
+    fn selection_handler_claims_selectable_text_before_on_press(cx: &mut TestAppContext) {
+        let header_presses = Rc::new(Cell::new(0));
+        let selection_presses = Rc::new(Cell::new(0));
+        let window = open_pressable_selection_test_window(
+            cx,
+            header_presses.clone(),
+            selection_presses.clone(),
+        );
+        let selectable_text_point = cx
+            .update_window(window, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                document.bounds_for_range(0..1).unwrap().center()
+            })
+            .unwrap();
+
+        assert!(selection_fast_hit_cache_claims_point(
+            cx,
+            window,
+            selectable_text_point
+        ));
+        let selection_claimed_touch =
+            selection_handler_claims_point(cx, window, selectable_text_point);
+        assert!(selection_claimed_touch);
+        if !selection_claimed_touch {
+            simulate_primary_click(cx, window, selectable_text_point);
+        }
+
+        assert_eq!(header_presses.get(), 0);
+        assert_eq!(selection_presses.get(), 0);
+    }
+
+    #[gpui::test]
+    fn selection_area_cache_allows_nearest_position_without_starting_on_empty_space(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| EmptySpaceSelectionAreaTestView)
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let window = *window;
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        let empty_selection_area_point = point(px(20.0), px(60.0));
+
+        assert!(!selection_fast_hit_cache_claims_point(
+            cx,
+            window,
+            empty_selection_area_point
+        ));
+        assert!(selection_fast_hit_cache_claims_selection_area(
+            cx,
+            window,
+            empty_selection_area_point
+        ));
+
+        let mut handler = cx
+            .test_window(window)
+            .take_selection_handler_for_test()
+            .unwrap();
+        assert_eq!(
+            handler.character_index_for_point(empty_selection_area_point),
+            None
+        );
+        assert!(
+            handler
+                .nearest_character_index_for_point(empty_selection_area_point)
+                .is_some()
+        );
+    }
+
+    #[gpui::test]
+    fn nearest_selection_position_prefers_nearest_visual_row(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| MultilineEmptySpaceSelectionAreaTestView)
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let window = *window;
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        let empty_space_after_first_line = cx
+            .update_window(window, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                let first_line_bounds = document
+                    .fragments
+                    .first()
+                    .unwrap()
+                    .fragment
+                    .fragment()
+                    .layout()
+                    .bounds();
+                let selection_bounds = document.bounds.unwrap();
+                point(
+                    selection_bounds.right() - px(4.0),
+                    first_line_bounds.bottom() + px(4.0),
+                )
+            })
+            .unwrap();
+
+        let mut handler = cx
+            .test_window(window)
+            .take_selection_handler_for_test()
+            .unwrap();
+
+        assert_eq!(
+            handler.character_index_for_point(empty_space_after_first_line),
+            None
+        );
+        assert_eq!(
+            handler.nearest_character_index_for_point(empty_space_after_first_line),
+            Some(1)
+        );
+    }
+
+    #[gpui::test]
+    fn focus_change_clears_active_selection(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|_| SelectionTestView))
+                .unwrap()
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, cx| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                window.selection_state = SelectionState {
+                    active_area: Some(document.key.clone()),
+                    range_utf16: Some(0..5),
+                    reversed: false,
+                };
+
+                let focus_handle = cx.focus_handle();
+                window.focus(&focus_handle, cx);
+
+                assert!(window.selection_state.active_area.is_none());
+                assert!(window.selection_state.range_utf16.is_none());
+                assert!(!window.selection_state.reversed);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn selection_handler_allows_on_press_on_overlay_above_selection_area(cx: &mut TestAppContext) {
+        let overlay_presses = Rc::new(Cell::new(0));
+        let selection_presses = Rc::new(Cell::new(0));
+        let window = open_pressable_overlay_selection_test_window(
+            cx,
+            overlay_presses.clone(),
+            selection_presses.clone(),
+        );
+        let overlay_point = cx
+            .update_window(window, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                document.bounds_for_range(0..1).unwrap().center()
+            })
+            .unwrap();
+
+        assert!(!selection_fast_hit_cache_claims_point(
+            cx,
+            window,
+            overlay_point
+        ));
+        let selection_claimed_touch = selection_handler_claims_point(cx, window, overlay_point);
+        assert!(!selection_claimed_touch);
+        if !selection_claimed_touch {
+            simulate_primary_click(cx, window, overlay_point);
+        }
+
+        assert_eq!(overlay_presses.get(), 1);
+        assert_eq!(selection_presses.get(), 0);
+    }
+
+    fn open_pressable_selection_test_window(
+        cx: &mut TestAppContext,
+        header_presses: Rc<Cell<usize>>,
+        selection_presses: Rc<Cell<usize>>,
+    ) -> AnyWindowHandle {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| PressableSelectionTestView {
+                    header_presses,
+                    selection_presses,
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let window = *window;
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        window
+    }
+
+    fn open_pressable_overlay_selection_test_window(
+        cx: &mut TestAppContext,
+        overlay_presses: Rc<Cell<usize>>,
+        selection_presses: Rc<Cell<usize>>,
+    ) -> AnyWindowHandle {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| PressableOverlaySelectionTestView {
+                    overlay_presses,
+                    selection_presses,
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let window = *window;
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        window
+    }
+
+    fn selection_handler_claims_point(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        point: crate::Point<crate::Pixels>,
+    ) -> bool {
+        let mut handler = cx
+            .test_window(window)
+            .take_selection_handler_for_test()
+            .unwrap();
+        handler.character_index_for_point(point).is_some()
+    }
+
+    fn selection_fast_hit_cache_claims_point(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        point: crate::Point<crate::Pixels>,
+    ) -> bool {
+        cx.test_window(window)
+            .selectable_text_hit_regions_for_test()
+            .iter()
+            .any(|region| region.contains_text(point))
+    }
+
+    fn selection_fast_hit_cache_claims_selection_area(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        point: crate::Point<crate::Pixels>,
+    ) -> bool {
+        cx.test_window(window)
+            .selectable_text_hit_regions_for_test()
+            .iter()
+            .any(|region| region.contains_selection_area(point))
+    }
+
+    fn simulate_primary_click(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        point: crate::Point<crate::Pixels>,
+    ) {
+        let mut test_window = cx.test_window(window);
+        test_window.simulate_input(
+            PointerDownEvent {
+                pointer_id: 1,
+                kind: PointerKind::Touch,
+                is_primary: true,
+                position: point,
+                button: PointerButton::Primary,
+                modifiers: Modifiers::default(),
+            }
+            .to_platform_input(),
+        );
+        test_window.simulate_input(
+            PointerUpEvent {
+                pointer_id: 1,
+                kind: PointerKind::Touch,
+                is_primary: true,
+                position: point,
+                button: PointerButton::Primary,
+                modifiers: Modifiers::default(),
+            }
+            .to_platform_input(),
+        );
+        cx.run_until_parked();
     }
 
     #[gpui::test]
