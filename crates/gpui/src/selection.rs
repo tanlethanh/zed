@@ -1,7 +1,7 @@
 use crate::{
-    Action, AnyElement, App, Bounds, Element, ElementId, EntityId, GlobalElementId, InputHandler,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Point, SharedString, TextLayout,
-    UTF16Selection, Window,
+    Action, AnyElement, App, Bounds, Element, ElementId, EntityId, GlobalElementId, HitboxBehavior,
+    InputHandler, InspectorElementId, IntoElement, LayoutId, Pixels, Point, SharedString,
+    TextLayout, UTF16Selection, Window,
 };
 use smallvec::SmallVec;
 use std::ops::Range;
@@ -806,12 +806,27 @@ fn selection_area_is_occluded_at_point(
     point: Point<Pixels>,
     hitbox_range: &Range<usize>,
 ) -> bool {
+    let hitbox_start = hitbox_range.start.min(window.rendered_frame.hitboxes.len());
     let hitbox_end = hitbox_range.end.min(window.rendered_frame.hitboxes.len());
+
+    let hit_test = window.rendered_frame.hit_test(point);
+    if window.rendered_frame.hitboxes[hitbox_start..hitbox_end]
+        .iter()
+        .any(|hitbox| {
+            matches!(
+                hitbox.behavior,
+                HitboxBehavior::BlockMouse | HitboxBehavior::BlockMouseExceptScroll
+            ) && hitbox.interaction_bounds().contains(&point)
+                && hit_test.ids.contains(&hitbox.id)
+        })
+    {
+        return true;
+    }
+
     if hitbox_end >= window.rendered_frame.hitboxes.len() {
         return false;
     }
 
-    let hit_test = window.rendered_frame.hit_test(point);
     hit_test.ids.iter().any(|hitbox_id| {
         window.rendered_frame.hitboxes[hitbox_end..]
             .iter()
@@ -996,11 +1011,15 @@ mod tests {
     use super::{SelectionAreaKey, SelectionDocument, SelectionState};
     use crate::EntityId;
     use crate::{
-        AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement, IntoElement,
-        Modifiers, ParentElement, PointerButton, PointerDownEvent, PointerKind, PointerUpEvent,
-        Render, Styled, StyledText, TestAppContext, Window, div, point, px, selection_area,
+        AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement, InteractiveText,
+        IntoElement, Modifiers, ParentElement, PointerButton, PointerDownEvent, PointerKind,
+        PointerUpEvent, Render, Styled, StyledText, TestAppContext, TextLayout, Window, div, point,
+        px, selection_area,
     };
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     struct SelectionTestView;
 
@@ -1065,6 +1084,30 @@ mod tests {
                         })
                         .child(StyledText::new("selectable").selectable()),
                 ))
+        }
+    }
+
+    struct LinkSelectionTestView {
+        link_presses: Rc<Cell<usize>>,
+        layout: Rc<RefCell<Option<TextLayout>>>,
+    }
+
+    impl Render for LinkSelectionTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let link_presses = self.link_presses.clone();
+            let text = StyledText::new("open link")
+                .selectable()
+                .selection_separator_after("\n");
+            self.layout.borrow_mut().replace(text.layout().clone());
+
+            selection_area(div().w(px(240.0)).child(
+                InteractiveText::new("selection-link", text).on_click(
+                    vec![5..9],
+                    move |_, _, _| {
+                        link_presses.set(link_presses.get() + 1);
+                    },
+                ),
+            ))
         }
     }
 
@@ -1353,6 +1396,44 @@ mod tests {
 
         assert_eq!(header_presses.get(), 0);
         assert_eq!(selection_presses.get(), 0);
+    }
+
+    #[gpui::test]
+    fn interactive_text_link_hitboxes_take_precedence_over_selection(cx: &mut TestAppContext) {
+        let link_presses = Rc::new(Cell::new(0));
+        let layout = Rc::new(RefCell::new(None));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| LinkSelectionTestView {
+                    link_presses: link_presses.clone(),
+                    layout: layout.clone(),
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let window = *window;
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        let link_point = layout
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .rects_for_range(5..9)
+            .first()
+            .unwrap()
+            .center();
+
+        assert!(!selection_fast_hit_cache_claims_point(
+            cx, window, link_point
+        ));
+        let selection_claimed_touch = selection_handler_claims_point(cx, window, link_point);
+        assert!(!selection_claimed_touch);
+        simulate_primary_click(cx, window, link_point);
+
+        assert_eq!(link_presses.get(), 1);
     }
 
     #[gpui::test]

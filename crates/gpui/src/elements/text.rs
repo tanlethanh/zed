@@ -1,10 +1,10 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextSelectionFragment, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window,
-    WrappedLine, WrappedLineLayout, point, px, register_tooltip_mouse_handlers,
-    set_tooltip_on_window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PointerButton, PointerDownEvent,
+    PointerKind, PointerUpEvent, SharedString, Size, TextOverflow, TextRun, TextSelectionFragment,
+    TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine, WrappedLineLayout, point,
+    px, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -13,7 +13,6 @@ use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    mem,
     ops::Range,
     rc::Rc,
     sync::Arc,
@@ -835,11 +834,18 @@ pub struct InteractiveText {
     element_id: ElementId,
     text: StyledText,
     click_listener:
-        Option<Box<dyn Fn(&[Range<usize>], InteractiveTextClickEvent, &mut Window, &mut App)>>,
+        Option<Rc<dyn Fn(&[Range<usize>], InteractiveTextClickEvent, &mut Window, &mut App)>>,
     hover_listener: Option<Box<dyn Fn(Option<usize>, MouseMoveEvent, &mut Window, &mut App)>>,
     tooltip_builder: Option<Rc<dyn Fn(usize, &mut Window, &mut App) -> Option<AnyView>>>,
     tooltip_id: Option<TooltipId>,
     clickable_ranges: Vec<Range<usize>>,
+}
+
+const INTERACTIVE_TEXT_PRESS_MOVE_THRESHOLD: f64 = 8.0;
+
+#[derive(Clone)]
+struct InteractiveTextClickHitbox {
+    hitbox: Hitbox,
 }
 
 struct InteractiveTextClickEvent {
@@ -847,12 +853,26 @@ struct InteractiveTextClickEvent {
     mouse_up_index: usize,
 }
 
+#[derive(Clone, Copy)]
+struct InteractiveTextPointerDown {
+    pointer_id: u64,
+    index: usize,
+    position: Point<Pixels>,
+}
+
 #[doc(hidden)]
 #[derive(Default)]
 pub struct InteractiveTextState {
     mouse_down_index: Rc<Cell<Option<usize>>>,
+    pointer_down: Rc<Cell<Option<InteractiveTextPointerDown>>>,
     hovered_index: Rc<Cell<Option<usize>>>,
     active_tooltip: Rc<RefCell<Option<ActiveTooltip>>>,
+}
+
+/// Prepaint state for interactive text hitboxes.
+pub struct InteractiveTextPrepaintState {
+    hitbox: Hitbox,
+    clickable_hitboxes: Vec<InteractiveTextClickHitbox>,
 }
 
 /// InteractiveTest is a wrapper around StyledText that adds mouse interactions.
@@ -877,7 +897,7 @@ impl InteractiveText {
         ranges: Vec<Range<usize>>,
         listener: impl Fn(usize, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.click_listener = Some(Box::new(move |ranges, event, window, cx| {
+        self.click_listener = Some(Rc::new(move |ranges, event, window, cx| {
             for (range_ix, range) in ranges.iter().enumerate() {
                 if range.contains(&event.mouse_down_index) && range.contains(&event.mouse_up_index)
                 {
@@ -911,7 +931,7 @@ impl InteractiveText {
 
 impl Element for InteractiveText {
     type RequestLayoutState = ();
-    type PrepaintState = Hitbox;
+    type PrepaintState = InteractiveTextPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.element_id.clone())
@@ -939,7 +959,7 @@ impl Element for InteractiveText {
         state: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) -> Hitbox {
+    ) -> InteractiveTextPrepaintState {
         window.with_optional_element_state::<InteractiveTextState, _>(
             global_id,
             |interactive_state, window| {
@@ -959,7 +979,25 @@ impl Element for InteractiveText {
                 self.text
                     .prepaint(None, inspector_id, bounds, state, window, cx);
                 let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-                (hitbox, interactive_state)
+                let clickable_hitboxes = if self.click_listener.is_some() {
+                    self.clickable_ranges
+                        .iter()
+                        .flat_map(|range| self.text.layout().rects_for_range(range.clone()))
+                        .map(|bounds| InteractiveTextClickHitbox {
+                            hitbox: window
+                                .insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (
+                    InteractiveTextPrepaintState {
+                        hitbox,
+                        clickable_hitboxes,
+                    },
+                    interactive_state,
+                )
             },
         )
     }
@@ -970,7 +1008,7 @@ impl Element for InteractiveText {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        hitbox: &mut Hitbox,
+        prepaint: &mut InteractiveTextPrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -988,29 +1026,36 @@ impl Element for InteractiveText {
                             .iter()
                             .any(|range| range.contains(&ix))
                     {
-                        window.set_cursor_style(crate::CursorStyle::PointingHand, hitbox)
+                        window.set_cursor_style(crate::CursorStyle::PointingHand, &prepaint.hitbox)
                     }
 
                     let mouse_down = interactive_state.mouse_down_index.clone();
+                    let pointer_down = interactive_state.pointer_down.clone();
                     if let Some(mouse_down_index) = mouse_down.get() {
-                        let hitbox = hitbox.clone();
-                        let clickable_ranges = mem::take(&mut self.clickable_ranges);
+                        let clickable_hitboxes = prepaint.clickable_hitboxes.clone();
+                        let clickable_ranges = self.clickable_ranges.clone();
                         let text_layout = text_layout.clone();
+                        let click_listener = click_listener.clone();
                         window.on_mouse_event(
                             move |event: &MouseUpEvent, phase, window: &mut Window, cx| {
-                                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                                    if let Ok(mouse_up_index) =
-                                        text_layout.index_for_position(event.position)
+                                if phase == DispatchPhase::Bubble {
+                                    if clickable_hitboxes
+                                        .iter()
+                                        .any(|link| link.hitbox.is_hovered(window))
                                     {
-                                        click_listener(
-                                            &clickable_ranges,
-                                            InteractiveTextClickEvent {
-                                                mouse_down_index,
-                                                mouse_up_index,
-                                            },
-                                            window,
-                                            cx,
-                                        )
+                                        if let Ok(mouse_up_index) =
+                                            text_layout.index_for_position(event.position)
+                                        {
+                                            click_listener(
+                                                &clickable_ranges,
+                                                InteractiveTextClickEvent {
+                                                    mouse_down_index,
+                                                    mouse_up_index,
+                                                },
+                                                window,
+                                                cx,
+                                            )
+                                        }
                                     }
 
                                     mouse_down.take();
@@ -1019,11 +1064,13 @@ impl Element for InteractiveText {
                             },
                         );
                     } else {
-                        let hitbox = hitbox.clone();
+                        let clickable_hitboxes = prepaint.clickable_hitboxes.clone();
                         let text_layout = text_layout.clone();
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _| {
                             if phase == DispatchPhase::Bubble
-                                && hitbox.is_hovered(window)
+                                && clickable_hitboxes
+                                    .iter()
+                                    .any(|link| link.hitbox.is_hovered(window))
                                 && let Ok(mouse_down_index) =
                                     text_layout.index_for_position(event.position)
                             {
@@ -1032,11 +1079,80 @@ impl Element for InteractiveText {
                             }
                         });
                     }
+
+                    let clickable_hitboxes = prepaint.clickable_hitboxes.clone();
+                    let clickable_ranges = self.clickable_ranges.clone();
+                    let pointer_down_text_layout = text_layout.clone();
+                    let pointer_down_for_down = pointer_down.clone();
+                    window.on_pointer_event(move |event: &PointerDownEvent, phase, window, _| {
+                        if phase == DispatchPhase::Bubble
+                            && event.kind != PointerKind::Mouse
+                            && event.button == PointerButton::Primary
+                            && clickable_hitboxes
+                                .iter()
+                                .any(|link| link.hitbox.is_hovered(window))
+                            && let Ok(index) =
+                                pointer_down_text_layout.index_for_position(event.position)
+                            && clickable_ranges.iter().any(|range| range.contains(&index))
+                        {
+                            pointer_down_for_down.set(Some(InteractiveTextPointerDown {
+                                pointer_id: event.pointer_id,
+                                index,
+                                position: event.position,
+                            }));
+                            window.refresh();
+                        }
+                    });
+
+                    let clickable_hitboxes = prepaint.clickable_hitboxes.clone();
+                    let clickable_ranges = self.clickable_ranges.clone();
+                    let text_layout = text_layout.clone();
+                    let click_listener = click_listener.clone();
+                    let pointer_down_for_up = pointer_down.clone();
+                    window.on_pointer_event(move |event: &PointerUpEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble
+                            || event.kind == PointerKind::Mouse
+                            || event.button != PointerButton::Primary
+                        {
+                            return;
+                        }
+
+                        let Some(pointer) = pointer_down_for_up.get() else {
+                            return;
+                        };
+                        if pointer.pointer_id != event.pointer_id {
+                            return;
+                        }
+                        pointer_down_for_up.take();
+
+                        if !clickable_hitboxes
+                            .iter()
+                            .any(|link| link.hitbox.is_hovered(window))
+                            || (event.position - pointer.position).magnitude()
+                                > INTERACTIVE_TEXT_PRESS_MOVE_THRESHOLD
+                        {
+                            window.refresh();
+                            return;
+                        }
+
+                        if let Ok(mouse_up_index) = text_layout.index_for_position(event.position) {
+                            click_listener(
+                                &clickable_ranges,
+                                InteractiveTextClickEvent {
+                                    mouse_down_index: pointer.index,
+                                    mouse_up_index,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                        window.refresh();
+                    });
                 }
 
                 window.on_mouse_event({
                     let mut hover_listener = self.hover_listener.take();
-                    let hitbox = hitbox.clone();
+                    let hitbox = prepaint.hitbox.clone();
                     let text_layout = text_layout.clone();
                     let hovered_index = interactive_state.hovered_index.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
@@ -1070,7 +1186,7 @@ impl Element for InteractiveText {
 
                     // Use bounds instead of testing hitbox since this is called during prepaint.
                     let check_is_hovered_during_prepaint = Rc::new({
-                        let source_bounds = hitbox.bounds;
+                        let source_bounds = prepaint.hitbox.bounds;
                         let text_layout = text_layout.clone();
                         let pending_mouse_down = interactive_state.mouse_down_index.clone();
                         move |window: &Window| {
@@ -1083,7 +1199,7 @@ impl Element for InteractiveText {
                     });
 
                     let check_is_hovered = Rc::new({
-                        let hitbox = hitbox.clone();
+                        let hitbox = prepaint.hitbox.clone();
                         let text_layout = text_layout.clone();
                         let pending_mouse_down = interactive_state.mouse_down_index.clone();
                         move |window: &Window| {

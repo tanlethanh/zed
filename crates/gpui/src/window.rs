@@ -618,7 +618,7 @@ pub struct Hitbox {
 }
 
 impl Hitbox {
-    fn interaction_bounds(&self) -> Bounds<Pixels> {
+    pub(crate) fn interaction_bounds(&self) -> Bounds<Pixels> {
         let slop = &self.hit_slop;
         let interaction_bounds = Bounds {
             origin: point(
@@ -942,18 +942,28 @@ fn selectable_text_occluding_bounds(
     let Some(hitbox_range) = hitbox_range else {
         return SmallVec::new();
     };
-    let hitbox_start = hitbox_range.end.min(frame.hitboxes.len());
-    if hitbox_start >= frame.hitboxes.len() {
-        return SmallVec::new();
-    }
+    let hitbox_start = hitbox_range.start.min(frame.hitboxes.len());
+    let hitbox_end = hitbox_range.end.min(frame.hitboxes.len());
 
-    frame.hitboxes[hitbox_start..]
+    let mut bounds = frame.hitboxes[hitbox_start..hitbox_end]
         .iter()
+        .filter(|hitbox| {
+            matches!(
+                hitbox.behavior,
+                HitboxBehavior::BlockMouse | HitboxBehavior::BlockMouseExceptScroll
+            )
+        })
         .filter_map(|hitbox| {
             let bounds = hitbox.interaction_bounds();
             bounds.intersects(&text_bounds).then_some(bounds)
         })
-        .collect()
+        .collect::<SmallVec<[Bounds<Pixels>; 4]>>();
+
+    bounds.extend(frame.hitboxes[hitbox_end..].iter().filter_map(|hitbox| {
+        let bounds = hitbox.interaction_bounds();
+        bounds.intersects(&text_bounds).then_some(bounds)
+    }));
+    bounds
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
