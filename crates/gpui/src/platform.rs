@@ -1181,6 +1181,7 @@ pub struct PlatformInputHandler {
     handler: Rc<RefCell<Box<dyn InputHandler>>>,
     accepts_text_input: bool,
     uses_manual_focus: bool,
+    text_input_traits: PlatformTextInputTraits,
 }
 
 #[expect(missing_docs)]
@@ -1197,12 +1198,14 @@ impl PlatformInputHandler {
         handler: Box<dyn InputHandler>,
         accepts_text_input: bool,
         uses_manual_focus: bool,
+        text_input_traits: PlatformTextInputTraits,
     ) -> Self {
         Self {
             cx,
             handler: Rc::new(RefCell::new(handler)),
             accepts_text_input,
             uses_manual_focus,
+            text_input_traits,
         }
     }
 
@@ -1398,6 +1401,11 @@ impl PlatformInputHandler {
     }
 
     #[allow(dead_code)]
+    pub fn query_text_input_traits(&self) -> PlatformTextInputTraits {
+        self.text_input_traits
+    }
+
+    #[allow(dead_code)]
     pub fn query_prefers_ime_for_printable_keys(&mut self) -> bool {
         self.cx
             .update(|window, cx| {
@@ -1439,6 +1447,83 @@ pub struct UTF16Selection {
     /// Whether the head of this selection is at the start (true), or end (false)
     /// of the range
     pub reversed: bool,
+}
+
+/// Generic enabled/default/disabled state for platform text input traits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformTextInputTrait {
+    /// Ask the platform to use its default behavior.
+    SystemDefault,
+    /// Disable the platform behavior.
+    Disabled,
+    /// Enable the platform behavior.
+    Enabled,
+}
+
+impl Default for PlatformTextInputTrait {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+/// Platform autocapitalization behavior for text input handlers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformTextAutocapitalization {
+    /// Do not autocapitalize typed text.
+    None,
+    /// Autocapitalize word starts.
+    Words,
+    /// Autocapitalize sentence starts.
+    Sentences,
+    /// Autocapitalize every character.
+    AllCharacters,
+}
+
+impl Default for PlatformTextAutocapitalization {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Snapshot of platform text input traits for a focused input handler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlatformTextInputTraits {
+    /// Autocapitalization policy.
+    pub autocapitalization: PlatformTextAutocapitalization,
+    /// Autocorrection policy.
+    pub autocorrection: PlatformTextInputTrait,
+    /// Spell-checking policy.
+    pub spell_checking: PlatformTextInputTrait,
+    /// Smart quotes policy.
+    pub smart_quotes: PlatformTextInputTrait,
+    /// Smart dashes policy.
+    pub smart_dashes: PlatformTextInputTrait,
+    /// Smart insert/delete policy.
+    pub smart_insert_delete: PlatformTextInputTrait,
+    /// Inline prediction policy.
+    pub inline_prediction: PlatformTextInputTrait,
+}
+
+impl PlatformTextInputTraits {
+    /// Enable native platform suggestions without enabling autocorrect or smart punctuation.
+    pub fn suggestions_only() -> Self {
+        Self {
+            inline_prediction: PlatformTextInputTrait::Enabled,
+            ..Self::default()
+        }
+    }
+
+    /// Enable the platform keyboard suggestion strip while keeping smart punctuation disabled.
+    pub fn keyboard_suggestions() -> Self {
+        // Important: on iOS the QuickType suggestion strip depends on
+        // autocorrection being enabled, but smart punctuation and spell-checking
+        // stay disabled so terminal/code-like text is not rewritten.
+        Self {
+            autocorrection: PlatformTextInputTrait::Enabled,
+            inline_prediction: PlatformTextInputTrait::Enabled,
+            ..Self::default()
+        }
+    }
 }
 
 /// Zed's interface for handling text input from the platform's IME system
@@ -1586,6 +1671,15 @@ pub trait InputHandler: 'static {
     /// Returns whether this handler is accepting text input to be inserted.
     fn accepts_text_input(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         true
+    }
+
+    /// Returns platform-specific text input traits for this handler.
+    fn text_input_traits(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> PlatformTextInputTraits {
+        PlatformTextInputTraits::default()
     }
 
     /// Returns whether printable keys should be routed to the IME before keybinding
@@ -2435,7 +2529,21 @@ impl From<String> for ClipboardString {
 
 #[cfg(test)]
 mod keyboard_tests {
-    use super::should_auto_request_soft_keyboard;
+    use super::{
+        PlatformTextAutocapitalization, PlatformTextInputTrait, PlatformTextInputTraits,
+        should_auto_request_soft_keyboard,
+    };
+
+    fn assert_mutating_traits_disabled(traits: PlatformTextInputTraits) {
+        assert_eq!(
+            traits.autocapitalization,
+            PlatformTextAutocapitalization::None
+        );
+        assert_eq!(traits.spell_checking, PlatformTextInputTrait::Disabled);
+        assert_eq!(traits.smart_quotes, PlatformTextInputTrait::Disabled);
+        assert_eq!(traits.smart_dashes, PlatformTextInputTrait::Disabled);
+        assert_eq!(traits.smart_insert_delete, PlatformTextInputTrait::Disabled);
+    }
 
     #[test]
     fn editable_text_input_auto_requests_keyboard_on_new_focus() {
@@ -2455,6 +2563,64 @@ mod keyboard_tests {
     #[test]
     fn non_text_input_never_auto_requests_keyboard() {
         assert!(!should_auto_request_soft_keyboard(false, false, false));
+    }
+
+    #[test]
+    fn default_text_input_traits_keep_native_mutation_disabled() {
+        let traits = PlatformTextInputTraits::default();
+
+        assert_mutating_traits_disabled(traits);
+        assert_eq!(traits.autocorrection, PlatformTextInputTrait::Disabled);
+        assert_eq!(traits.inline_prediction, PlatformTextInputTrait::Disabled);
+    }
+
+    #[test]
+    fn suggestions_only_enables_inline_prediction_only() {
+        let traits = PlatformTextInputTraits::suggestions_only();
+
+        assert_mutating_traits_disabled(traits);
+        assert_eq!(traits.inline_prediction, PlatformTextInputTrait::Enabled);
+        assert_eq!(traits.autocorrection, PlatformTextInputTrait::Disabled);
+    }
+
+    #[test]
+    fn keyboard_suggestions_enable_autocorrection_candidates_without_smart_punctuation() {
+        let traits = PlatformTextInputTraits::keyboard_suggestions();
+
+        assert_mutating_traits_disabled(traits);
+        assert_eq!(traits.inline_prediction, PlatformTextInputTrait::Enabled);
+        assert_eq!(traits.autocorrection, PlatformTextInputTrait::Enabled);
+    }
+
+    #[test]
+    fn text_input_trait_factories_have_exact_expected_policies() {
+        assert_eq!(
+            PlatformTextInputTraits::default(),
+            PlatformTextInputTraits {
+                autocapitalization: PlatformTextAutocapitalization::None,
+                autocorrection: PlatformTextInputTrait::Disabled,
+                spell_checking: PlatformTextInputTrait::Disabled,
+                smart_quotes: PlatformTextInputTrait::Disabled,
+                smart_dashes: PlatformTextInputTrait::Disabled,
+                smart_insert_delete: PlatformTextInputTrait::Disabled,
+                inline_prediction: PlatformTextInputTrait::Disabled,
+            }
+        );
+        assert_eq!(
+            PlatformTextInputTraits::suggestions_only(),
+            PlatformTextInputTraits {
+                inline_prediction: PlatformTextInputTrait::Enabled,
+                ..PlatformTextInputTraits::default()
+            }
+        );
+        assert_eq!(
+            PlatformTextInputTraits::keyboard_suggestions(),
+            PlatformTextInputTraits {
+                autocorrection: PlatformTextInputTrait::Enabled,
+                inline_prediction: PlatformTextInputTrait::Enabled,
+                ..PlatformTextInputTraits::default()
+            }
+        );
     }
 }
 

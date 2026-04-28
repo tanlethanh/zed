@@ -23,10 +23,12 @@ use core_graphics::{
 };
 use gpui::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta, ScrollWheelEvent,
-    SelectableTextHitRegion, Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowParams, px, should_auto_request_soft_keyboard, size,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformTextAutocapitalization, PlatformTextInputTrait, PlatformTextInputTraits,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
+    ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, px,
+    should_auto_request_soft_keyboard, size,
 };
 use objc::{
     Encode, Encoding, class,
@@ -714,6 +716,43 @@ fn text_input_uses_system_keyboard_for_gpui(view: &Object) -> bool {
     }
 }
 
+fn active_text_input_traits_for_gpui(view: &Object) -> PlatformTextInputTraits {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return PlatformTextInputTraits::default();
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        if should_use_system_keyboard(
+            window.input_handler.borrow().is_some(),
+            window.callback_input_handler.borrow().is_some(),
+            window.input_accepts_text_input.get(),
+            window.keyboard_session_requested.get(),
+        ) {
+            window.input_text_input_traits.get()
+        } else {
+            PlatformTextInputTraits::default()
+        }
+    }
+}
+
+fn text_input_trait_value(trait_value: PlatformTextInputTrait) -> i64 {
+    match trait_value {
+        PlatformTextInputTrait::SystemDefault => 0,
+        PlatformTextInputTrait::Disabled => 1,
+        PlatformTextInputTrait::Enabled => 2,
+    }
+}
+
+fn autocapitalization_value(value: PlatformTextAutocapitalization) -> i64 {
+    match value {
+        PlatformTextAutocapitalization::None => 0,
+        PlatformTextAutocapitalization::Words => 1,
+        PlatformTextAutocapitalization::Sentences => 2,
+        PlatformTextAutocapitalization::AllCharacters => 3,
+    }
+}
+
 fn text_input_context_expects_dictation() -> bool {
     unsafe {
         let Some(class) = Class::get("UITextInputContext") else {
@@ -1002,37 +1041,43 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // UITextInputTraits - autocapitalization type
-        extern "C" fn autocapitalization_type(_this: &Object, _sel: Sel) -> i64 {
-            0 // UITextAutocapitalizationTypeNone
+        extern "C" fn autocapitalization_type(this: &Object, _sel: Sel) -> i64 {
+            autocapitalization_value(active_text_input_traits_for_gpui(this).autocapitalization)
         }
 
         // UITextInputTraits - autocorrection type
-        extern "C" fn autocorrection_type(_this: &Object, _sel: Sel) -> i64 {
-            1 // UITextAutocorrectionTypeNo
+        extern "C" fn autocorrection_type(this: &Object, _sel: Sel) -> i64 {
+            text_input_trait_value(active_text_input_traits_for_gpui(this).autocorrection)
         }
 
-        // UITextInputTraits - smart quotes type (disable smart quotes)
+        // UITextInputTraits - smart quotes type
         // UITextSmartQuotesType: 0=Default, 1=No, 2=Yes
-        extern "C" fn smart_quotes_type(_this: &Object, _sel: Sel) -> i64 {
-            1 // UITextSmartQuotesTypeNo
+        extern "C" fn smart_quotes_type(this: &Object, _sel: Sel) -> i64 {
+            text_input_trait_value(active_text_input_traits_for_gpui(this).smart_quotes)
         }
 
-        // UITextInputTraits - smart dashes type (disable smart dashes)
+        // UITextInputTraits - smart dashes type
         // UITextSmartDashesType: 0=Default, 1=No, 2=Yes
-        extern "C" fn smart_dashes_type(_this: &Object, _sel: Sel) -> i64 {
-            1 // UITextSmartDashesTypeNo
+        extern "C" fn smart_dashes_type(this: &Object, _sel: Sel) -> i64 {
+            text_input_trait_value(active_text_input_traits_for_gpui(this).smart_dashes)
         }
 
-        // UITextInputTraits - smart insert delete type (disable double-space to period)
+        // UITextInputTraits - smart insert delete type
         // UITextSmartInsertDeleteType: 0=Default, 1=No, 2=Yes
-        extern "C" fn smart_insert_delete_type(_this: &Object, _sel: Sel) -> i64 {
-            1 // UITextSmartInsertDeleteTypeNo
+        extern "C" fn smart_insert_delete_type(this: &Object, _sel: Sel) -> i64 {
+            text_input_trait_value(active_text_input_traits_for_gpui(this).smart_insert_delete)
         }
 
-        // UITextInputTraits - spell checking type (disable spell checking)
+        // UITextInputTraits - spell checking type
         // UITextSpellCheckingType: 0=Default, 1=No, 2=Yes
-        extern "C" fn spell_checking_type(_this: &Object, _sel: Sel) -> i64 {
-            1 // UITextSpellCheckingTypeNo
+        extern "C" fn spell_checking_type(this: &Object, _sel: Sel) -> i64 {
+            text_input_trait_value(active_text_input_traits_for_gpui(this).spell_checking)
+        }
+
+        // UITextInputTraits - inline prediction type
+        // UITextInlinePredictionType: 0=Default, 1=No, 2=Yes
+        extern "C" fn inline_prediction_type(this: &Object, _sel: Sel) -> i64 {
+            text_input_trait_value(active_text_input_traits_for_gpui(this).inline_prediction)
         }
 
         // Tell iOS we want to receive keyboard input
@@ -2227,6 +2272,10 @@ fn register_metal_view_class() -> &'static Class {
                 sel!(spellCheckingType),
                 spell_checking_type as extern "C" fn(&Object, Sel) -> i64,
             );
+            decl.add_method(
+                sel!(inlinePredictionType),
+                inline_prediction_type as extern "C" fn(&Object, Sel) -> i64,
+            );
 
             // Add UIKeyInput protocol methods for text input
             decl.add_method(
@@ -2636,6 +2685,8 @@ pub(crate) struct IosWindow {
     input_accepts_text_input: Cell<bool>,
     /// Whether the active input handler belongs to a manual-focus surface.
     input_uses_manual_focus: Cell<bool>,
+    /// Cached text input traits for the active editable handler.
+    input_text_input_traits: Cell<PlatformTextInputTraits>,
     /// Whether UIKit should keep the software keyboard up for the active input handler.
     keyboard_session_requested: Cell<bool>,
     /// Weak text input delegate assigned by UIKit.
@@ -2822,6 +2873,7 @@ impl IosWindow {
                 callback_selection_handler: RefCell::new(None),
                 input_accepts_text_input: Cell::new(false),
                 input_uses_manual_focus: Cell::new(false),
+                input_text_input_traits: Cell::new(PlatformTextInputTraits::default()),
                 keyboard_session_requested: Cell::new(false),
                 input_delegate: Cell::new(ptr::null_mut()),
                 editable_text_interaction,
@@ -2963,6 +3015,7 @@ impl IosWindow {
                 callback_selection_handler: RefCell::new(None),
                 input_accepts_text_input: Cell::new(false),
                 input_uses_manual_focus: Cell::new(false),
+                input_text_input_traits: Cell::new(PlatformTextInputTraits::default()),
                 keyboard_session_requested: Cell::new(false),
                 input_delegate: Cell::new(ptr::null_mut()),
                 editable_text_interaction,
@@ -3133,6 +3186,12 @@ impl IosWindow {
         };
         let _: BOOL = unsafe { msg_send![responder, resignFirstResponder] };
         self.sync_text_interaction_for_current_responder_state();
+    }
+
+    fn reload_text_input_views_if_first_responder(&self) {
+        if let Some(responder) = self.active_first_responder_view() {
+            let _: () = unsafe { msg_send![responder, reloadInputViews] };
+        }
     }
 
     fn refresh_text_input_state(&self) {
@@ -3810,6 +3869,7 @@ impl PlatformWindow for IosWindow {
         let mut input_handler = input_handler;
         let accepts_text_input = input_handler.query_accepts_text_input();
         let uses_manual_focus = input_handler.query_uses_manual_focus();
+        let text_input_traits = input_handler.query_text_input_traits();
         let should_auto_request_keyboard = should_auto_request_soft_keyboard(
             accepts_text_input,
             uses_manual_focus,
@@ -3820,6 +3880,10 @@ impl PlatformWindow for IosWindow {
         *self.input_handler.borrow_mut() = Some(input_handler);
         self.input_accepts_text_input.set(accepts_text_input);
         self.input_uses_manual_focus.set(uses_manual_focus);
+        let previous_text_input_traits = self.input_text_input_traits.replace(text_input_traits);
+        if previous_text_input_traits != text_input_traits {
+            self.reload_text_input_views_if_first_responder();
+        }
         if should_auto_request_keyboard {
             self.keyboard_session_requested.set(true);
         }
@@ -3835,6 +3899,12 @@ impl PlatformWindow for IosWindow {
         let had_callback_input_handler = self.callback_input_handler.borrow_mut().take().is_some();
         self.input_accepts_text_input.set(false);
         self.input_uses_manual_focus.set(false);
+        let previous_text_input_traits = self
+            .input_text_input_traits
+            .replace(PlatformTextInputTraits::default());
+        if previous_text_input_traits != PlatformTextInputTraits::default() {
+            self.reload_text_input_views_if_first_responder();
+        }
         if should_clear_keyboard_request_when_clearing_input_handler(
             had_input_handler,
             had_callback_input_handler,
@@ -4298,6 +4368,49 @@ mod tests {
         assert_eq!(
             active_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, true),
             TEXT_INTERACTION_NONEDITABLE
+        );
+    }
+
+    #[test]
+    fn text_input_trait_values_match_uikit_enums() {
+        assert_eq!(
+            text_input_trait_value(PlatformTextInputTrait::SystemDefault),
+            0
+        );
+        assert_eq!(text_input_trait_value(PlatformTextInputTrait::Disabled), 1);
+        assert_eq!(text_input_trait_value(PlatformTextInputTrait::Enabled), 2);
+    }
+
+    #[test]
+    fn keyboard_suggestion_traits_map_to_uikit_values_without_smart_mutation() {
+        let traits = PlatformTextInputTraits::keyboard_suggestions();
+
+        assert_eq!(autocapitalization_value(traits.autocapitalization), 0);
+        assert_eq!(text_input_trait_value(traits.autocorrection), 2);
+        assert_eq!(text_input_trait_value(traits.inline_prediction), 2);
+        assert_eq!(text_input_trait_value(traits.spell_checking), 1);
+        assert_eq!(text_input_trait_value(traits.smart_quotes), 1);
+        assert_eq!(text_input_trait_value(traits.smart_dashes), 1);
+        assert_eq!(text_input_trait_value(traits.smart_insert_delete), 1);
+    }
+
+    #[test]
+    fn autocapitalization_values_match_uikit_enums() {
+        assert_eq!(
+            autocapitalization_value(PlatformTextAutocapitalization::None),
+            0
+        );
+        assert_eq!(
+            autocapitalization_value(PlatformTextAutocapitalization::Words),
+            1
+        );
+        assert_eq!(
+            autocapitalization_value(PlatformTextAutocapitalization::Sentences),
+            2
+        );
+        assert_eq!(
+            autocapitalization_value(PlatformTextAutocapitalization::AllCharacters),
+            3
         );
     }
 }

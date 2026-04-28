@@ -9,8 +9,8 @@ use crate::{
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PointerCancelEvent, PointerEvent, PointerUpEvent, PolychromeSprite, Priority, PromptButton,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformTextInputTraits, PlatformWindow,
+    Point, PointerCancelEvent, PointerEvent, PointerUpEvent, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, RegisteredSelectionArea, RegisteredTextSelectionFragment, Render,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
@@ -2411,6 +2411,7 @@ impl Window {
                     Box::new(WindowSelectionHandler),
                     false,
                     false,
+                    PlatformTextInputTraits::default(),
                 ));
         }
 
@@ -4205,6 +4206,7 @@ impl Window {
 
         if focus_handle.is_focused(self) {
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
+            let text_input_traits = input_handler.text_input_traits(self, cx);
             let uses_manual_focus = self
                 .next_frame
                 .manual_focus_handles
@@ -4217,6 +4219,7 @@ impl Window {
                     Box::new(input_handler),
                     accepts_text_input,
                     uses_manual_focus,
+                    text_input_traits,
                 )));
         }
     }

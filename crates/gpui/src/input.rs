@@ -1,4 +1,7 @@
-use crate::{App, Bounds, Context, Entity, InputHandler, Pixels, UTF16Selection, Window};
+use crate::{
+    App, Bounds, Context, Entity, InputHandler, Pixels, PlatformTextInputTraits, UTF16Selection,
+    Window,
+};
 use std::ops::Range;
 
 /// Implement this trait to allow views to handle textual input when implementing an editor, field, etc.
@@ -74,6 +77,15 @@ pub trait EntityInputHandler: 'static + Sized {
     /// See [`InputHandler::accepts_text_input`] for details
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         true
+    }
+
+    /// See [`InputHandler::text_input_traits`] for details
+    fn text_input_traits(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> PlatformTextInputTraits {
+        PlatformTextInputTraits::default()
     }
 }
 
@@ -186,6 +198,11 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
     fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
         self.view
             .update(cx, |view, cx| view.accepts_text_input(window, cx))
+    }
+
+    fn text_input_traits(&mut self, window: &mut Window, cx: &mut App) -> PlatformTextInputTraits {
+        self.view
+            .update(cx, |view, cx| view.text_input_traits(window, cx))
     }
 
     fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, cx: &mut App) -> bool {
