@@ -316,6 +316,17 @@ pub(crate) struct SelectionState {
     pub(crate) reversed: bool,
 }
 
+/// Snapshot of a read-only selection inside a GPUI [`SelectionArea`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadOnlySelectionSnapshot {
+    /// The selected area's stable element id.
+    pub area_id: ElementId,
+    /// The selected range in the area's flattened UTF-16 document.
+    pub range_utf16: Range<usize>,
+    /// The text covered by `range_utf16`.
+    pub text: String,
+}
+
 #[derive(Clone)]
 struct SelectionDocumentFragment {
     fragment: RegisteredTextSelectionFragment,
@@ -432,6 +443,33 @@ impl SelectionDocument {
             .filter(|document| document.key.selection_area_id() == Some(active_area_id));
         let document = matching_documents.next()?;
         matching_documents.next().is_none().then_some(document)
+    }
+
+    fn snapshot_for_range(&self, range_utf16: Range<usize>) -> Option<ReadOnlySelectionSnapshot> {
+        let range_utf16 = self.clamped_range(range_utf16);
+        if range_utf16.is_empty() {
+            return None;
+        }
+        Some(ReadOnlySelectionSnapshot {
+            area_id: self.key.selection_area_id()?.clone(),
+            text: self.text_for_range(range_utf16.clone())?,
+            range_utf16,
+        })
+    }
+
+    fn actions(&self) -> SmallVec<[SelectionAction; 4]> {
+        self.fragments
+            .first()
+            .map(|fragment| {
+                fragment
+                    .fragment
+                    .selection_area()
+                    .actions()
+                    .iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn from_fragments(
@@ -653,6 +691,21 @@ impl SelectionDocument {
     }
 }
 
+pub(crate) fn active_read_only_selection(window: &Window) -> Option<ReadOnlySelectionSnapshot> {
+    let document = SelectionDocument::active(window)?;
+    document.snapshot_for_range(window.selection_state.range_utf16.clone()?)
+}
+
+fn cache_read_only_selection(
+    window: &mut Window,
+    document: &SelectionDocument,
+    range_utf16: Range<usize>,
+) {
+    if let Some(selection) = document.snapshot_for_range(range_utf16) {
+        window.latest_read_only_selection = Some(selection);
+    }
+}
+
 /// Window-level read-only selection bridge.
 ///
 /// Platform backends expose this through their native text-input surface so
@@ -790,10 +843,28 @@ impl InputHandler for WindowSelectionHandler {
         let clamped_range = document.clamped_range(range.clone());
         window.selection_state.range_utf16 = Some(clamped_range);
         window.selection_state.reversed = false;
+        cache_read_only_selection(window, &document, range);
     }
 
     fn clear_selected_text_range(&mut self, window: &mut Window, _cx: &mut App) {
         window.selection_state = SelectionState::default();
+    }
+
+    fn selection_actions(
+        &mut self,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> SmallVec<[SelectionAction; 4]> {
+        let Some(document) = SelectionDocument::active(window) else {
+            return SmallVec::new();
+        };
+        let Some(range_utf16) = window.selection_state.range_utf16.clone() else {
+            return SmallVec::new();
+        };
+        if document.clamped_range(range_utf16).is_empty() {
+            return SmallVec::new();
+        }
+        document.actions()
     }
 }
 
@@ -1011,10 +1082,10 @@ mod tests {
     use super::{SelectionAreaKey, SelectionDocument, SelectionState};
     use crate::EntityId;
     use crate::{
-        AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement, InteractiveText,
-        IntoElement, Modifiers, ParentElement, PointerButton, PointerDownEvent, PointerKind,
-        PointerUpEvent, Render, Styled, StyledText, TestAppContext, TextLayout, Window, div, point,
-        px, selection_area,
+        self as gpui, AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement,
+        InteractiveText, IntoElement, Modifiers, ParentElement, PointerButton, PointerDownEvent,
+        PointerKind, PointerUpEvent, Render, Styled, StyledText, TestAppContext, TextLayout,
+        Window, div, point, px, selection_area,
     };
     use std::{
         cell::{Cell, RefCell},
@@ -1034,6 +1105,21 @@ mod tests {
                     )
                     .child(StyledText::new("world").selectable()),
             )
+        }
+    }
+
+    actions!(
+        selection_test,
+        [SelectionMenuAction, OtherSelectionMenuAction]
+    );
+
+    struct SelectionActionTestView;
+
+    impl Render for SelectionActionTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            selection_area(div().child(StyledText::new("hello").selectable()))
+                .action("Add to Chat", SelectionMenuAction)
+                .action("Other", OtherSelectionMenuAction)
         }
     }
 
@@ -1271,6 +1357,157 @@ mod tests {
         assert_eq!(adjusted_range, Some(0..11));
         assert!(handler.bounds_for_range(0..11).is_some());
         assert!(!handler.rects_for_range(0..11).is_empty());
+
+        handler.set_selected_text_range(0..11);
+        let latest = window
+            .update(cx, |_, window, _| window.latest_read_only_selection())
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.range_utf16, 0..11);
+        assert_eq!(latest.text, "hello world");
+
+        handler.clear_selected_text_range();
+        window
+            .update(cx, |_, window, _| {
+                assert!(window.active_read_only_selection().is_none());
+                assert_eq!(
+                    window
+                        .latest_read_only_selection()
+                        .map(|selection| selection.text),
+                    Some("hello world".to_string())
+                );
+                window.clear_read_only_selection_cache();
+                assert!(window.latest_read_only_selection().is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn selection_handler_exposes_selection_area_actions(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| SelectionActionTestView)
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                window.selection_state = SelectionState {
+                    active_area: Some(document.key.clone()),
+                    range_utf16: Some(0..5),
+                    reversed: false,
+                };
+            })
+            .unwrap();
+
+        let test_window = cx.test_window(*window);
+        let mut handler = test_window.take_selection_handler_for_test().unwrap();
+
+        assert_eq!(
+            handler.selection_action_names(),
+            vec!["Add to Chat", "Other"]
+        );
+        handler.clear_selected_text_range();
+        assert!(handler.selection_action_names().is_empty());
+    }
+
+    #[gpui::test]
+    fn selection_handler_dispatches_selection_area_actions(cx: &mut TestAppContext) {
+        let first_action_count = Rc::new(Cell::new(0));
+        let second_action_count = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            let first_action_count = first_action_count.clone();
+            let second_action_count = second_action_count.clone();
+            cx.on_action(move |_: &SelectionMenuAction, _| {
+                first_action_count.set(first_action_count.get() + 1);
+            });
+            cx.on_action(move |_: &OtherSelectionMenuAction, _| {
+                second_action_count.set(second_action_count.get() + 1);
+            });
+        });
+
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| SelectionActionTestView)
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                window.selection_state = SelectionState {
+                    active_area: Some(document.key.clone()),
+                    range_utf16: Some(0..5),
+                    reversed: false,
+                };
+            })
+            .unwrap();
+
+        let test_window = cx.test_window(*window);
+        let mut handler = test_window.take_selection_handler_for_test().unwrap();
+
+        assert_eq!(
+            handler.selection_action_names(),
+            vec!["Add to Chat", "Other"]
+        );
+        handler.perform_selection_action(1);
+        cx.run_until_parked();
+        assert_eq!(first_action_count.get(), 0);
+        assert_eq!(second_action_count.get(), 1);
+
+        handler.perform_selection_action(99);
+        cx.run_until_parked();
+        assert_eq!(first_action_count.get(), 0);
+        assert_eq!(second_action_count.get(), 1);
+    }
+
+    #[gpui::test]
+    fn selection_handler_hides_actions_for_empty_clamped_selection(cx: &mut TestAppContext) {
+        let first_action_count = Rc::new(Cell::new(0));
+        let second_action_count = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            let first_action_count = first_action_count.clone();
+            let second_action_count = second_action_count.clone();
+            cx.on_action(move |_: &SelectionMenuAction, _| {
+                first_action_count.set(first_action_count.get() + 1);
+            });
+            cx.on_action(move |_: &OtherSelectionMenuAction, _| {
+                second_action_count.set(second_action_count.get() + 1);
+            });
+        });
+
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| SelectionActionTestView)
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                window.selection_state = SelectionState {
+                    active_area: Some(document.key.clone()),
+                    range_utf16: Some(10..20),
+                    reversed: false,
+                };
+            })
+            .unwrap();
+
+        let test_window = cx.test_window(*window);
+        let mut handler = test_window.take_selection_handler_for_test().unwrap();
+
+        assert!(handler.selection_action_names().is_empty());
+        handler.perform_selection_action(0);
+        cx.run_until_parked();
+        assert_eq!(first_action_count.get(), 0);
+        assert_eq!(second_action_count.get(), 0);
     }
 
     #[gpui::test]

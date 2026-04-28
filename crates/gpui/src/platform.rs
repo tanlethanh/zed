@@ -33,8 +33,8 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
     Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
-    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task,
-    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    SelectionAction, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab,
+    Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -1426,6 +1426,36 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    pub fn selection_action_names(&mut self) -> Vec<String> {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .selection_actions(window, cx)
+                    .into_iter()
+                    .map(|action| action.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn perform_selection_action(&mut self, action_index: usize) {
+        self.cx
+            .update(|window, cx| {
+                let action = {
+                    let mut handler = self.handler.borrow_mut();
+                    handler
+                        .selection_actions(window, cx)
+                        .get(action_index)
+                        .map(|action| action.action().boxed_clone())
+                };
+                if let Some(action) = action {
+                    window.dispatch_action(action, cx);
+                }
+            })
+            .ok();
+    }
+
     pub fn clear_selected_text_range(&mut self) {
         self.cx
             .update(|window, cx| {
@@ -1702,6 +1732,15 @@ pub trait InputHandler: 'static {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+    }
+
+    /// Returns custom actions for the active platform-owned selection.
+    fn selection_actions(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> SmallVec<[SelectionAction; 4]> {
+        SmallVec::new()
     }
 }
 

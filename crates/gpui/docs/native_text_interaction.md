@@ -76,8 +76,8 @@ update.
 Current limits:
 
 - built-in fragment registration is currently implemented for `StyledText`,
-- selection-scoped custom actions are stored in GPUI but are not yet presented
-  by the iOS edit menu,
+- selection-scoped custom actions are presented by the iOS edit menu when a
+  read-only `SelectionArea` has an active selection,
 - other platforms can implement native or custom presenters through the
   selection-handler slot without changing the GPUI document model.
 

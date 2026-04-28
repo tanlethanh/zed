@@ -17,6 +17,7 @@ use super::{
 };
 use crate::metal_renderer;
 use anyhow::Result;
+use block::ConcreteBlock;
 use core_graphics::{
     base::CGFloat,
     geometry::{CGRect, CGSize},
@@ -41,7 +42,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, UiKitDisplayHandle, U
 use smallvec::SmallVec;
 use std::{
     cell::{Cell, RefCell},
-    ffi::c_void,
+    ffi::{CString, c_void},
     ops::Range,
     panic::{self, AssertUnwindSafe},
     ptr::{self, NonNull},
@@ -556,6 +557,28 @@ fn active_text_interaction_mode(view: &Object) -> i8 {
     }
 }
 
+fn selection_action_names(view: &Object) -> Vec<String> {
+    if active_text_interaction_mode(view) != TEXT_INTERACTION_NONEDITABLE {
+        return Vec::new();
+    }
+    with_input_handler(view, |handler| handler.selection_action_names()).unwrap_or_default()
+}
+
+fn perform_selection_menu_action(view: *mut Object, action_index: usize) {
+    if view.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        let view = &*view;
+        if active_text_interaction_mode(view) != TEXT_INTERACTION_NONEDITABLE {
+            return;
+        }
+        with_input_handler(view, |handler| {
+            handler.perform_selection_action(action_index);
+        });
+    }));
+}
+
 fn ios_window_for_view(view: &Object) -> Option<&IosWindow> {
     unsafe {
         let window_ptr: *mut c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
@@ -880,6 +903,13 @@ fn ns_string_to_rust_string(ns_string: *mut Object) -> Option<String> {
                 .into_owned(),
         )
     }
+}
+
+fn ns_string_from_str(text: &str) -> *mut Object {
+    let Ok(cstr) = CString::new(text) else {
+        return ptr::null_mut();
+    };
+    unsafe { msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()] }
 }
 
 fn dictation_result_text(dictation_result: *mut Object) -> Option<String> {
@@ -1337,7 +1367,6 @@ fn register_metal_view_class() -> &'static Class {
                 let range = with_input_handler(this, |handler| handler.selected_text_range(false))
                     .flatten();
                 let interaction_mode = active_text_interaction_mode(this);
-
                 match range {
                     Some(selection) => {
                         create_text_range(selection.range.start, selection.range.end)
@@ -1409,6 +1438,56 @@ fn register_metal_view_class() -> &'static Class {
                     Some(())
                 });
             }));
+        }
+
+        // UITextInput - editMenuForTextRange:suggestedActions:
+        // Append GPUI selection-area actions to UIKit's native edit menu.
+        extern "C" fn edit_menu_for_text_range(
+            this: &Object,
+            _sel: Sel,
+            _text_range: *mut Object,
+            suggested_actions: *mut Object,
+        ) -> *mut Object {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let action_names = selection_action_names(this);
+                if action_names.is_empty() {
+                    return ptr::null_mut();
+                }
+
+                unsafe {
+                    let children: *mut Object = msg_send![class!(NSMutableArray), array];
+                    if !suggested_actions.is_null() {
+                        let _: () = msg_send![children, addObjectsFromArray: suggested_actions];
+                    }
+
+                    let view = this as *const Object as *mut Object;
+                    for (action_index, action_name) in action_names.into_iter().enumerate() {
+                        let title = ns_string_from_str(&action_name);
+                        if title.is_null() {
+                            continue;
+                        }
+
+                        // UIAction handlers can run after this menu is built, so dispatch by index.
+                        let block = ConcreteBlock::new(move |_action: *mut Object| {
+                            perform_selection_menu_action(view, action_index);
+                        });
+                        let block = block.copy();
+                        let action: *mut Object = msg_send![
+                            class!(UIAction),
+                            actionWithTitle: title
+                            image: ptr::null_mut::<Object>()
+                            identifier: ptr::null_mut::<Object>()
+                            handler: &*block
+                        ];
+                        if !action.is_null() {
+                            let _: () = msg_send![children, addObject: action];
+                        }
+                    }
+
+                    msg_send![class!(UIMenu), menuWithChildren: children]
+                }
+            }));
+            result.unwrap_or(ptr::null_mut())
         }
 
         // UIResponder - canPerformAction:withSender:
@@ -2118,16 +2197,17 @@ fn register_metal_view_class() -> &'static Class {
                 }
                 let point = Point::new(px(point.x as f32), px(point.y as f32));
                 let has_active_selection = has_active_selection_geometry(this);
-                let index = with_input_handler(this, |handler| {
+                let (direct_index, nearest_index) = with_input_handler(this, |handler| {
                     let direct_index = handler.character_index_for_point(point);
                     let nearest_index = if direct_index.is_none() && has_active_selection {
                         handler.nearest_character_index_for_point(point)
                     } else {
                         None
                     };
-                    direct_index.or(nearest_index)
+                    (direct_index, nearest_index)
                 })
-                .flatten();
+                .unwrap_or((None, None));
+                let index = direct_index.or(nearest_index);
 
                 if let Some(index) = index {
                     create_text_position(index)
@@ -2508,6 +2588,11 @@ fn register_metal_view_class() -> &'static Class {
             decl.add_method(
                 sel!(copy:),
                 copy_action as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(editMenuForTextRange:suggestedActions:),
+                edit_menu_for_text_range
+                    as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> *mut Object,
             );
             decl.add_method(
                 sel!(canPerformAction:withSender:),
@@ -3293,6 +3378,13 @@ impl IosWindow {
             .any(|region| region.contains_text(point))
     }
 
+    fn point_hits_selectable_area(&self, point: Point<Pixels>) -> bool {
+        self.selectable_text_hit_regions
+            .borrow()
+            .iter()
+            .any(|region| region.contains_selection_area(point))
+    }
+
     fn clear_active_text_selection(&self, clear_handler: bool) {
         let had_geometry = self.last_selection_geometry.borrow_mut().take().is_some();
         if !had_geometry && !clear_handler {
@@ -3339,7 +3431,8 @@ impl IosWindow {
                     *self.fling.borrow_mut() = None;
                     let had_selection = self.last_selection_geometry.borrow().is_some();
                     let hit_text = self.point_hits_selectable_text(position);
-                    if had_selection && !hit_text {
+                    let hit_selection_area = self.point_hits_selectable_area(position);
+                    if had_selection && !hit_text && !hit_selection_area {
                         self.clear_active_text_selection(true);
                     }
                     if let Some(callback) = self.input_callback.borrow_mut().as_mut() {

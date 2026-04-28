@@ -10,17 +10,18 @@ use crate::{
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformTextInputTraits, PlatformWindow,
-    Point, PointerCancelEvent, PointerEvent, PointerUpEvent, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, RegisteredSelectionArea, RegisteredTextSelectionFragment, Render,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
-    SelectableTextHitRegion, SelectionArea, SelectionState, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode,
-    TextSelectionFragment, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowSelectionHandler,
-    WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
+    Point, PointerCancelEvent, PointerEvent, PointerUpEvent, PolychromeSprite, Priority,
+    PromptButton, PromptLevel, Quad, ReadOnlySelectionSnapshot, RegisteredSelectionArea,
+    RegisteredTextSelectionFragment, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SelectableTextHitRegion, SelectionArea,
+    SelectionState, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextSelectionFragment, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowSelectionHandler, WindowTextSystem, point, prelude::*, px,
+    rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -995,6 +996,7 @@ pub struct Window {
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) selection_area_stack: Vec<ActiveSelectionArea>,
     pub(crate) selection_state: SelectionState,
+    pub(crate) latest_read_only_selection: Option<ReadOnlySelectionSnapshot>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
@@ -1523,6 +1525,7 @@ impl Window {
             text_style_stack: Vec::new(),
             selection_area_stack: Vec::new(),
             selection_state: SelectionState::default(),
+            latest_read_only_selection: None,
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
@@ -1713,7 +1716,27 @@ impl Window {
         }
 
         self.selection_state = SelectionState::default();
+        self.latest_read_only_selection = None;
         self.platform_window.clear_active_selection();
+    }
+
+    /// Return the active read-only text selection, if any.
+    pub fn active_read_only_selection(&self) -> Option<ReadOnlySelectionSnapshot> {
+        crate::selection::active_read_only_selection(self)
+    }
+
+    /// Return the latest non-empty read-only text selection.
+    ///
+    /// This includes the active selection when one exists, or the most recently
+    /// active selection after platform UI has dismissed it.
+    pub fn latest_read_only_selection(&self) -> Option<ReadOnlySelectionSnapshot> {
+        self.active_read_only_selection()
+            .or_else(|| self.latest_read_only_selection.clone())
+    }
+
+    /// Clear the cached read-only text selection.
+    pub fn clear_read_only_selection_cache(&mut self) {
+        self.latest_read_only_selection = None;
     }
 
     /// Move focus to the element associated with the given [`FocusHandle`].
@@ -2403,6 +2426,7 @@ impl Window {
         );
         if self.next_frame.selection_fragments.is_empty() {
             self.selection_state = SelectionState::default();
+            self.latest_read_only_selection = None;
             self.platform_window.clear_selection_handler();
         } else {
             self.platform_window
