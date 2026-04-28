@@ -45,6 +45,7 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 const GPUI_VIEW_IVAR: &str = "gpui_view";
@@ -54,6 +55,7 @@ const FLING_THRESHOLD: f32 = 50.0;
 const TEXT_INTERACTION_NONE: i8 = -1;
 const TEXT_INTERACTION_NONEDITABLE: i8 = 0;
 const TEXT_INTERACTION_EDITABLE: i8 = 1;
+const PENDING_DICTATION_INSERT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditMenuActionPolicy {
@@ -90,18 +92,17 @@ fn text_input_refresh_plan(
     has_input_handler: bool,
     has_selection_handler: bool,
     input_accepts_text_input: bool,
-    input_uses_manual_focus: bool,
+    _input_uses_manual_focus: bool,
     keyboard_session_requested: bool,
     software_keyboard_visible: bool,
 ) -> TextInputRefreshPlan {
-    let target_interaction_mode =
-        if has_input_handler && input_accepts_text_input && !input_uses_manual_focus {
-            TEXT_INTERACTION_EDITABLE
-        } else if has_selection_handler {
-            TEXT_INTERACTION_NONEDITABLE
-        } else {
-            TEXT_INTERACTION_NONE
-        };
+    let target_interaction_mode = if has_input_handler && input_accepts_text_input {
+        TEXT_INTERACTION_EDITABLE
+    } else if has_selection_handler {
+        TEXT_INTERACTION_NONEDITABLE
+    } else {
+        TEXT_INTERACTION_NONE
+    };
 
     let should_show_keyboard =
         has_input_handler && input_accepts_text_input && keyboard_session_requested;
@@ -459,7 +460,6 @@ where
     unsafe {
         let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
         if window_ptr.is_null() {
-            ios_log_cstr(c"GPUI iOS: with_input_handler - window_ptr is null");
             return None;
         }
 
@@ -469,18 +469,12 @@ where
             match slot {
                 HandlerSlot::Input => {
                     let Ok(mut borrow) = window.callback_input_handler.try_borrow_mut() else {
-                        ios_log_cstr(
-                            c"GPUI iOS: with_input_handler - BORROW CONFLICT during input take!",
-                        );
                         return None;
                     };
                     borrow.take()
                 }
                 HandlerSlot::Selection => {
                     let Ok(mut borrow) = window.callback_selection_handler.try_borrow_mut() else {
-                        ios_log_cstr(
-                            c"GPUI iOS: with_input_handler - BORROW CONFLICT during selection take!",
-                        );
                         return None;
                     };
                     borrow.take()
@@ -496,15 +490,20 @@ where
             _ => None,
         };
         let (mut handler, restore_slot) = match preferred_slot {
-            Some(slot) => (take_handler(slot)?, slot),
+            Some(slot) => {
+                let Some(handler) = take_handler(slot) else {
+                    return None;
+                };
+                (handler, slot)
+            }
             None => {
                 if let Some(handler) = take_handler(HandlerSlot::Input) {
                     (handler, HandlerSlot::Input)
                 } else {
-                    (
-                        take_handler(HandlerSlot::Selection)?,
-                        HandlerSlot::Selection,
-                    )
+                    let Some(handler) = take_handler(HandlerSlot::Selection) else {
+                        return None;
+                    };
+                    (handler, HandlerSlot::Selection)
                 }
             }
         };
@@ -517,18 +516,12 @@ where
         match restore_slot {
             HandlerSlot::Input => {
                 let Ok(mut borrow) = window.callback_input_handler.try_borrow_mut() else {
-                    ios_log_cstr(
-                        c"GPUI iOS: with_input_handler - BORROW CONFLICT during input restore!",
-                    );
                     return Some(result);
                 };
                 *borrow = Some(handler);
             }
             HandlerSlot::Selection => {
                 let Ok(mut borrow) = window.callback_selection_handler.try_borrow_mut() else {
-                    ios_log_cstr(
-                        c"GPUI iOS: with_input_handler - BORROW CONFLICT during selection restore!",
-                    );
                     return Some(result);
                 };
                 *borrow = Some(handler);
@@ -558,6 +551,128 @@ fn active_text_interaction_mode(view: &Object) -> i8 {
         }
         let window = &*(window_ptr as *const IosWindow);
         window.active_text_interaction_mode.get()
+    }
+}
+
+fn ios_window_for_view(view: &Object) -> Option<&IosWindow> {
+    unsafe {
+        let window_ptr: *mut c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return None;
+        }
+        (window_ptr as *const IosWindow).as_ref()
+    }
+}
+
+fn dictation_insert_flags(view: &Object) -> (bool, bool) {
+    ios_window_for_view(view)
+        .map(|window| {
+            let pending = if window.pending_dictation_insert.get()
+                && window
+                    .pending_dictation_insert_at
+                    .get()
+                    .is_some_and(|at| at.elapsed() <= PENDING_DICTATION_INSERT_TIMEOUT)
+            {
+                true
+            } else {
+                window.pending_dictation_insert.set(false);
+                window.pending_dictation_insert_at.set(None);
+                false
+            };
+            (pending, window.insert_text_dictation_active.get())
+        })
+        .unwrap_or((false, false))
+}
+
+fn set_pending_dictation_insert(view: &Object, pending: bool) {
+    if let Some(window) = ios_window_for_view(view) {
+        window.pending_dictation_insert.set(pending);
+        window
+            .pending_dictation_insert_at
+            .set(pending.then(Instant::now));
+    }
+}
+
+fn set_insert_text_dictation_active(view: &Object, active: bool) {
+    if let Some(window) = ios_window_for_view(view) {
+        window.insert_text_dictation_active.set(active);
+        if active {
+            window.streamed_dictation_committed_at.set(None);
+        }
+        if !active {
+            window.pending_dictation_insert.set(false);
+            window.pending_dictation_insert_at.set(None);
+        }
+    }
+}
+
+fn set_streamed_dictation_committed(view: &Object, committed: bool) {
+    if let Some(window) = ios_window_for_view(view) {
+        window
+            .streamed_dictation_committed_at
+            .set(committed.then(Instant::now));
+    }
+}
+
+fn recently_committed_streamed_dictation(view: &Object) -> bool {
+    ios_window_for_view(view)
+        .map(|window| {
+            if window
+                .streamed_dictation_committed_at
+                .get()
+                .is_some_and(|at| at.elapsed() <= PENDING_DICTATION_INSERT_TIMEOUT)
+            {
+                true
+            } else {
+                window.streamed_dictation_committed_at.set(None);
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
+fn should_mark_pending_dictation_insert(
+    interaction_mode: i8,
+    software_keyboard_visible: bool,
+    requested_utf16_len: usize,
+) -> bool {
+    interaction_mode == TEXT_INTERACTION_EDITABLE
+        && software_keyboard_visible
+        && requested_utf16_len >= 1000
+}
+
+fn should_buffer_insert_text_as_dictation(
+    dictation_expected: bool,
+    pending_dictation_insert: bool,
+    insert_text_dictation_active: bool,
+) -> bool {
+    dictation_expected || pending_dictation_insert || insert_text_dictation_active
+}
+
+fn should_ignore_late_dictation_insert(
+    recently_committed_streamed_dictation: bool,
+    insert_text_dictation_active: bool,
+) -> bool {
+    recently_committed_streamed_dictation && !insert_text_dictation_active
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DictationPlaceholderRemovalAction {
+    WaitForInsertDictationResult,
+    CommitStreamedHypothesis,
+    Cancel,
+}
+
+fn dictation_placeholder_removal_action(
+    will_insert_result: bool,
+    insert_text_dictation_active: bool,
+) -> DictationPlaceholderRemovalAction {
+    if will_insert_result {
+        DictationPlaceholderRemovalAction::WaitForInsertDictationResult
+    } else if insert_text_dictation_active {
+        DictationPlaceholderRemovalAction::CommitStreamedHypothesis
+    } else {
+        DictationPlaceholderRemovalAction::Cancel
     }
 }
 
@@ -596,6 +711,20 @@ fn text_input_uses_system_keyboard_for_gpui(view: &Object) -> bool {
             window.input_accepts_text_input.get(),
             window.keyboard_session_requested.get(),
         )
+    }
+}
+
+fn text_input_context_expects_dictation() -> bool {
+    unsafe {
+        let Some(class) = Class::get("UITextInputContext") else {
+            return false;
+        };
+        let context: *mut Object = msg_send![class, current];
+        if context.is_null() {
+            return false;
+        }
+        let expected: BOOL = msg_send![context, isDictationInputExpected];
+        expected == YES
     }
 }
 
@@ -691,6 +820,52 @@ where
         if !delegate.is_null() {
             let _: () = msg_send![delegate, selectionDidChange: view];
             let _: () = msg_send![delegate, textDidChange: view];
+        }
+    }
+}
+
+fn ns_string_to_rust_string(ns_string: *mut Object) -> Option<String> {
+    if ns_string.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let utf8: *const std::os::raw::c_char = msg_send![ns_string, UTF8String];
+        if utf8.is_null() {
+            return None;
+        }
+
+        Some(
+            std::ffi::CStr::from_ptr(utf8)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+fn dictation_result_text(dictation_result: *mut Object) -> Option<String> {
+    if dictation_result.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let count: usize = msg_send![dictation_result, count];
+        let mut result = String::new();
+        for index in 0..count {
+            let phrase: *mut Object = msg_send![dictation_result, objectAtIndex: index];
+            if phrase.is_null() {
+                continue;
+            }
+            let text: *mut Object = msg_send![phrase, text];
+            if let Some(text) = ns_string_to_rust_string(text) {
+                result.push_str(&text);
+            }
+        }
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
         }
     }
 }
@@ -909,11 +1084,28 @@ fn register_metal_view_class() -> &'static Class {
                     // Get the string from the NSString first (before any handler access)
                     let utf8: *const std::os::raw::c_char = msg_send![text, UTF8String];
                     if utf8.is_null() {
-                        ios_log_cstr(c"GPUI iOS: insertText - UTF8String is null!");
                         return;
                     }
 
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
+                    let dictation_expected = text_input_context_expects_dictation();
+                    let (pending_dictation_insert, insert_text_dictation_active) =
+                        dictation_insert_flags(this);
+                    let buffer_as_dictation = should_buffer_insert_text_as_dictation(
+                        dictation_expected,
+                        pending_dictation_insert,
+                        insert_text_dictation_active,
+                    );
+                    if buffer_as_dictation
+                        && should_ignore_late_dictation_insert(
+                            recently_committed_streamed_dictation(this),
+                            insert_text_dictation_active,
+                        )
+                    {
+                        set_pending_dictation_insert(this, false);
+                        set_streamed_dictation_committed(this, false);
+                        return;
+                    }
 
                     // First try the input handler directly (for text fields)
                     // This is the preferred path for software keyboard input.
@@ -922,19 +1114,26 @@ fn register_metal_view_class() -> &'static Class {
                     if with_input_handler(this, |_handler| ()).is_some() {
                         notify_text_and_selection_change(this, || {
                             let _ = with_input_handler(this, |handler| {
-                                handler.replace_text_in_range(None, &text_str);
+                                if buffer_as_dictation {
+                                    set_pending_dictation_insert(this, false);
+                                    set_insert_text_dictation_active(this, true);
+                                    handler.dictation_started();
+                                    handler.insert_dictation_text(&text_str);
+                                } else {
+                                    set_pending_dictation_insert(this, false);
+                                    handler.replace_text_in_range(None, &text_str);
+                                }
                             });
                         });
                         return;
                     }
 
+                    set_pending_dictation_insert(this, false);
+
                     // Fallback: with_input_handler returned None (no handler set)
                     // Send as key events for non-input-handler scenarios
                     let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
                     if window_ptr.is_null() {
-                        ios_log_cstr(
-                            c"GPUI iOS: insertText - window pointer is null for fallback!",
-                        );
                         return;
                     }
                     let window = &*(window_ptr as *const IosWindow);
@@ -1082,7 +1281,7 @@ fn register_metal_view_class() -> &'static Class {
 
             match result {
                 Ok(ptr) => ptr,
-                Err(_) => create_text_position(0), // Return position 0 on panic
+                Err(_) => create_text_position(0),
             }
         }
 
@@ -1216,7 +1415,7 @@ fn register_metal_view_class() -> &'static Class {
 
             match result {
                 Ok(ptr) => ptr,
-                Err(_) => std::ptr::null_mut(), // Return nil on panic
+                Err(_) => std::ptr::null_mut(),
             }
         }
 
@@ -1268,12 +1467,23 @@ fn register_metal_view_class() -> &'static Class {
                 let Some((start, end)) = get_range_indices(range) else {
                     return std::ptr::null_mut();
                 };
+                let requested_utf16_len = end.saturating_sub(start);
+                if should_mark_pending_dictation_insert(
+                    active_text_interaction_mode(this),
+                    software_keyboard_visible(),
+                    requested_utf16_len,
+                ) {
+                    set_pending_dictation_insert(this, true);
+                }
 
-                let text = with_input_handler(this, |handler| {
+                let handler_result = with_input_handler(this, |handler| {
                     let mut adjusted = None;
                     handler.text_for_range(start..end, &mut adjusted)
-                })
-                .flatten();
+                });
+                let text = match handler_result {
+                    Some(text) => text,
+                    None => None,
+                };
 
                 match text {
                     Some(s) => unsafe {
@@ -1303,14 +1513,12 @@ fn register_metal_view_class() -> &'static Class {
         ) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some((start, end)) = get_range_indices(range) else {
-                    ios_log_cstr(c"GPUI iOS: replaceRange:withText: - no valid range");
                     return;
                 };
 
                 unsafe {
                     let utf8: *const std::os::raw::c_char = msg_send![text, UTF8String];
                     if utf8.is_null() {
-                        ios_log_cstr(c"GPUI iOS: replaceRange:withText: - null text");
                         return;
                     }
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
@@ -1335,7 +1543,6 @@ fn register_metal_view_class() -> &'static Class {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 unsafe {
                     if marked_text.is_null() {
-                        ios_log_cstr(c"GPUI iOS: setMarkedText - unmarking (null text)");
                         // Unmark text
                         notify_text_and_selection_change(this, || {
                             let _ = with_input_handler(this, |handler| {
@@ -1356,7 +1563,6 @@ fn register_metal_view_class() -> &'static Class {
 
                     let utf8: *const std::os::raw::c_char = msg_send![text_obj, UTF8String];
                     if utf8.is_null() {
-                        ios_log_cstr(c"GPUI iOS: setMarkedText - null UTF8 string");
                         return;
                     }
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
@@ -1388,6 +1594,160 @@ fn register_metal_view_class() -> &'static Class {
                         handler.unmark_text();
                     });
                 });
+            }));
+        }
+
+        // UITextInput - insertDictationResult:
+        // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
+        extern "C" fn insert_dictation_result(
+            this: &mut Object,
+            _sel: Sel,
+            dictation_result: *mut Object,
+        ) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                let Some(text) = dictation_result_text(dictation_result) else {
+                    return;
+                };
+
+                let (_, insert_text_dictation_active) = dictation_insert_flags(this);
+                if should_ignore_late_dictation_insert(
+                    recently_committed_streamed_dictation(this),
+                    insert_text_dictation_active,
+                ) {
+                    set_streamed_dictation_committed(this, false);
+                    return;
+                }
+
+                let _ = with_input_handler(this, |handler| {
+                    handler.insert_dictation_text(&text);
+                    handler.dictation_ended();
+                });
+                set_insert_text_dictation_active(this, false);
+                set_streamed_dictation_committed(this, false);
+            }));
+        }
+
+        // UITextInput - dictationRecordingDidEnd
+        // This only means the microphone stopped recording. UIKit may still
+        // query and replace its live hypothesis before delivering the final
+        // insertDictationResult: or removing the placeholder, so keep the
+        // synthetic marked text alive here.
+        extern "C" fn dictation_recording_did_end(_this: &mut Object, _sel: Sel) {}
+
+        // UITextInput - dictationRecognitionFailed
+        // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
+        extern "C" fn dictation_recognition_failed(this: &mut Object, _sel: Sel) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = with_input_handler(this, |handler| {
+                    handler.dictation_cancelled();
+                });
+                set_insert_text_dictation_active(this, false);
+                set_streamed_dictation_committed(this, false);
+            }));
+        }
+
+        // UITextInput - insertDictationResultPlaceholder
+        // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
+        extern "C" fn insert_dictation_result_placeholder(this: &Object, _sel: Sel) -> *mut Object {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                set_pending_dictation_insert(this, true);
+                set_insert_text_dictation_active(this, true);
+                set_streamed_dictation_committed(this, false);
+                let _ = with_input_handler(this, |handler| {
+                    handler.dictation_started();
+                });
+
+                this as *const Object as *mut Object
+            }));
+
+            result.unwrap_or(ptr::null_mut())
+        }
+
+        // UITextInput - frameForDictationResultPlaceholder:
+        extern "C" fn frame_for_dictation_result_placeholder(
+            this: &Object,
+            _sel: Sel,
+            _placeholder: *mut Object,
+        ) -> IOSCGRect {
+            let default_rect = IOSCGRect::new(IOSCGPoint::new(0.0, 0.0), IOSCGSize::new(0.0, 0.0));
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let bounds = with_input_handler(this, |handler| {
+                    let range = handler
+                        .selected_text_range(false)
+                        .map(|selection| {
+                            if selection.reversed {
+                                selection.range.start..selection.range.start
+                            } else {
+                                selection.range.end..selection.range.end
+                            }
+                        })
+                        .unwrap_or(0..0);
+                    handler.bounds_for_range(range)
+                })
+                .flatten();
+
+                match bounds {
+                    Some(bounds) => IOSCGRect::new(
+                        IOSCGPoint::new(
+                            bounds.origin.x.as_f32() as f64,
+                            bounds.origin.y.as_f32() as f64,
+                        ),
+                        IOSCGSize::new(
+                            bounds.size.width.as_f32() as f64,
+                            bounds.size.height.as_f32() as f64,
+                        ),
+                    ),
+                    None => default_rect,
+                }
+            }));
+
+            result.unwrap_or(default_rect)
+        }
+
+        // UITextInput - removeDictationResultPlaceholder:willInsertResult:
+        // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
+        extern "C" fn remove_dictation_result_placeholder(
+            this: &mut Object,
+            _sel: Sel,
+            _placeholder: *mut Object,
+            will_insert_result: BOOL,
+        ) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                let (_, insert_text_dictation_active) = dictation_insert_flags(this);
+                let action = dictation_placeholder_removal_action(
+                    will_insert_result == YES,
+                    insert_text_dictation_active,
+                );
+                let _ = with_input_handler(this, |handler| {
+                    match action {
+                        DictationPlaceholderRemovalAction::WaitForInsertDictationResult => {
+                            // Critical: when UIKit promises a final
+                            // insertDictationResult:, placeholder removal is
+                            // only an ordering step. Committing here can send
+                            // stale partial text before the final result lands.
+                        }
+                        DictationPlaceholderRemovalAction::CommitStreamedHypothesis => {
+                            // Critical: for custom UITextInput clients, UIKit
+                            // can stream the hypothesis through marked text and
+                            // then remove the placeholder with
+                            // willInsertResult=false. That is not cancellation;
+                            // the current marked text is the final transcript.
+                            handler.dictation_ended();
+                            set_streamed_dictation_committed(this, true);
+                        }
+                        DictationPlaceholderRemovalAction::Cancel => {
+                            handler.dictation_cancelled();
+                            set_streamed_dictation_committed(this, false);
+                        }
+                    }
+                });
+                if matches!(
+                    action,
+                    DictationPlaceholderRemovalAction::WaitForInsertDictationResult
+                ) {
+                    set_streamed_dictation_committed(this, false);
+                }
+                set_insert_text_dictation_active(this, false);
             }));
         }
 
@@ -1973,6 +2333,32 @@ fn register_metal_view_class() -> &'static Class {
                 unmark_text as extern "C" fn(&mut Object, Sel),
             );
             decl.add_method(
+                sel!(insertDictationResult:),
+                insert_dictation_result as extern "C" fn(&mut Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(dictationRecordingDidEnd),
+                dictation_recording_did_end as extern "C" fn(&mut Object, Sel),
+            );
+            decl.add_method(
+                sel!(dictationRecognitionFailed),
+                dictation_recognition_failed as extern "C" fn(&mut Object, Sel),
+            );
+            decl.add_method(
+                sel!(insertDictationResultPlaceholder),
+                insert_dictation_result_placeholder as extern "C" fn(&Object, Sel) -> *mut Object,
+            );
+            decl.add_method(
+                sel!(frameForDictationResultPlaceholder:),
+                frame_for_dictation_result_placeholder
+                    as extern "C" fn(&Object, Sel, *mut Object) -> IOSCGRect,
+            );
+            decl.add_method(
+                sel!(removeDictationResultPlaceholder:willInsertResult:),
+                remove_dictation_result_placeholder
+                    as extern "C" fn(&mut Object, Sel, *mut Object, BOOL),
+            );
+            decl.add_method(
                 sel!(attributedSubstringFromRange:),
                 attributed_substring_from_range
                     as extern "C" fn(&Object, Sel, *mut Object) -> *mut Object,
@@ -2262,6 +2648,17 @@ pub(crate) struct IosWindow {
     /// The active route for UIKit text callbacks; editable mode does not currently
     /// install UIKit's editable selection interaction on `view`.
     active_text_interaction_mode: Cell<i8>,
+    /// Set when UIKit has just queried a wide dictation context range and the
+    /// next insertText callback should be treated as a provisional hypothesis.
+    pending_dictation_insert: Cell<bool>,
+    pending_dictation_insert_at: Cell<Option<Instant>>,
+    /// Tracks dictation streams that arrive through insertText rather than
+    /// insertDictationResult.
+    insert_text_dictation_active: Cell<bool>,
+    /// Set briefly after committing a streamed hypothesis from
+    /// removeDictationResultPlaceholder(willInsertResult=false) so late native
+    /// final-result callbacks from the same stop action can be ignored.
+    streamed_dictation_committed_at: Cell<Option<Instant>>,
     selectable_text_hit_regions: RefCell<SmallVec<[SelectableTextHitRegion; 8]>>,
     last_selection_geometry: RefCell<Option<SelectionGeometry>>,
     /// Callback for frame requests
@@ -2431,6 +2828,10 @@ impl IosWindow {
                 noneditable_text_interaction,
                 target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
                 active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                pending_dictation_insert: Cell::new(false),
+                pending_dictation_insert_at: Cell::new(None),
+                insert_text_dictation_active: Cell::new(false),
+                streamed_dictation_committed_at: Cell::new(None),
                 selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
@@ -2568,6 +2969,10 @@ impl IosWindow {
                 noneditable_text_interaction,
                 target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
                 active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                pending_dictation_insert: Cell::new(false),
+                pending_dictation_insert_at: Cell::new(None),
+                insert_text_dictation_active: Cell::new(false),
+                streamed_dictation_committed_at: Cell::new(None),
                 selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
@@ -2669,9 +3074,9 @@ impl IosWindow {
 
     /// Applies the active text mode without changing GPUI's desired mode.
     ///
-    /// Editable input stays first responder for keyboard and IME callbacks, but
-    /// does not install UIKit's editable `UITextInteraction` until GPUI supports
-    /// native selection for input handlers.
+    /// Editable input installs UIKit's text interaction for keyboard, IME, and
+    /// dictation plumbing, while the delegate still blocks native touch selection
+    /// for current input handlers.
     fn install_text_interaction_mode(&self, mode: i8) {
         let previous_mode = self.active_text_interaction_mode.get();
         if previous_mode == mode {
@@ -2690,6 +3095,11 @@ impl IosWindow {
             }
 
             match mode {
+                TEXT_INTERACTION_EDITABLE => {
+                    let _: () =
+                        msg_send![self.view, addInteraction: self.editable_text_interaction];
+                    allow_gpui_touch_delivery_while_text_interaction_recognizes(self.view);
+                }
                 TEXT_INTERACTION_NONEDITABLE => {
                     let _: () =
                         msg_send![self.view, addInteraction: self.noneditable_text_interaction];
@@ -3659,6 +4069,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wide_context_query_marks_pending_dictation_insert() {
+        assert!(should_mark_pending_dictation_insert(
+            TEXT_INTERACTION_EDITABLE,
+            true,
+            1000
+        ));
+        assert!(!should_mark_pending_dictation_insert(
+            TEXT_INTERACTION_EDITABLE,
+            true,
+            999
+        ));
+        assert!(!should_mark_pending_dictation_insert(
+            TEXT_INTERACTION_EDITABLE,
+            false,
+            1000
+        ));
+        assert!(!should_mark_pending_dictation_insert(
+            TEXT_INTERACTION_NONEDITABLE,
+            true,
+            1000
+        ));
+    }
+
+    #[test]
+    fn insert_text_buffers_dictation_from_native_context_probe_or_stream_state() {
+        assert!(should_buffer_insert_text_as_dictation(true, false, false));
+        assert!(should_buffer_insert_text_as_dictation(false, true, false));
+        assert!(should_buffer_insert_text_as_dictation(false, false, true));
+        assert!(!should_buffer_insert_text_as_dictation(false, false, false));
+    }
+
+    #[test]
+    fn late_dictation_insert_is_ignored_after_streamed_commit_only_when_stream_closed() {
+        assert!(should_ignore_late_dictation_insert(true, false));
+        assert!(!should_ignore_late_dictation_insert(true, true));
+        assert!(!should_ignore_late_dictation_insert(false, false));
+    }
+
+    #[test]
+    fn placeholder_removal_waits_when_final_dictation_result_is_promised() {
+        assert_eq!(
+            dictation_placeholder_removal_action(true, true),
+            DictationPlaceholderRemovalAction::WaitForInsertDictationResult
+        );
+        assert_eq!(
+            dictation_placeholder_removal_action(true, false),
+            DictationPlaceholderRemovalAction::WaitForInsertDictationResult
+        );
+    }
+
+    #[test]
+    fn placeholder_removal_commits_streamed_hypothesis_without_final_result() {
+        assert_eq!(
+            dictation_placeholder_removal_action(false, true),
+            DictationPlaceholderRemovalAction::CommitStreamedHypothesis
+        );
+    }
+
+    #[test]
+    fn placeholder_removal_cancels_when_no_stream_or_final_result_exists() {
+        assert_eq!(
+            dictation_placeholder_removal_action(false, false),
+            DictationPlaceholderRemovalAction::Cancel
+        );
+    }
+
+    #[test]
     fn editable_edit_menu_actions_are_disabled_for_current_inputs() {
         assert_eq!(
             edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true),
@@ -3768,7 +4245,7 @@ mod tests {
         let plan = text_input_refresh_plan(true, false, true, true, true, false);
 
         assert!(plan.keyboard_session_requested);
-        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_EDITABLE);
         assert_eq!(
             plan.responder_action,
             TextInputResponderAction::ShowKeyboard
@@ -3780,7 +4257,7 @@ mod tests {
         let plan = text_input_refresh_plan(true, false, true, true, true, true);
 
         assert!(plan.keyboard_session_requested);
-        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_EDITABLE);
         assert_eq!(plan.responder_action, TextInputResponderAction::None);
     }
 

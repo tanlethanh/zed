@@ -1276,6 +1276,36 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    pub fn dictation_started(&mut self) {
+        self.cx
+            .update(|window, cx| self.handler.borrow_mut().dictation_started(window, cx))
+            .ok();
+    }
+
+    pub fn insert_dictation_text(&mut self, text: &str) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .insert_dictation_text(text, window, cx);
+            })
+            .ok();
+    }
+
+    pub fn dictation_ended(&mut self) {
+        self.cx
+            .update(|window, cx| self.handler.borrow_mut().dictation_ended(window, cx))
+            .ok();
+    }
+
+    pub fn dictation_cancelled(&mut self) {
+        self.cx
+            .update(|window, cx| {
+                self.handler.borrow_mut().dictation_cancelled(window, cx);
+            })
+            .ok();
+    }
+
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn unmark_text(&mut self) {
         self.cx
@@ -1471,6 +1501,20 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     );
+
+    /// Called when the platform starts a native dictation insertion session.
+    fn dictation_started(&mut self, _window: &mut Window, _cx: &mut App) {}
+
+    /// Inserts recognized native dictation text.
+    fn insert_dictation_text(&mut self, text: &str, window: &mut Window, cx: &mut App) {
+        self.replace_text_in_range(None, text, window, cx);
+    }
+
+    /// Called when the platform finishes a native dictation insertion session.
+    fn dictation_ended(&mut self, _window: &mut Window, _cx: &mut App) {}
+
+    /// Called when the platform abandons a native dictation insertion session.
+    fn dictation_cancelled(&mut self, _window: &mut Window, _cx: &mut App) {}
 
     /// Remove the IME 'composing' state from the document
     /// Corresponds to [unmarkText()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438239-unmarktext)
