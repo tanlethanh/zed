@@ -50,6 +50,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tracing::info;
 
 const GPUI_VIEW_IVAR: &str = "gpui_view";
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
@@ -615,6 +616,7 @@ fn set_pending_dictation_insert(view: &Object, pending: bool) {
         window
             .pending_dictation_insert_at
             .set(pending.then(Instant::now));
+        info!(pending, "KeyboardDebug ios set_pending_dictation_insert");
     }
 }
 
@@ -628,6 +630,7 @@ fn set_insert_text_dictation_active(view: &Object, active: bool) {
             window.pending_dictation_insert.set(false);
             window.pending_dictation_insert_at.set(None);
         }
+        info!(active, "KeyboardDebug ios set_insert_text_dictation_active");
     }
 }
 
@@ -636,6 +639,10 @@ fn set_streamed_dictation_committed(view: &Object, committed: bool) {
         window
             .streamed_dictation_committed_at
             .set(committed.then(Instant::now));
+        info!(
+            committed,
+            "KeyboardDebug ios set_streamed_dictation_committed"
+        );
     }
 }
 
@@ -1171,12 +1178,27 @@ fn register_metal_view_class() -> &'static Class {
                         pending_dictation_insert,
                         insert_text_dictation_active,
                     );
+                    let recently_committed_streamed = if buffer_as_dictation {
+                        recently_committed_streamed_dictation(this)
+                    } else {
+                        false
+                    };
+                    info!(
+                        text = %text_str,
+                        dictation_expected,
+                        pending_dictation_insert,
+                        insert_text_dictation_active,
+                        buffer_as_dictation,
+                        recently_committed_streamed,
+                        "KeyboardDebug ios insert_text"
+                    );
                     if buffer_as_dictation
                         && should_ignore_late_dictation_insert(
-                            recently_committed_streamed_dictation(this),
+                            recently_committed_streamed,
                             insert_text_dictation_active,
                         )
                     {
+                        info!(text = %text_str, "KeyboardDebug ios insert_text ignore_late_dictation_insert");
                         set_pending_dictation_insert(this, false);
                         set_streamed_dictation_committed(this, false);
                         return;
@@ -1186,7 +1208,9 @@ fn register_metal_view_class() -> &'static Class {
                     // This is the preferred path for software keyboard input.
                     // Uses with_input_handler which releases the borrow during callback
                     // to prevent conflicts when iOS queries multiple UITextInput methods.
-                    if with_input_handler(this, |_handler| ()).is_some() {
+                    let has_input_handler = with_input_handler(this, |_handler| ()).is_some();
+                    info!(has_input_handler, "KeyboardDebug ios insert_text handler_probe");
+                    if has_input_handler {
                         notify_text_and_selection_change(this, || {
                             let _ = with_input_handler(this, |handler| {
                                 if buffer_as_dictation {
@@ -1267,9 +1291,11 @@ fn register_metal_view_class() -> &'static Class {
                 let delta_ms = now_ms.saturating_sub(last_ms);
 
                 if last_ms != 0 && delta_ms == 0 {
+                    info!("KeyboardDebug ios delete_backward deduped");
                     return;
                 }
                 LAST_DELETE_TIME_MS.store(now_ms, Ordering::SeqCst);
+                info!("KeyboardDebug ios delete_backward");
 
                 // Route software-keyboard deletes through the active GPUI input handler.
                 // The callback mirror keeps this available across GPUI's per-frame take/set cycle.
@@ -1530,6 +1556,7 @@ fn register_metal_view_class() -> &'static Class {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let range =
                     with_input_handler(this, |handler| handler.marked_text_range()).flatten();
+                info!(range = ?range, "KeyboardDebug ios marked_text_range");
 
                 match range {
                     Some(r) => create_text_range(r.start, r.end),
@@ -1592,22 +1619,35 @@ fn register_metal_view_class() -> &'static Class {
                     return std::ptr::null_mut();
                 };
                 let requested_utf16_len = end.saturating_sub(start);
-                if should_mark_pending_dictation_insert(
+                let should_mark_pending = should_mark_pending_dictation_insert(
                     active_text_interaction_mode(this),
                     software_keyboard_visible(),
                     requested_utf16_len,
-                ) {
+                );
+                info!(
+                    range = ?(start..end),
+                    requested_utf16_len,
+                    should_mark_pending,
+                    "KeyboardDebug ios text_in_range request"
+                );
+                if should_mark_pending {
                     set_pending_dictation_insert(this, true);
                 }
 
+                let mut adjusted = None;
                 let handler_result = with_input_handler(this, |handler| {
-                    let mut adjusted = None;
                     handler.text_for_range(start..end, &mut adjusted)
                 });
                 let text = match handler_result {
                     Some(text) => text,
                     None => None,
                 };
+                info!(
+                    range = ?(start..end),
+                    adjusted_range = ?adjusted,
+                    text = ?text,
+                    "KeyboardDebug ios text_in_range response"
+                );
 
                 match text {
                     Some(s) => unsafe {
@@ -1646,10 +1686,15 @@ fn register_metal_view_class() -> &'static Class {
                         return;
                     }
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
+                    info!(
+                        range = ?(start..end),
+                        text = %text_str,
+                        "KeyboardDebug ios replace_range_with_text"
+                    );
 
                     notify_text_and_selection_change(this, || {
                         let _ = with_input_handler(this, |handler| {
-                            handler.replace_text_in_range(Some(start..end), &text_str);
+                            handler.replace_text_in_range_from_context(Some(start..end), &text_str);
                         });
                     });
                 }
@@ -1668,6 +1713,7 @@ fn register_metal_view_class() -> &'static Class {
                 unsafe {
                     if marked_text.is_null() {
                         // Unmark text
+                        info!("KeyboardDebug ios set_marked_text null_unmark");
                         notify_text_and_selection_change(this, || {
                             let _ = with_input_handler(this, |handler| {
                                 handler.unmark_text();
@@ -1699,6 +1745,12 @@ fn register_metal_view_class() -> &'static Class {
                     } else {
                         None
                     };
+                    info!(
+                        text = %text_str,
+                        selected_range = ?selected,
+                        is_attributed = is_attributed == YES,
+                        "KeyboardDebug ios set_marked_text"
+                    );
 
                     notify_text_and_selection_change(this, || {
                         let _ = with_input_handler(this, |handler| {
@@ -1713,6 +1765,7 @@ fn register_metal_view_class() -> &'static Class {
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn unmark_text(this: &mut Object, _sel: Sel) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                info!("KeyboardDebug ios unmark_text");
                 notify_text_and_selection_change(this, || {
                     let _ = with_input_handler(this, |handler| {
                         handler.unmark_text();
@@ -1730,14 +1783,23 @@ fn register_metal_view_class() -> &'static Class {
         ) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some(text) = dictation_result_text(dictation_result) else {
+                    info!("KeyboardDebug ios insert_dictation_result missing_text");
                     return;
                 };
 
                 let (_, insert_text_dictation_active) = dictation_insert_flags(this);
+                let recently_committed_streamed = recently_committed_streamed_dictation(this);
+                info!(
+                    text = %text,
+                    insert_text_dictation_active,
+                    recently_committed_streamed,
+                    "KeyboardDebug ios insert_dictation_result"
+                );
                 if should_ignore_late_dictation_insert(
-                    recently_committed_streamed_dictation(this),
+                    recently_committed_streamed,
                     insert_text_dictation_active,
                 ) {
+                    info!(text = %text, "KeyboardDebug ios insert_dictation_result ignore_late");
                     set_streamed_dictation_committed(this, false);
                     return;
                 }
@@ -1756,12 +1818,30 @@ fn register_metal_view_class() -> &'static Class {
         // query and replace its live hypothesis before delivering the final
         // insertDictationResult: or removing the placeholder, so keep the
         // synthetic marked text alive here.
-        extern "C" fn dictation_recording_did_end(_this: &mut Object, _sel: Sel) {}
+        extern "C" fn dictation_recording_did_end(this: &mut Object, _sel: Sel) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                let (pending_dictation_insert, insert_text_dictation_active) =
+                    ios_window_for_view(this)
+                        .map(|window| {
+                            (
+                                window.pending_dictation_insert.get(),
+                                window.insert_text_dictation_active.get(),
+                            )
+                        })
+                        .unwrap_or((false, false));
+                info!(
+                    pending_dictation_insert,
+                    insert_text_dictation_active,
+                    "KeyboardDebug ios dictation_recording_did_end"
+                );
+            }));
+        }
 
         // UITextInput - dictationRecognitionFailed
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn dictation_recognition_failed(this: &mut Object, _sel: Sel) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                info!("KeyboardDebug ios dictation_recognition_failed");
                 let _ = with_input_handler(this, |handler| {
                     handler.dictation_cancelled();
                 });
@@ -1774,6 +1854,7 @@ fn register_metal_view_class() -> &'static Class {
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn insert_dictation_result_placeholder(this: &Object, _sel: Sel) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                info!("KeyboardDebug ios insert_dictation_result_placeholder");
                 set_pending_dictation_insert(this, true);
                 set_insert_text_dictation_active(this, true);
                 set_streamed_dictation_committed(this, false);
@@ -1841,6 +1922,12 @@ fn register_metal_view_class() -> &'static Class {
                 let action = dictation_placeholder_removal_action(
                     will_insert_result == YES,
                     insert_text_dictation_active,
+                );
+                info!(
+                    will_insert_result = will_insert_result == YES,
+                    insert_text_dictation_active,
+                    action = ?action,
+                    "KeyboardDebug ios remove_dictation_result_placeholder"
                 );
                 let _ = with_input_handler(this, |handler| {
                     match action {

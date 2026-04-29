@@ -1260,6 +1260,20 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    pub fn replace_text_in_range_from_context(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+    ) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .replace_text_in_range_from_context(replacement_range, text, window, cx);
+            })
+            .ok();
+    }
+
     pub fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -1601,6 +1615,21 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     );
+
+    /// Replace text from a native text-system context rewrite.
+    /// Corresponds to UIKit's replaceRange:withText: path, used by IMEs,
+    /// autocorrect, and smart substitutions.
+    ///
+    /// replacement_range is in terms of UTF-16 characters
+    fn replace_text_in_range_from_context(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.replace_text_in_range(replacement_range, text, window, cx);
+    }
 
     /// Replace the text in the given document range with the given text,
     /// and mark the given text as part of an IME 'composing' state
