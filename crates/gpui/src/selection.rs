@@ -1083,9 +1083,9 @@ mod tests {
     use crate::EntityId;
     use crate::{
         self as gpui, AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement,
-        InteractiveText, IntoElement, Modifiers, ParentElement, PointerButton, PointerDownEvent,
-        PointerKind, PointerUpEvent, Render, Styled, StyledText, TestAppContext, TextLayout,
-        Window, div, point, px, selection_area,
+        InteractiveText, IntoElement, Modifiers, ParentElement, Pixels, PointerButton,
+        PointerDownEvent, PointerKind, PointerUpEvent, Render, Styled, StyledText, TestAppContext,
+        TextLayout, Window, div, point, px, selection_area,
     };
     use std::{
         cell::{Cell, RefCell},
@@ -1176,6 +1176,7 @@ mod tests {
     struct LinkSelectionTestView {
         link_presses: Rc<Cell<usize>>,
         layout: Rc<RefCell<Option<TextLayout>>>,
+        link_hit_slop: Option<Pixels>,
     }
 
     impl Render for LinkSelectionTestView {
@@ -1185,15 +1186,17 @@ mod tests {
                 .selectable()
                 .selection_separator_after("\n");
             self.layout.borrow_mut().replace(text.layout().clone());
+            let mut link = InteractiveText::new("selection-link", text).on_click(
+                vec![5..9],
+                move |_, _, _| {
+                    link_presses.set(link_presses.get() + 1);
+                },
+            );
+            if let Some(hit_slop) = self.link_hit_slop {
+                link = link.hit_slop(hit_slop);
+            }
 
-            selection_area(div().w(px(240.0)).child(
-                InteractiveText::new("selection-link", text).on_click(
-                    vec![5..9],
-                    move |_, _, _| {
-                        link_presses.set(link_presses.get() + 1);
-                    },
-                ),
-            ))
+            selection_area(div().w(px(240.0)).child(link))
         }
     }
 
@@ -1644,6 +1647,7 @@ mod tests {
                 cx.new(|_| LinkSelectionTestView {
                     link_presses: link_presses.clone(),
                     layout: layout.clone(),
+                    link_hit_slop: None,
                 })
             })
             .unwrap()
@@ -1669,6 +1673,43 @@ mod tests {
         let selection_claimed_touch = selection_handler_claims_point(cx, window, link_point);
         assert!(!selection_claimed_touch);
         simulate_primary_click(cx, window, link_point);
+
+        assert_eq!(link_presses.get(), 1);
+    }
+
+    #[gpui::test]
+    fn interactive_text_link_hit_slop_takes_precedence_over_selection(cx: &mut TestAppContext) {
+        let link_presses = Rc::new(Cell::new(0));
+        let layout = Rc::new(RefCell::new(None));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| LinkSelectionTestView {
+                    link_presses: link_presses.clone(),
+                    layout: layout.clone(),
+                    link_hit_slop: Some(px(8.0)),
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let window = *window;
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        let link_bounds = *layout
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .rects_for_range(5..9)
+            .first()
+            .unwrap();
+        let slop_point = point(link_bounds.right() + px(4.0), link_bounds.center().y);
+
+        assert!(!selection_fast_hit_cache_claims_point(
+            cx, window, slop_point
+        ));
+        simulate_primary_click(cx, window, slop_point);
 
         assert_eq!(link_presses.get(), 1);
     }

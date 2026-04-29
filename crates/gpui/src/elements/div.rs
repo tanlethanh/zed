@@ -3332,10 +3332,16 @@ impl Interactivity {
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                if phase == DispatchPhase::Bubble
+                    && !window.default_prevented()
+                    && hitbox.should_handle_scroll(window)
+                {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
-                    let delta = event.delta.pixel_delta(line_height);
+                    let mut delta = event.delta.pixel_delta(line_height);
+                    if restrict_scroll_to_axis {
+                        delta = restrict_scroll_delta_to_primary_axis(delta);
+                    }
 
                     let mut delta_x = Pixels::ZERO;
                     if overflow.x == Overflow::Scroll {
@@ -3363,6 +3369,7 @@ impl Interactivity {
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
+                        window.prevent_default();
                         cx.notify(current_view);
                     }
                 }
@@ -3988,6 +3995,18 @@ where
     }
 }
 
+fn restrict_scroll_delta_to_primary_axis(delta: Point<Pixels>) -> Point<Pixels> {
+    if delta.x.is_zero() || delta.y.is_zero() {
+        return delta;
+    }
+
+    if delta.x.abs() > delta.y.abs() {
+        point(delta.x, Pixels::ZERO)
+    } else {
+        point(Pixels::ZERO, delta.y)
+    }
+}
+
 /// Represents an element that can be scrolled *to* in its parent element.
 /// Contrary to [ScrollHandle::scroll_to_active_item], an anchored element does not have to be an immediate child of the parent.
 #[derive(Clone)]
@@ -4486,6 +4505,22 @@ mod tests {
         handle.scroll_to_active_item();
 
         assert_eq!(handle.offset().y, px(-25.));
+    }
+
+    #[test]
+    fn restrict_scroll_delta_to_primary_axis_filters_cross_axis_drift() {
+        assert_eq!(
+            restrict_scroll_delta_to_primary_axis(point(px(3.), px(24.))),
+            point(px(0.), px(24.))
+        );
+        assert_eq!(
+            restrict_scroll_delta_to_primary_axis(point(px(24.), px(3.))),
+            point(px(24.), px(0.))
+        );
+        assert_eq!(
+            restrict_scroll_delta_to_primary_axis(point(px(0.), px(12.))),
+            point(px(0.), px(12.))
+        );
     }
 
     fn setup_tooltip_owner_test() -> (
