@@ -901,7 +901,16 @@ fn selection_area_is_occluded_at_point(
     hit_test.ids.iter().any(|hitbox_id| {
         window.rendered_frame.hitboxes[hitbox_end..]
             .iter()
-            .any(|hitbox| hitbox.id == *hitbox_id)
+            .any(|hitbox| {
+                hitbox.id == *hitbox_id
+                    // Later normal hitboxes can be gesture affordances such as
+                    // a drawer edge strip; only explicit blockers should
+                    // suppress native selection.
+                    && matches!(
+                        hitbox.behavior,
+                        HitboxBehavior::BlockMouse | HitboxBehavior::BlockMouseExceptScroll
+                    )
+            })
     })
 }
 
@@ -1229,6 +1238,36 @@ mod tests {
                         .absolute()
                         .inset_0()
                         .occlude()
+                        .on_press(move |_, _, _| {
+                            overlay_presses.set(overlay_presses.get() + 1);
+                        })
+                        .child("Overlay"),
+                )
+        }
+    }
+
+    struct NormalOverlaySelectionTestView {
+        overlay_presses: Rc<Cell<usize>>,
+    }
+
+    impl Render for NormalOverlaySelectionTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let overlay_presses = self.overlay_presses.clone();
+
+            div()
+                .relative()
+                .w(px(240.0))
+                .h(px(80.0))
+                .child(selection_area(
+                    div()
+                        .size_full()
+                        .child(StyledText::new("selectable").selectable()),
+                ))
+                .child(
+                    div()
+                        .id("normal-overlay")
+                        .absolute()
+                        .inset_0()
                         .on_press(move |_, _, _| {
                             overlay_presses.set(overlay_presses.get() + 1);
                         })
@@ -1862,6 +1901,39 @@ mod tests {
 
         assert_eq!(overlay_presses.get(), 1);
         assert_eq!(selection_presses.get(), 0);
+    }
+
+    #[gpui::test]
+    fn selection_handler_ignores_normal_overlay_above_selection_area(cx: &mut TestAppContext) {
+        let overlay_presses = Rc::new(Cell::new(0));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| NormalOverlaySelectionTestView {
+                    overlay_presses: overlay_presses.clone(),
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let window = *window;
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        let selection_point = cx
+            .update_window(window, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                document.bounds_for_range(0..1).unwrap().center()
+            })
+            .unwrap();
+
+        assert!(selection_fast_hit_cache_claims_point(
+            cx,
+            window,
+            selection_point
+        ));
+        assert!(selection_handler_claims_point(cx, window, selection_point));
+        assert_eq!(overlay_presses.get(), 0);
     }
 
     fn open_pressable_selection_test_window(

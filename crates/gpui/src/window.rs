@@ -961,6 +961,14 @@ fn selectable_text_occluding_bounds(
         .collect::<SmallVec<[Bounds<Pixels>; 4]>>();
 
     bounds.extend(frame.hitboxes[hitbox_end..].iter().filter_map(|hitbox| {
+        // Later normal hitboxes can be gesture affordances such as a drawer
+        // edge strip; only explicit blockers should suppress native selection.
+        if !matches!(
+            hitbox.behavior,
+            HitboxBehavior::BlockMouse | HitboxBehavior::BlockMouseExceptScroll
+        ) {
+            return None;
+        }
         let bounds = hitbox.interaction_bounds();
         bounds.intersects(&text_bounds).then_some(bounds)
     }));
