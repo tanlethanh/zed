@@ -50,7 +50,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::info;
 
 const GPUI_VIEW_IVAR: &str = "gpui_view";
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
@@ -182,6 +181,11 @@ fn should_use_system_keyboard(
 
 fn handles_native_touch_selection(interaction_mode: i8) -> bool {
     interaction_mode == TEXT_INTERACTION_NONEDITABLE
+}
+
+fn should_report_text_input_range_geometry(interaction_mode: i8) -> bool {
+    interaction_mode == TEXT_INTERACTION_EDITABLE
+        || handles_native_touch_selection(interaction_mode)
 }
 
 fn should_begin_text_interaction(interaction_mode: i8, hit_selectable_text: bool) -> bool {
@@ -616,7 +620,6 @@ fn set_pending_dictation_insert(view: &Object, pending: bool) {
         window
             .pending_dictation_insert_at
             .set(pending.then(Instant::now));
-        info!(pending, "KeyboardDebug ios set_pending_dictation_insert");
     }
 }
 
@@ -629,8 +632,9 @@ fn set_insert_text_dictation_active(view: &Object, active: bool) {
         if !active {
             window.pending_dictation_insert.set(false);
             window.pending_dictation_insert_at.set(None);
+            window.pending_text_input_change.borrow_mut().take();
+            window.native_text_rewrite_active.set(false);
         }
-        info!(active, "KeyboardDebug ios set_insert_text_dictation_active");
     }
 }
 
@@ -639,10 +643,6 @@ fn set_streamed_dictation_committed(view: &Object, committed: bool) {
         window
             .streamed_dictation_committed_at
             .set(committed.then(Instant::now));
-        info!(
-            committed,
-            "KeyboardDebug ios set_streamed_dictation_committed"
-        );
     }
 }
 
@@ -673,6 +673,29 @@ fn should_mark_pending_dictation_insert(
         && requested_utf16_len >= 1000
 }
 
+fn should_begin_pending_dictation_from_text_probe(
+    should_mark_pending: bool,
+    recently_committed_streamed_dictation: bool,
+) -> bool {
+    should_mark_pending && !recently_committed_streamed_dictation
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeDictationInputState {
+    context_expected: bool,
+    input_mode_dictation: bool,
+}
+
+impl NativeDictationInputState {
+    fn expects_dictation(self) -> bool {
+        self.context_expected || self.input_mode_dictation
+    }
+}
+
+fn primary_language_expects_dictation(primary_language: Option<&str>) -> bool {
+    primary_language.is_some_and(|language| language.eq_ignore_ascii_case("dictation"))
+}
+
 fn should_buffer_insert_text_as_dictation(
     dictation_expected: bool,
     pending_dictation_insert: bool,
@@ -681,11 +704,191 @@ fn should_buffer_insert_text_as_dictation(
     dictation_expected || pending_dictation_insert || insert_text_dictation_active
 }
 
+fn should_route_unconfirmed_insert_as_dictation(
+    confirmed_text_change: bool,
+    dictation_expected: bool,
+    pending_dictation_insert: bool,
+    insert_text_dictation_active: bool,
+    recently_committed_streamed_dictation: bool,
+    text: &str,
+) -> bool {
+    !confirmed_text_change
+        && !text.is_empty()
+        && !should_buffer_insert_text_as_dictation(
+            dictation_expected,
+            pending_dictation_insert,
+            insert_text_dictation_active,
+        )
+        && !recently_committed_streamed_dictation
+}
+
+fn should_route_context_rewrite_as_live_dictation(
+    dictation_expected: bool,
+    pending_dictation_insert: bool,
+    insert_text_dictation_active: bool,
+    recently_committed_streamed_dictation: bool,
+) -> bool {
+    should_buffer_insert_text_as_dictation(
+        dictation_expected,
+        pending_dictation_insert,
+        insert_text_dictation_active,
+    ) && !should_ignore_late_dictation_insert(
+        recently_committed_streamed_dictation,
+        insert_text_dictation_active,
+    )
+}
+
 fn should_ignore_late_dictation_insert(
     recently_committed_streamed_dictation: bool,
     insert_text_dictation_active: bool,
 ) -> bool {
     recently_committed_streamed_dictation && !insert_text_dictation_active
+}
+
+fn should_ignore_late_insert_text_after_streamed_dictation(
+    recently_committed_streamed_dictation: bool,
+    insert_text_dictation_active: bool,
+    confirmed_text_change: bool,
+) -> bool {
+    recently_committed_streamed_dictation && !insert_text_dictation_active && !confirmed_text_change
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingTextInputChange {
+    range: Option<Range<usize>>,
+    text: String,
+}
+
+fn set_pending_text_input_change(view: &Object, range: Option<Range<usize>>, text: String) {
+    if let Some(window) = ios_window_for_view(view) {
+        window
+            .pending_text_input_change
+            .replace(Some(PendingTextInputChange { range, text }));
+        window.native_text_rewrite_active.set(false);
+    }
+}
+
+fn take_pending_text_input_change(view: &Object) -> Option<PendingTextInputChange> {
+    let window = ios_window_for_view(view)?;
+    window.pending_text_input_change.borrow_mut().take()
+}
+
+fn clear_pending_text_input_change(view: &Object) {
+    if let Some(window) = ios_window_for_view(view) {
+        window.pending_text_input_change.borrow_mut().take();
+        window.native_text_rewrite_active.set(false);
+    }
+}
+
+fn mark_native_text_rewrite_active(view: &Object) {
+    let Some(window) = ios_window_for_view(view) else {
+        return;
+    };
+
+    let pending_text_input_change = window.pending_text_input_change.borrow();
+    if should_clear_native_text_rewrite_for_delete(pending_text_input_change.as_ref()) {
+        drop(pending_text_input_change);
+        // Critical: a plain backspace preflight has no replacement text. Do not
+        // leave rewrite state armed for a later unconfirmed dictation insert.
+        window.pending_text_input_change.borrow_mut().take();
+        window.native_text_rewrite_active.set(false);
+        return;
+    }
+
+    if should_mark_native_text_rewrite_active_for_delete(
+        pending_text_input_change.as_ref(),
+        window.native_text_rewrite_active.get(),
+    ) {
+        window.native_text_rewrite_active.set(true);
+    }
+}
+
+fn native_text_rewrite_active(view: &Object) -> bool {
+    ios_window_for_view(view).is_some_and(|window| window.native_text_rewrite_active.get())
+}
+
+fn should_keep_native_text_rewrite_active(
+    pending_exists: bool,
+    exact_pending_insert: bool,
+    rewrite_active: bool,
+) -> bool {
+    (pending_exists || rewrite_active) && !(exact_pending_insert && !rewrite_active)
+}
+
+fn should_clear_native_text_rewrite_for_delete(pending: Option<&PendingTextInputChange>) -> bool {
+    pending.is_some_and(|pending| pending.text.is_empty())
+}
+
+fn should_mark_native_text_rewrite_active_for_delete(
+    pending: Option<&PendingTextInputChange>,
+    rewrite_active: bool,
+) -> bool {
+    !should_clear_native_text_rewrite_for_delete(pending) && (rewrite_active || pending.is_some())
+}
+
+fn update_text_input_change_after_insert(
+    view: &Object,
+    pending: Option<&PendingTextInputChange>,
+    text: &str,
+) {
+    let Some(window) = ios_window_for_view(view) else {
+        return;
+    };
+
+    let rewrite_active = window.native_text_rewrite_active.get();
+    let exact_pending_insert = pending.is_some_and(|pending| pending.text == text);
+    window
+        .native_text_rewrite_active
+        .set(should_keep_native_text_rewrite_active(
+            pending.is_some(),
+            exact_pending_insert,
+            rewrite_active,
+        ));
+}
+
+fn offset_text_position_index(index: usize, offset: isize, document_len: usize) -> Option<usize> {
+    let index = isize::try_from(index).ok()?;
+    let result = index.checked_add(offset)?;
+    if result < 0 {
+        return None;
+    }
+
+    let result = usize::try_from(result).ok()?;
+    (result <= document_len).then_some(result)
+}
+
+fn text_position_index_at_range_offset(range: Range<usize>, offset: isize) -> Option<usize> {
+    let offset = usize::try_from(offset).ok()?;
+    let index = range.start.checked_add(offset)?;
+    (index <= range.end).then_some(index)
+}
+
+fn text_position_offset_in_range(index: usize, range: Range<usize>) -> Option<usize> {
+    (range.start <= index && index <= range.end).then_some(index - range.start)
+}
+
+fn text_character_range_by_extending_position(
+    index: usize,
+    direction: i64,
+    document_len: usize,
+) -> Option<Range<usize>> {
+    if index > document_len {
+        return None;
+    }
+
+    let range = match direction {
+        1 | 2 => index.saturating_sub(1)..index,
+        _ => index..(index + 1).min(document_len),
+    };
+    Some(range)
+}
+
+fn text_input_document_utf16_len(view: &Object) -> Option<usize> {
+    with_input_handler(view, |handler| handler.text_len_utf16()).flatten()
+}
+
+fn text_input_has_text(document_utf16_len: Option<usize>) -> bool {
+    document_utf16_len.is_some_and(|len| len > 0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -797,6 +1000,35 @@ fn text_input_context_expects_dictation() -> bool {
     }
 }
 
+fn text_input_mode_primary_language(view: &Object) -> Option<String> {
+    unsafe {
+        let mut input_mode: *mut Object = msg_send![view, textInputMode];
+        if input_mode.is_null() {
+            let Some(class) = Class::get("UITextInputMode") else {
+                return None;
+            };
+            input_mode = msg_send![class, currentInputMode];
+        }
+        if input_mode.is_null() {
+            return None;
+        }
+
+        let primary_language: *mut Object = msg_send![input_mode, primaryLanguage];
+        ns_string_to_rust_string(primary_language)
+    }
+}
+
+fn text_input_mode_expects_dictation(view: &Object) -> bool {
+    primary_language_expects_dictation(text_input_mode_primary_language(view).as_deref())
+}
+
+fn native_dictation_input_state(view: &Object) -> NativeDictationInputState {
+    NativeDictationInputState {
+        context_expected: text_input_context_expects_dictation(),
+        input_mode_dictation: text_input_mode_expects_dictation(view),
+    }
+}
+
 /// Shared zero-sized custom input view used for read-only selection sessions.
 /// Returning this from `inputView` keeps UIKit first-responder selection behavior
 /// alive without emitting keyboard show notifications for noneditable text.
@@ -859,17 +1091,35 @@ fn can_become_first_responder_for_gpui(view: &Object) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextInputMutationSource {
+    TextInputSystem,
+    External,
+}
+
+fn should_notify_text_input_delegate(source: TextInputMutationSource) -> bool {
+    source == TextInputMutationSource::External
+}
+
 fn notify_selection_change<F>(view: &Object, f: F)
+where
+    F: FnOnce(),
+{
+    notify_selection_change_from(view, TextInputMutationSource::External, f);
+}
+
+fn notify_selection_change_from<F>(view: &Object, source: TextInputMutationSource, f: F)
 where
     F: FnOnce(),
 {
     unsafe {
         let delegate = text_input_delegate(view);
-        if !delegate.is_null() {
+        let should_notify = should_notify_text_input_delegate(source);
+        if should_notify && !delegate.is_null() {
             let _: () = msg_send![delegate, selectionWillChange: view];
         }
         f();
-        if !delegate.is_null() {
+        if should_notify && !delegate.is_null() {
             let _: () = msg_send![delegate, selectionDidChange: view];
         }
     }
@@ -879,14 +1129,26 @@ fn notify_text_and_selection_change<F>(view: &Object, f: F)
 where
     F: FnOnce(),
 {
+    notify_text_and_selection_change_from(view, TextInputMutationSource::External, f);
+}
+
+fn notify_text_and_selection_change_from<F>(view: &Object, source: TextInputMutationSource, f: F)
+where
+    F: FnOnce(),
+{
     unsafe {
         let delegate = text_input_delegate(view);
-        if !delegate.is_null() {
+        let should_notify = should_notify_text_input_delegate(source);
+        if should_notify && !delegate.is_null() {
             let _: () = msg_send![delegate, textWillChange: view];
             let _: () = msg_send![delegate, selectionWillChange: view];
         }
+        // Critical: UIKit calls insertText/deleteBackward/replaceRange while it
+        // is already driving an IME transaction. Delegate change notifications
+        // are only for external edits; sending them here can make Telex commit
+        // the tone change one keystroke late.
         f();
-        if !delegate.is_null() {
+        if should_notify && !delegate.is_null() {
             let _: () = msg_send![delegate, selectionDidChange: view];
             let _: () = msg_send![delegate, textDidChange: view];
         }
@@ -1152,8 +1414,11 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // UIKeyInput protocol - hasText
-        extern "C" fn has_text(_this: &Object, _sel: Sel) -> bool {
-            true // Always return true to receive text input
+        extern "C" fn has_text(this: &Object, _sel: Sel) -> bool {
+            // Critical: this must reflect the synthetic UITextInput document.
+            // Returning true for an empty editable input confuses native delete
+            // and replay decisions during IME rewrites.
+            text_input_has_text(text_input_document_utf16_len(this))
         }
 
         // UIKeyInput protocol - insertText:
@@ -1170,37 +1435,52 @@ fn register_metal_view_class() -> &'static Class {
                     }
 
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
-                    let dictation_expected = text_input_context_expects_dictation();
+                    let native_dictation_state = native_dictation_input_state(this);
+                    let dictation_expected = native_dictation_state.expects_dictation();
                     let (pending_dictation_insert, insert_text_dictation_active) =
                         dictation_insert_flags(this);
-                    let buffer_as_dictation = should_buffer_insert_text_as_dictation(
+                    let native_buffer_as_dictation = should_buffer_insert_text_as_dictation(
                         dictation_expected,
                         pending_dictation_insert,
                         insert_text_dictation_active,
                     );
-                    let recently_committed_streamed = if buffer_as_dictation {
-                        recently_committed_streamed_dictation(this)
-                    } else {
-                        false
-                    };
-                    info!(
-                        text = %text_str,
-                        dictation_expected,
-                        pending_dictation_insert,
-                        insert_text_dictation_active,
-                        buffer_as_dictation,
-                        recently_committed_streamed,
-                        "KeyboardDebug ios insert_text"
+                    let pending_text_input_change = take_pending_text_input_change(this);
+                    let confirmed_text_change =
+                        pending_text_input_change.is_some() || native_text_rewrite_active(this);
+                    let recently_committed_streamed =
+                        if native_buffer_as_dictation || !confirmed_text_change {
+                            recently_committed_streamed_dictation(this)
+                        } else {
+                            false
+                        };
+                    update_text_input_change_after_insert(
+                        this,
+                        pending_text_input_change.as_ref(),
+                        &text_str,
                     );
-                    if buffer_as_dictation
-                        && should_ignore_late_dictation_insert(
+                    let route_unconfirmed_insert_as_dictation =
+                        should_route_unconfirmed_insert_as_dictation(
+                            confirmed_text_change,
+                            dictation_expected,
+                            pending_dictation_insert,
+                            insert_text_dictation_active,
+                            recently_committed_streamed,
+                            &text_str,
+                        );
+                    let buffer_as_dictation =
+                        native_buffer_as_dictation || route_unconfirmed_insert_as_dictation;
+                    let ignore_late_dictation_insert =
+                        should_ignore_late_insert_text_after_streamed_dictation(
                             recently_committed_streamed,
                             insert_text_dictation_active,
-                        )
-                    {
-                        info!(text = %text_str, "KeyboardDebug ios insert_text ignore_late_dictation_insert");
+                            confirmed_text_change,
+                        );
+                    let has_input_handler = with_input_handler(this, |_handler| ()).is_some();
+                    if ignore_late_dictation_insert {
+                        // Critical: UIKit may send a synthetic insertText and then
+                        // insertDictationResult after a streamed commit. Ignore this
+                        // unconfirmed insert but keep the guard alive for the final result.
                         set_pending_dictation_insert(this, false);
-                        set_streamed_dictation_committed(this, false);
                         return;
                     }
 
@@ -1208,22 +1488,29 @@ fn register_metal_view_class() -> &'static Class {
                     // This is the preferred path for software keyboard input.
                     // Uses with_input_handler which releases the borrow during callback
                     // to prevent conflicts when iOS queries multiple UITextInput methods.
-                    let has_input_handler = with_input_handler(this, |_handler| ()).is_some();
-                    info!(has_input_handler, "KeyboardDebug ios insert_text handler_probe");
                     if has_input_handler {
-                        notify_text_and_selection_change(this, || {
-                            let _ = with_input_handler(this, |handler| {
-                                if buffer_as_dictation {
-                                    set_pending_dictation_insert(this, false);
-                                    set_insert_text_dictation_active(this, true);
-                                    handler.dictation_started();
-                                    handler.insert_dictation_text(&text_str);
-                                } else {
-                                    set_pending_dictation_insert(this, false);
-                                    handler.replace_text_in_range(None, &text_str);
-                                }
-                            });
-                        });
+                        notify_text_and_selection_change_from(
+                            this,
+                            TextInputMutationSource::TextInputSystem,
+                            || {
+                                let _ = with_input_handler(this, |handler| {
+                                    if buffer_as_dictation {
+                                        // Critical: native dictation can stream through
+                                        // insertText before placeholder callbacks, and
+                                        // may be the only system text path that skips
+                                        // shouldChangeText. Keep it as marked text so
+                                        // UIKit can reconcile its last hypothesis.
+                                        set_pending_dictation_insert(this, false);
+                                        set_insert_text_dictation_active(this, true);
+                                        handler.dictation_started();
+                                        handler.insert_dictation_text(&text_str);
+                                    } else {
+                                        set_pending_dictation_insert(this, false);
+                                        handler.replace_text_in_range(None, &text_str);
+                                    }
+                                });
+                            },
+                        );
                         return;
                     }
 
@@ -1267,56 +1554,45 @@ fn register_metal_view_class() -> &'static Class {
             }));
         }
 
+        // UITextInput - insertText:alternatives:style:
+        // Some iOS text services use this richer insertion selector before
+        // falling back to plain insertText:. Route it through the same guarded path.
+        extern "C" fn insert_text_with_alternatives(
+            this: &mut Object,
+            _sel: Sel,
+            text: *mut Object,
+            _alternatives: *mut Object,
+            _style: i64,
+        ) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                let text_str = ns_string_to_rust_string(text);
+                if let Some(text_str) = text_str.as_ref() {
+                    set_pending_text_input_change(this, None, text_str.clone());
+                }
+                insert_text(this, sel!(insertText:), text);
+            }));
+        }
+
         // UIKeyInput protocol - deleteBackward
         // This is the ONLY path for backspace deletion - we skip backspace in pressesBegan
         // to avoid duplicate handling.
         //
-        // iOS sometimes calls deleteBackward twice for one user gesture.
-        // Ignore callbacks that land in the exact same millisecond while preserving
-        // native long-press repeat cadence.
         extern "C" fn delete_backward(this: &mut Object, _sel: Sel) {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            use std::time::{SystemTime, UNIX_EPOCH};
-
-            // Dedupe callbacks that land in the exact same millisecond.
-            // This keeps true key-repeat cadence untouched.
-            static LAST_DELETE_TIME_MS: AtomicU64 = AtomicU64::new(0);
-
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let last_ms = LAST_DELETE_TIME_MS.load(Ordering::SeqCst);
-                let delta_ms = now_ms.saturating_sub(last_ms);
-
-                if last_ms != 0 && delta_ms == 0 {
-                    info!("KeyboardDebug ios delete_backward deduped");
-                    return;
-                }
-                LAST_DELETE_TIME_MS.store(now_ms, Ordering::SeqCst);
-                info!("KeyboardDebug ios delete_backward");
-
                 // Route software-keyboard deletes through the active GPUI input handler.
                 // The callback mirror keeps this available across GPUI's per-frame take/set cycle.
-                if with_input_handler(this, |_handler| ()).is_some() {
-                    notify_text_and_selection_change(this, || {
-                        let _ = with_input_handler(this, |handler| {
-                            if let Some(selection) = handler.selected_text_range(false) {
-                                if selection.range.is_empty() {
-                                    if selection.range.start > 0 {
-                                        let delete_range =
-                                            selection.range.start - 1..selection.range.start;
-                                        handler.replace_text_in_range(Some(delete_range), "");
-                                        return;
-                                    }
-                                } else {
-                                    handler.replace_text_in_range(Some(selection.range), "");
-                                    return;
-                                }
-                            }
-                        });
-                    });
+                let has_input_handler = with_input_handler(this, |_handler| ()).is_some();
+                mark_native_text_rewrite_active(this);
+                if has_input_handler {
+                    notify_text_and_selection_change_from(
+                        this,
+                        TextInputMutationSource::TextInputSystem,
+                        || {
+                            let _ = with_input_handler(this, |handler| {
+                                handler.delete_backward();
+                            });
+                        },
+                    );
                 }
             }));
         }
@@ -1415,23 +1691,33 @@ fn register_metal_view_class() -> &'static Class {
         }
 
         // UITextInput - setSelectedTextRange:
-        // Propagated only while read-only native text selection is active.
         extern "C" fn set_selected_text_range(this: &mut Object, _sel: Sel, range: *mut Object) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                let interaction_mode = active_text_interaction_mode(this);
+                if !should_report_text_input_range_geometry(interaction_mode) {
                     return;
                 }
                 if let Some((start, end)) = get_range_indices(range) {
-                    notify_selection_change(this, || {
-                        let _ = with_input_handler(this, |handler| {
-                            handler.set_selected_text_range(start..end);
-                        });
-                    });
-                    unsafe {
-                        let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
-                        if !window_ptr.is_null() {
-                            let window = &*(window_ptr as *const IosWindow);
-                            window.cache_active_selection_range(start..end);
+                    // Critical: UIKit can move the caret inside an active IME
+                    // composition. Ignoring this for editable inputs leaves the
+                    // native tokenizer and GPUI shadow document out of sync.
+                    notify_selection_change_from(
+                        this,
+                        TextInputMutationSource::TextInputSystem,
+                        || {
+                            let _ = with_input_handler(this, |handler| {
+                                handler.set_selected_text_range(start..end);
+                            });
+                        },
+                    );
+                    if handles_native_touch_selection(interaction_mode) {
+                        unsafe {
+                            let window_ptr: *mut std::ffi::c_void =
+                                *this.get_ivar(GPUI_WINDOW_IVAR);
+                            if !window_ptr.is_null() {
+                                let window = &*(window_ptr as *const IosWindow);
+                                window.cache_active_selection_range(start..end);
+                            }
                         }
                     }
                 }
@@ -1556,7 +1842,6 @@ fn register_metal_view_class() -> &'static Class {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let range =
                     with_input_handler(this, |handler| handler.marked_text_range()).flatten();
-                info!(range = ?range, "KeyboardDebug ios marked_text_range");
 
                 match range {
                     Some(r) => create_text_range(r.start, r.end),
@@ -1578,6 +1863,16 @@ fn register_metal_view_class() -> &'static Class {
         // UITextInput - setMarkedTextStyle: (not used)
         extern "C" fn set_marked_text_style(_this: &mut Object, _sel: Sel, _style: *mut Object) {
             // No-op
+        }
+
+        // UITextInput - selectionAffinity
+        extern "C" fn selection_affinity(_this: &Object, _sel: Sel) -> i64 {
+            0 // UITextStorageDirectionForward
+        }
+
+        // UITextInput - setSelectionAffinity:
+        extern "C" fn set_selection_affinity(_this: &mut Object, _sel: Sel, _affinity: i64) {
+            // No-op. GPUI text handlers expose logical UTF-16 ranges only.
         }
 
         // UITextInput - inputDelegate (store reference to delegate)
@@ -1624,14 +1919,25 @@ fn register_metal_view_class() -> &'static Class {
                     software_keyboard_visible(),
                     requested_utf16_len,
                 );
-                info!(
-                    range = ?(start..end),
-                    requested_utf16_len,
+                let recently_committed_streamed = if should_mark_pending {
+                    recently_committed_streamed_dictation(this)
+                } else {
+                    false
+                };
+                let should_begin_pending = should_begin_pending_dictation_from_text_probe(
                     should_mark_pending,
-                    "KeyboardDebug ios text_in_range request"
+                    recently_committed_streamed,
                 );
-                if should_mark_pending {
+                if should_begin_pending {
                     set_pending_dictation_insert(this, true);
+                    let _ = with_input_handler(this, |handler| {
+                        handler.dictation_started();
+                    });
+                } else if should_mark_pending {
+                    // Critical: UIKit probes large ranges again while resolving a
+                    // just-committed streamed dictation. Do not treat those cleanup
+                    // reads as a new dictation session or the preview reopens.
+                    set_pending_dictation_insert(this, false);
                 }
 
                 let mut adjusted = None;
@@ -1642,12 +1948,6 @@ fn register_metal_view_class() -> &'static Class {
                     Some(text) => text,
                     None => None,
                 };
-                info!(
-                    range = ?(start..end),
-                    adjusted_range = ?adjusted,
-                    text = ?text,
-                    "KeyboardDebug ios text_in_range response"
-                );
 
                 match text {
                     Some(s) => unsafe {
@@ -1686,18 +1986,86 @@ fn register_metal_view_class() -> &'static Class {
                         return;
                     }
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
-                    info!(
-                        range = ?(start..end),
-                        text = %text_str,
-                        "KeyboardDebug ios replace_range_with_text"
+                    let native_dictation_state = native_dictation_input_state(this);
+                    let dictation_expected = native_dictation_state.expects_dictation();
+                    let (pending_dictation_insert, insert_text_dictation_active) =
+                        dictation_insert_flags(this);
+                    let recently_committed_streamed = recently_committed_streamed_dictation(this);
+                    let route_as_live_dictation = should_route_context_rewrite_as_live_dictation(
+                        dictation_expected,
+                        pending_dictation_insert,
+                        insert_text_dictation_active,
+                        recently_committed_streamed,
                     );
+                    notify_text_and_selection_change_from(
+                        this,
+                        TextInputMutationSource::TextInputSystem,
+                        || {
+                            let _ = with_input_handler(this, |handler| {
+                                if route_as_live_dictation {
+                                    // Critical: live dictation hypotheses can arrive
+                                    // through replaceRange, not only insertText. Keep
+                                    // them in the marked-text store so UIKit can find
+                                    // the previous hypothesis during reconciliation.
+                                    set_pending_dictation_insert(this, false);
+                                    set_insert_text_dictation_active(this, true);
+                                    handler.dictation_started();
+                                }
+                                handler.replace_text_in_range_from_context(
+                                    Some(start..end),
+                                    &text_str,
+                                );
+                            });
+                        },
+                    );
+                    clear_pending_text_input_change(this);
+                }
+            }));
+        }
 
-                    notify_text_and_selection_change(this, || {
-                        let _ = with_input_handler(this, |handler| {
-                            handler.replace_text_in_range_from_context(Some(start..end), &text_str);
-                        });
+        // UITextInput - shouldChangeTextInRange:replacementText:
+        extern "C" fn should_change_text_in_range(
+            this: &Object,
+            _sel: Sel,
+            range: *mut Object,
+            text: *mut Object,
+        ) -> BOOL {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+                let range = get_range_indices(range).map(|(start, end)| start..end);
+                let text_str = ns_string_to_rust_string(text).unwrap_or_default();
+                let native_dictation_state = native_dictation_input_state(this);
+                set_pending_text_input_change(this, range.clone(), text_str.clone());
+                if native_dictation_state.expects_dictation() {
+                    // Critical: UIKit may expose dictation only on the
+                    // shouldChangeText preflight. Persist that native signal so
+                    // the following insertText/replaceRange cannot leak to PTY.
+                    set_pending_dictation_insert(this, false);
+                    set_insert_text_dictation_active(this, true);
+                    let _ = with_input_handler(this, |handler| {
+                        handler.dictation_started();
                     });
                 }
+                // Critical: UIKit's text system asks this before native IME
+                // rewrites. Returning YES keeps replacement validation on the
+                // platform path instead of forcing language-specific handling.
+                YES
+            }));
+
+            result.unwrap_or(YES)
+        }
+
+        // UITextInput - replaceRange:withAttributedText:
+        // Keep attributed native replacements on the same context-rewrite path
+        // as plain replacements so IMEs and suggestions do not bypass the model.
+        extern "C" fn replace_range_with_attributed_text(
+            this: &mut Object,
+            _sel: Sel,
+            range: *mut Object,
+            attributed_text: *mut Object,
+        ) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+                let text: *mut Object = msg_send![attributed_text, string];
+                replace_range_with_text(this, sel!(replaceRange:withText:), range, text);
             }));
         }
 
@@ -1713,12 +2081,16 @@ fn register_metal_view_class() -> &'static Class {
                 unsafe {
                     if marked_text.is_null() {
                         // Unmark text
-                        info!("KeyboardDebug ios set_marked_text null_unmark");
-                        notify_text_and_selection_change(this, || {
-                            let _ = with_input_handler(this, |handler| {
-                                handler.unmark_text();
-                            });
-                        });
+                        notify_text_and_selection_change_from(
+                            this,
+                            TextInputMutationSource::TextInputSystem,
+                            || {
+                                let _ = with_input_handler(this, |handler| {
+                                    handler.unmark_text();
+                                });
+                            },
+                        );
+                        clear_pending_text_input_change(this);
                         return;
                     }
 
@@ -1745,19 +2117,46 @@ fn register_metal_view_class() -> &'static Class {
                     } else {
                         None
                     };
-                    info!(
-                        text = %text_str,
-                        selected_range = ?selected,
-                        is_attributed = is_attributed == YES,
-                        "KeyboardDebug ios set_marked_text"
-                    );
 
-                    notify_text_and_selection_change(this, || {
-                        let _ = with_input_handler(this, |handler| {
-                            handler.replace_and_mark_text_in_range(None, &text_str, selected);
-                        });
-                    });
+                    notify_text_and_selection_change_from(
+                        this,
+                        TextInputMutationSource::TextInputSystem,
+                        || {
+                            let _ = with_input_handler(this, |handler| {
+                                handler.replace_and_mark_text_in_range(None, &text_str, selected);
+                            });
+                        },
+                    );
                 }
+            }));
+        }
+
+        // UITextInput - setAttributedMarkedText:selectedRange:
+        // Some IMEs use attributed marked text for live composition. Preserve
+        // the same marked-text path instead of falling back to delete/insert.
+        extern "C" fn set_attributed_marked_text(
+            this: &mut Object,
+            _sel: Sel,
+            marked_text: *mut Object,
+            selected_range: NSRange,
+        ) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+                if marked_text.is_null() {
+                    set_marked_text(
+                        this,
+                        sel!(setMarkedText:selectedRange:),
+                        ptr::null_mut(),
+                        selected_range,
+                    );
+                    return;
+                }
+                let text: *mut Object = msg_send![marked_text, string];
+                set_marked_text(
+                    this,
+                    sel!(setMarkedText:selectedRange:),
+                    text,
+                    selected_range,
+                );
             }));
         }
 
@@ -1765,12 +2164,16 @@ fn register_metal_view_class() -> &'static Class {
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn unmark_text(this: &mut Object, _sel: Sel) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                info!("KeyboardDebug ios unmark_text");
-                notify_text_and_selection_change(this, || {
-                    let _ = with_input_handler(this, |handler| {
-                        handler.unmark_text();
-                    });
-                });
+                notify_text_and_selection_change_from(
+                    this,
+                    TextInputMutationSource::TextInputSystem,
+                    || {
+                        let _ = with_input_handler(this, |handler| {
+                            handler.unmark_text();
+                        });
+                    },
+                );
+                clear_pending_text_input_change(this);
             }));
         }
 
@@ -1783,23 +2186,18 @@ fn register_metal_view_class() -> &'static Class {
         ) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some(text) = dictation_result_text(dictation_result) else {
-                    info!("KeyboardDebug ios insert_dictation_result missing_text");
                     return;
                 };
 
                 let (_, insert_text_dictation_active) = dictation_insert_flags(this);
                 let recently_committed_streamed = recently_committed_streamed_dictation(this);
-                info!(
-                    text = %text,
-                    insert_text_dictation_active,
+                let ignore_late_dictation_insert = should_ignore_late_dictation_insert(
                     recently_committed_streamed,
-                    "KeyboardDebug ios insert_dictation_result"
+                    insert_text_dictation_active,
                 );
-                if should_ignore_late_dictation_insert(
-                    recently_committed_streamed,
-                    insert_text_dictation_active,
-                ) {
-                    info!(text = %text, "KeyboardDebug ios insert_dictation_result ignore_late");
+                if ignore_late_dictation_insert {
+                    // Critical: streamed dictation already committed through
+                    // marked text; a late final insert would duplicate PTY output.
                     set_streamed_dictation_committed(this, false);
                     return;
                 }
@@ -1820,20 +2218,9 @@ fn register_metal_view_class() -> &'static Class {
         // synthetic marked text alive here.
         extern "C" fn dictation_recording_did_end(this: &mut Object, _sel: Sel) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                let (pending_dictation_insert, insert_text_dictation_active) =
-                    ios_window_for_view(this)
-                        .map(|window| {
-                            (
-                                window.pending_dictation_insert.get(),
-                                window.insert_text_dictation_active.get(),
-                            )
-                        })
-                        .unwrap_or((false, false));
-                info!(
-                    pending_dictation_insert,
-                    insert_text_dictation_active,
-                    "KeyboardDebug ios dictation_recording_did_end"
-                );
+                let _ = with_input_handler(this, |handler| {
+                    handler.dictation_recording_ended();
+                });
             }));
         }
 
@@ -1841,7 +2228,6 @@ fn register_metal_view_class() -> &'static Class {
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn dictation_recognition_failed(this: &mut Object, _sel: Sel) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                info!("KeyboardDebug ios dictation_recognition_failed");
                 let _ = with_input_handler(this, |handler| {
                     handler.dictation_cancelled();
                 });
@@ -1854,7 +2240,6 @@ fn register_metal_view_class() -> &'static Class {
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn insert_dictation_result_placeholder(this: &Object, _sel: Sel) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                info!("KeyboardDebug ios insert_dictation_result_placeholder");
                 set_pending_dictation_insert(this, true);
                 set_insert_text_dictation_active(this, true);
                 set_streamed_dictation_committed(this, false);
@@ -1922,12 +2307,6 @@ fn register_metal_view_class() -> &'static Class {
                 let action = dictation_placeholder_removal_action(
                     will_insert_result == YES,
                     insert_text_dictation_active,
-                );
-                info!(
-                    will_insert_result = will_insert_result == YES,
-                    insert_text_dictation_active,
-                    action = ?action,
-                    "KeyboardDebug ios remove_dictation_result_placeholder"
                 );
                 let _ = with_input_handler(this, |handler| {
                     match action {
@@ -2006,7 +2385,7 @@ fn register_metal_view_class() -> &'static Class {
 
         // UITextInput - positionFromPosition:offset:
         extern "C" fn position_from_position_offset(
-            _this: &Object,
+            this: &Object,
             _sel: Sel,
             position: *mut Object,
             offset: isize,
@@ -2015,18 +2394,18 @@ fn register_metal_view_class() -> &'static Class {
                 return std::ptr::null_mut();
             };
 
-            let new_index = if offset >= 0 {
-                index.saturating_add(offset as usize)
-            } else {
-                index.saturating_sub((-offset) as usize)
+            let Some(document_len) = text_input_document_utf16_len(this) else {
+                return std::ptr::null_mut();
             };
-
+            let Some(new_index) = offset_text_position_index(index, offset, document_len) else {
+                return std::ptr::null_mut();
+            };
             create_text_position(new_index)
         }
 
         // UITextInput - positionFromPosition:inDirection:offset:
         extern "C" fn position_from_position_in_direction(
-            _this: &Object,
+            this: &Object,
             _sel: Sel,
             position: *mut Object,
             direction: i64, // UITextLayoutDirection
@@ -2043,18 +2422,19 @@ fn register_metal_view_class() -> &'static Class {
                 _ => offset.abs(),      // right/down = positive
             };
 
-            let new_index = if effective_offset >= 0 {
-                index.saturating_add(effective_offset as usize)
-            } else {
-                index.saturating_sub((-effective_offset) as usize)
+            let Some(document_len) = text_input_document_utf16_len(this) else {
+                return std::ptr::null_mut();
             };
-
+            let Some(new_index) = offset_text_position_index(index, effective_offset, document_len)
+            else {
+                return std::ptr::null_mut();
+            };
             create_text_position(new_index)
         }
 
         // UITextInput - textRangeFromPosition:toPosition:
         extern "C" fn text_range_from_position_to_position(
-            _this: &Object,
+            this: &Object,
             _sel: Sel,
             from: *mut Object,
             to: *mut Object,
@@ -2066,6 +2446,11 @@ fn register_metal_view_class() -> &'static Class {
                 return std::ptr::null_mut();
             };
 
+            if let Some(document_len) = text_input_document_utf16_len(this) {
+                if start > document_len || end > document_len {
+                    return std::ptr::null_mut();
+                }
+            }
             create_text_range(start.min(end), start.max(end))
         }
 
@@ -2084,11 +2469,12 @@ fn register_metal_view_class() -> &'static Class {
                 return 0;
             };
 
-            match a.cmp(&b) {
+            let result = match a.cmp(&b) {
                 std::cmp::Ordering::Less => -1,   // NSOrderedAscending
                 std::cmp::Ordering::Equal => 0,   // NSOrderedSame
                 std::cmp::Ordering::Greater => 1, // NSOrderedDescending
-            }
+            };
+            result
         }
 
         // UITextInput - offsetFromPosition:toPosition:
@@ -2105,12 +2491,13 @@ fn register_metal_view_class() -> &'static Class {
                 return 0;
             };
 
-            (end as isize) - (start as isize)
+            let result = (end as isize) - (start as isize);
+            result
         }
 
         // UITextInput - positionWithinRange:farthestInDirection:
         extern "C" fn position_within_range_farthest(
-            _this: &Object,
+            this: &Object,
             _sel: Sel,
             range: *mut Object,
             direction: i64,
@@ -2118,6 +2505,11 @@ fn register_metal_view_class() -> &'static Class {
             let Some((start, end)) = get_range_indices(range) else {
                 return std::ptr::null_mut();
             };
+            if let Some(document_len) = text_input_document_utf16_len(this) {
+                if start > document_len || end > document_len {
+                    return std::ptr::null_mut();
+                }
+            }
 
             // Direction: 0=right, 1=left, 2=up, 3=down
             let index = match direction {
@@ -2126,6 +2518,40 @@ fn register_metal_view_class() -> &'static Class {
             };
 
             create_text_position(index)
+        }
+
+        // UITextInput - positionWithinRange:atCharacterOffset:
+        extern "C" fn position_within_range_at_character_offset(
+            _this: &Object,
+            _sel: Sel,
+            range: *mut Object,
+            offset: isize,
+        ) -> *mut Object {
+            let Some((start, end)) = get_range_indices(range) else {
+                return std::ptr::null_mut();
+            };
+            let Some(index) = text_position_index_at_range_offset(start..end, offset) else {
+                return std::ptr::null_mut();
+            };
+            create_text_position(index)
+        }
+
+        // UITextInput - characterOffsetOfPosition:withinRange:
+        extern "C" fn character_offset_of_position_within_range(
+            _this: &Object,
+            _sel: Sel,
+            position: *mut Object,
+            range: *mut Object,
+        ) -> isize {
+            let Some(index) = get_position_index(position) else {
+                return -1;
+            };
+            let Some((start, end)) = get_range_indices(range) else {
+                return -1;
+            };
+            text_position_offset_in_range(index, start..end)
+                .and_then(|offset| isize::try_from(offset).ok())
+                .unwrap_or(-1)
         }
 
         // UITextInput - characterRangeByExtendingPosition:inDirection:
@@ -2151,10 +2577,12 @@ fn register_metal_view_class() -> &'static Class {
                 })
                 .unwrap_or(0);
 
-                match direction {
-                    1 | 2 => create_text_range(0, index), // left/up - to beginning
-                    _ => create_text_range(index, doc_end), // right/down - to end
-                }
+                let Some(range) =
+                    text_character_range_by_extending_position(index, direction, doc_end)
+                else {
+                    return std::ptr::null_mut();
+                };
+                create_text_range(range.start, range.end)
             }));
 
             match result {
@@ -2198,7 +2626,10 @@ fn register_metal_view_class() -> &'static Class {
             let empty_rect = IOSCGRect::new(IOSCGPoint::new(0.0, 0.0), IOSCGSize::new(0.0, 0.0));
 
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                // IME candidate UI needs firstRectForRange even when GPUI draws
+                // its own editable caret and selection handles.
+                let interaction_mode = active_text_interaction_mode(this);
+                if !should_report_text_input_range_geometry(interaction_mode) {
                     return empty_rect;
                 }
                 let Some((start, end)) = get_range_indices(range) else {
@@ -2454,6 +2885,11 @@ fn register_metal_view_class() -> &'static Class {
                 insert_text as extern "C" fn(&mut Object, Sel, *mut Object),
             );
             decl.add_method(
+                sel!(insertText:alternatives:style:),
+                insert_text_with_alternatives
+                    as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object, i64),
+            );
+            decl.add_method(
                 sel!(deleteBackward),
                 delete_backward as extern "C" fn(&mut Object, Sel),
             );
@@ -2516,6 +2952,14 @@ fn register_metal_view_class() -> &'static Class {
                 set_marked_text_style as extern "C" fn(&mut Object, Sel, *mut Object),
             );
             decl.add_method(
+                sel!(selectionAffinity),
+                selection_affinity as extern "C" fn(&Object, Sel) -> i64,
+            );
+            decl.add_method(
+                sel!(setSelectionAffinity:),
+                set_selection_affinity as extern "C" fn(&mut Object, Sel, i64),
+            );
+            decl.add_method(
                 sel!(inputDelegate),
                 input_delegate as extern "C" fn(&Object, Sel) -> *mut Object,
             );
@@ -2541,8 +2985,22 @@ fn register_metal_view_class() -> &'static Class {
                     as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
             );
             decl.add_method(
+                sel!(shouldChangeTextInRange:replacementText:),
+                should_change_text_in_range
+                    as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> BOOL,
+            );
+            decl.add_method(
+                sel!(replaceRange:withAttributedText:),
+                replace_range_with_attributed_text
+                    as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
+            );
+            decl.add_method(
                 sel!(setMarkedText:selectedRange:),
                 set_marked_text as extern "C" fn(&mut Object, Sel, *mut Object, NSRange),
+            );
+            decl.add_method(
+                sel!(setAttributedMarkedText:selectedRange:),
+                set_attributed_marked_text as extern "C" fn(&mut Object, Sel, *mut Object, NSRange),
             );
             decl.add_method(
                 sel!(unmarkText),
@@ -2611,6 +3069,16 @@ fn register_metal_view_class() -> &'static Class {
                 sel!(positionWithinRange:farthestInDirection:),
                 position_within_range_farthest
                     as extern "C" fn(&Object, Sel, *mut Object, i64) -> *mut Object,
+            );
+            decl.add_method(
+                sel!(positionWithinRange:atCharacterOffset:),
+                position_within_range_at_character_offset
+                    as extern "C" fn(&Object, Sel, *mut Object, isize) -> *mut Object,
+            );
+            decl.add_method(
+                sel!(characterOffsetOfPosition:withinRange:),
+                character_offset_of_position_within_range
+                    as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> isize,
             );
             decl.add_method(
                 sel!(characterRangeByExtendingPosition:inDirection:),
@@ -2882,6 +3350,12 @@ pub(crate) struct IosWindow {
     /// removeDictationResultPlaceholder(willInsertResult=false) so late native
     /// final-result callbacks from the same stop action can be ignored.
     streamed_dictation_committed_at: Cell<Option<Instant>>,
+    /// Last `shouldChangeTextInRange` validation expected to be followed by
+    /// ordinary keyboard/IME `insertText`.
+    pending_text_input_change: RefCell<Option<PendingTextInputChange>>,
+    /// True while UIKit is expanding a validated native IME rewrite into
+    /// delete/insert callbacks that may not text-match `shouldChangeText`.
+    native_text_rewrite_active: Cell<bool>,
     selectable_text_hit_regions: RefCell<SmallVec<[SelectableTextHitRegion; 8]>>,
     last_selection_geometry: RefCell<Option<SelectionGeometry>>,
     /// Callback for frame requests
@@ -3056,6 +3530,8 @@ impl IosWindow {
                 pending_dictation_insert_at: Cell::new(None),
                 insert_text_dictation_active: Cell::new(false),
                 streamed_dictation_committed_at: Cell::new(None),
+                pending_text_input_change: RefCell::new(None),
+                native_text_rewrite_active: Cell::new(false),
                 selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
@@ -3198,6 +3674,8 @@ impl IosWindow {
                 pending_dictation_insert_at: Cell::new(None),
                 insert_text_dictation_active: Cell::new(false),
                 streamed_dictation_committed_at: Cell::new(None),
+                pending_text_input_change: RefCell::new(None),
+                native_text_rewrite_active: Cell::new(false),
                 selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
@@ -4351,10 +4829,166 @@ mod tests {
     }
 
     #[test]
+    fn native_dictation_signal_includes_input_mode() {
+        assert!(primary_language_expects_dictation(Some("dictation")));
+        assert!(primary_language_expects_dictation(Some("DICTATION")));
+        assert!(!primary_language_expects_dictation(Some("en-US")));
+        assert!(!primary_language_expects_dictation(None));
+
+        assert!(
+            NativeDictationInputState {
+                context_expected: false,
+                input_mode_dictation: true,
+            }
+            .expects_dictation()
+        );
+        assert!(
+            NativeDictationInputState {
+                context_expected: true,
+                input_mode_dictation: false,
+            }
+            .expects_dictation()
+        );
+        assert!(
+            !NativeDictationInputState {
+                context_expected: false,
+                input_mode_dictation: false,
+            }
+            .expects_dictation()
+        );
+    }
+
+    #[test]
+    fn unconfirmed_insert_routes_as_dictation_transaction_not_phrase_shape() {
+        assert!(should_route_unconfirmed_insert_as_dictation(
+            false, false, false, false, false, "Hey"
+        ));
+        assert!(should_route_unconfirmed_insert_as_dictation(
+            false, false, false, false, false, "h"
+        ));
+        assert!(!should_route_unconfirmed_insert_as_dictation(
+            true, false, false, false, false, "Hey"
+        ));
+        assert!(!should_route_unconfirmed_insert_as_dictation(
+            false, true, false, false, false, "Hey"
+        ));
+        assert!(!should_route_unconfirmed_insert_as_dictation(
+            false, false, false, false, true, "Hey"
+        ));
+        assert!(!should_route_unconfirmed_insert_as_dictation(
+            false, false, false, false, false, ""
+        ));
+    }
+
+    #[test]
+    fn native_ime_rewrite_stays_confirmed_across_delete_insert_callbacks() {
+        assert!(
+            !should_keep_native_text_rewrite_active(true, true, false),
+            "ordinary key insert should not leave an IME rewrite open"
+        );
+        assert!(
+            should_keep_native_text_rewrite_active(true, false, false),
+            "validated Telex rewrite can insert different text than shouldChangeText"
+        );
+        assert!(
+            should_keep_native_text_rewrite_active(false, false, true),
+            "multi-step IME rewrite remains confirmed until unmarkText"
+        );
+    }
+
+    #[test]
+    fn delete_preflight_without_replacement_clears_native_rewrite_state() {
+        let plain_delete = PendingTextInputChange {
+            range: Some(1..2),
+            text: String::new(),
+        };
+        let rewrite_delete = PendingTextInputChange {
+            range: Some(1..2),
+            text: "o".to_string(),
+        };
+
+        assert!(should_clear_native_text_rewrite_for_delete(Some(
+            &plain_delete
+        )));
+        assert!(!should_mark_native_text_rewrite_active_for_delete(
+            Some(&plain_delete),
+            true
+        ));
+        assert!(!should_clear_native_text_rewrite_for_delete(Some(
+            &rewrite_delete
+        )));
+        assert!(should_mark_native_text_rewrite_active_for_delete(
+            Some(&rewrite_delete),
+            false
+        ));
+    }
+
+    #[test]
+    fn context_rewrite_routes_live_dictation_without_capturing_late_final_results() {
+        assert!(should_route_context_rewrite_as_live_dictation(
+            true, false, false, false
+        ));
+        assert!(should_route_context_rewrite_as_live_dictation(
+            false, true, false, false
+        ));
+        assert!(should_route_context_rewrite_as_live_dictation(
+            false, false, true, true
+        ));
+
+        assert!(!should_route_context_rewrite_as_live_dictation(
+            true, false, false, true
+        ));
+        assert!(!should_route_context_rewrite_as_live_dictation(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn context_rewrite_keeps_normal_ime_and_suggestions_off_dictation_path() {
+        assert!(!should_route_context_rewrite_as_live_dictation(
+            false, false, false, false
+        ));
+        assert!(!should_route_context_rewrite_as_live_dictation(
+            false, false, false, true
+        ));
+        assert!(should_report_text_input_range_geometry(
+            TEXT_INTERACTION_EDITABLE
+        ));
+    }
+
+    #[test]
+    fn dictation_text_probe_does_not_restart_after_recent_streamed_commit() {
+        assert!(should_begin_pending_dictation_from_text_probe(true, false));
+        assert!(!should_begin_pending_dictation_from_text_probe(true, true));
+        assert!(!should_begin_pending_dictation_from_text_probe(false, true));
+    }
+
+    #[test]
     fn late_dictation_insert_is_ignored_after_streamed_commit_only_when_stream_closed() {
         assert!(should_ignore_late_dictation_insert(true, false));
         assert!(!should_ignore_late_dictation_insert(true, true));
         assert!(!should_ignore_late_dictation_insert(false, false));
+    }
+
+    #[test]
+    fn unconfirmed_late_insert_text_after_streamed_commit_is_ignored_without_restarting_dictation()
+    {
+        assert!(should_ignore_late_insert_text_after_streamed_dictation(
+            true, false, false
+        ));
+        assert!(!should_route_unconfirmed_insert_as_dictation(
+            false, false, false, false, true, " "
+        ));
+
+        assert!(!should_ignore_late_insert_text_after_streamed_dictation(
+            true, false, true
+        ));
+        assert!(!should_ignore_late_insert_text_after_streamed_dictation(
+            true, true, false
+        ));
+        assert!(!should_ignore_late_insert_text_after_streamed_dictation(
+            false, false, false
+        ));
     }
 
     #[test]
@@ -4422,6 +5056,82 @@ mod tests {
     #[test]
     fn native_touch_selection_is_disabled_for_current_input_handlers() {
         assert!(!handles_native_touch_selection(TEXT_INTERACTION_EDITABLE));
+    }
+
+    #[test]
+    fn editable_input_still_reports_ime_range_geometry() {
+        assert!(should_report_text_input_range_geometry(
+            TEXT_INTERACTION_EDITABLE
+        ));
+        assert!(should_report_text_input_range_geometry(
+            TEXT_INTERACTION_NONEDITABLE
+        ));
+        assert!(!should_report_text_input_range_geometry(
+            TEXT_INTERACTION_NONE
+        ));
+    }
+
+    #[test]
+    fn text_input_system_mutations_do_not_notify_the_input_delegate() {
+        assert!(!should_notify_text_input_delegate(
+            TextInputMutationSource::TextInputSystem
+        ));
+        assert!(should_notify_text_input_delegate(
+            TextInputMutationSource::External
+        ));
+    }
+
+    #[test]
+    fn has_text_follows_the_current_text_input_document() {
+        assert!(!text_input_has_text(None));
+        assert!(!text_input_has_text(Some(0)));
+        assert!(text_input_has_text(Some(1)));
+    }
+
+    #[test]
+    fn text_position_offsets_stay_inside_document() {
+        assert_eq!(offset_text_position_index(3, -3, 3), Some(0));
+        assert_eq!(offset_text_position_index(3, 0, 3), Some(3));
+        assert_eq!(offset_text_position_index(0, 3, 3), Some(3));
+
+        // Critical: UITextInputStringTokenizer probes large offsets while
+        // computing language context. Returning impossible positions causes
+        // native IMEs to make decisions against invalid text ranges.
+        assert_eq!(offset_text_position_index(3, 300, 3), None);
+        assert_eq!(offset_text_position_index(0, -1, 3), None);
+    }
+
+    #[test]
+    fn tokenizer_offsets_stay_inside_requested_range() {
+        assert_eq!(text_position_index_at_range_offset(2..5, 0), Some(2));
+        assert_eq!(text_position_index_at_range_offset(2..5, 3), Some(5));
+        assert_eq!(text_position_index_at_range_offset(2..5, 4), None);
+        assert_eq!(text_position_index_at_range_offset(2..5, -1), None);
+
+        assert_eq!(text_position_offset_in_range(2, 2..5), Some(0));
+        assert_eq!(text_position_offset_in_range(5, 2..5), Some(3));
+        assert_eq!(text_position_offset_in_range(6, 2..5), None);
+    }
+
+    #[test]
+    fn character_range_by_extending_returns_adjacent_character() {
+        assert_eq!(
+            text_character_range_by_extending_position(2, 0, 4),
+            Some(2..3)
+        );
+        assert_eq!(
+            text_character_range_by_extending_position(2, 1, 4),
+            Some(1..2)
+        );
+        assert_eq!(
+            text_character_range_by_extending_position(0, 1, 4),
+            Some(0..0)
+        );
+        assert_eq!(
+            text_character_range_by_extending_position(4, 0, 4),
+            Some(4..4)
+        );
+        assert_eq!(text_character_range_by_extending_position(5, 0, 4), None);
     }
 
     #[test]

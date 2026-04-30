@@ -1247,6 +1247,13 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    pub fn text_len_utf16(&mut self) -> Option<usize> {
+        self.cx
+            .update(|window, cx| self.handler.borrow_mut().text_len_utf16(window, cx))
+            .ok()
+            .flatten()
+    }
+
     pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
@@ -1271,6 +1278,12 @@ impl PlatformInputHandler {
                     .borrow_mut()
                     .replace_text_in_range_from_context(replacement_range, text, window, cx);
             })
+            .ok();
+    }
+
+    pub fn delete_backward(&mut self) {
+        self.cx
+            .update(|window, cx| self.handler.borrow_mut().delete_backward(window, cx))
             .ok();
     }
 
@@ -1312,6 +1325,16 @@ impl PlatformInputHandler {
     pub fn dictation_ended(&mut self) {
         self.cx
             .update(|window, cx| self.handler.borrow_mut().dictation_ended(window, cx))
+            .ok();
+    }
+
+    pub fn dictation_recording_ended(&mut self) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .dictation_recording_ended(window, cx);
+            })
             .ok();
     }
 
@@ -1604,6 +1627,16 @@ pub trait InputHandler: 'static {
         cx: &mut App,
     ) -> Option<String>;
 
+    /// Get the current document length in UTF-16 code units.
+    ///
+    /// Platforms should use this for routine bounds checks and caret probes
+    /// instead of materializing the full document through `text_for_range`.
+    fn text_len_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
+        let mut adjusted_range = None;
+        let text = self.text_for_range(usize::MAX..usize::MAX, &mut adjusted_range, window, cx)?;
+        Some(adjusted_range.map_or_else(|| text.encode_utf16().count(), |range| range.end))
+    }
+
     /// Replace the text in the given document range with the given text
     /// Corresponds to [insertText(_:replacementRange:)](https://developer.apple.com/documentation/appkit/nstextinputclient/1438258-inserttext)
     ///
@@ -1631,6 +1664,31 @@ pub trait InputHandler: 'static {
         self.replace_text_in_range(replacement_range, text, window, cx);
     }
 
+    /// Delete one character or the current selection using the handler's native document model.
+    ///
+    /// Platforms with semantic delete callbacks should call this instead of
+    /// synthesizing a range edit themselves. Handlers without a real editable
+    /// document, such as terminals, can override this without exposing fake text
+    /// ranges to the platform IME.
+    fn delete_backward(&mut self, window: &mut Window, cx: &mut App) {
+        let Some(selection) = self.selected_text_range(false, window, cx) else {
+            return;
+        };
+
+        if selection.range.is_empty() {
+            if selection.range.start > 0 {
+                self.replace_text_in_range(
+                    Some(selection.range.start - 1..selection.range.start),
+                    "",
+                    window,
+                    cx,
+                );
+            }
+        } else {
+            self.replace_text_in_range(Some(selection.range), "", window, cx);
+        }
+    }
+
     /// Replace the text in the given document range with the given text,
     /// and mark the given text as part of an IME 'composing' state
     /// Corresponds to [setMarkedText(_:selectedRange:replacementRange:)](https://developer.apple.com/documentation/appkit/nstextinputclient/1438246-setmarkedtext)
@@ -1656,6 +1714,9 @@ pub trait InputHandler: 'static {
 
     /// Called when the platform finishes a native dictation insertion session.
     fn dictation_ended(&mut self, _window: &mut Window, _cx: &mut App) {}
+
+    /// Called when native dictation recording stops before final text reconciliation.
+    fn dictation_recording_ended(&mut self, _window: &mut Window, _cx: &mut App) {}
 
     /// Called when the platform abandons a native dictation insertion session.
     fn dictation_cancelled(&mut self, _window: &mut Window, _cx: &mut App) {}

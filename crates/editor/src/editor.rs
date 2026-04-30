@@ -28520,6 +28520,11 @@ impl EntityInputHandler for Editor {
         Some(snapshot.text_for_range(start..end).collect())
     }
 
+    fn text_len_utf16(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        let snapshot = self.buffer.read(cx).read(cx);
+        Some(snapshot.max_position::<MultiBufferOffsetUtf16>().0.0)
+    }
+
     fn selected_text_range(
         &mut self,
         ignore_disabled_input: bool,
