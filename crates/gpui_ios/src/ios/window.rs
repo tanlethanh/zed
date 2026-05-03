@@ -562,11 +562,23 @@ fn active_text_interaction_mode(view: &Object) -> i8 {
     }
 }
 
-fn selection_action_names(view: &Object) -> Vec<String> {
+fn selection_action_presentations(view: &Object) -> Vec<(String, Option<String>)> {
     if active_text_interaction_mode(view) != TEXT_INTERACTION_NONEDITABLE {
         return Vec::new();
     }
-    with_input_handler(view, |handler| handler.selection_action_names()).unwrap_or_default()
+    with_input_handler(view, |handler| {
+        handler
+            .selection_action_presentations()
+            .into_iter()
+            .map(|action| {
+                (
+                    action.name.to_string(),
+                    action.image_name.map(|image_name| image_name.to_string()),
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn perform_selection_menu_action(view: *mut Object, action_index: usize) {
@@ -1181,6 +1193,22 @@ fn ns_string_from_str(text: &str) -> *mut Object {
     unsafe { msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()] }
 }
 
+fn ui_image_from_name(name: &str) -> *mut Object {
+    let image_name = ns_string_from_str(name);
+    if image_name.is_null() {
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        let image: *mut Object = msg_send![class!(UIImage), imageNamed: image_name];
+        if !image.is_null() {
+            return image;
+        }
+
+        msg_send![class!(UIImage), systemImageNamed: image_name]
+    }
+}
+
 fn dictation_result_text(dictation_result: *mut Object) -> Option<String> {
     if dictation_result.is_null() {
         return None;
@@ -1761,8 +1789,8 @@ fn register_metal_view_class() -> &'static Class {
             suggested_actions: *mut Object,
         ) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                let action_names = selection_action_names(this);
-                if action_names.is_empty() {
+                let action_presentations = selection_action_presentations(this);
+                if action_presentations.is_empty() {
                     return ptr::null_mut();
                 }
 
@@ -1773,11 +1801,17 @@ fn register_metal_view_class() -> &'static Class {
                     }
 
                     let view = this as *const Object as *mut Object;
-                    for (action_index, action_name) in action_names.into_iter().enumerate() {
+                    for (action_index, (action_name, image_name)) in
+                        action_presentations.into_iter().enumerate()
+                    {
                         let title = ns_string_from_str(&action_name);
                         if title.is_null() {
                             continue;
                         }
+                        let image = image_name
+                            .as_deref()
+                            .map(ui_image_from_name)
+                            .unwrap_or(ptr::null_mut());
 
                         // UIAction handlers can run after this menu is built, so dispatch by index.
                         let block = ConcreteBlock::new(move |_action: *mut Object| {
@@ -1787,7 +1821,7 @@ fn register_metal_view_class() -> &'static Class {
                         let action: *mut Object = msg_send![
                             class!(UIAction),
                             actionWithTitle: title
-                            image: ptr::null_mut::<Object>()
+                            image: image
                             identifier: ptr::null_mut::<Object>()
                             handler: &*block
                         ];

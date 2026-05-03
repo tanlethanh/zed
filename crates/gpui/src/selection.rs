@@ -51,6 +51,28 @@ impl SelectionArea {
         self
     }
 
+    /// Append a custom action with a platform-native image name.
+    pub fn action_with_image(
+        mut self,
+        name: impl Into<SharedString>,
+        image_name: impl Into<SharedString>,
+        action: impl Action,
+    ) -> Self {
+        self.actions
+            .push(SelectionAction::new(name, action).image(image_name));
+        self
+    }
+
+    /// Append a custom action with a platform-native system image name.
+    pub fn action_with_system_image(
+        self,
+        name: impl Into<SharedString>,
+        system_image_name: impl Into<SharedString>,
+        action: impl Action,
+    ) -> Self {
+        self.action_with_image(name, system_image_name, action)
+    }
+
     /// Extend the selection menu with pre-built actions.
     pub fn with_actions(mut self, actions: impl IntoIterator<Item = SelectionAction>) -> Self {
         self.actions.extend(actions);
@@ -58,9 +80,19 @@ impl SelectionArea {
     }
 }
 
+/// Native menu presentation metadata for a selection action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionActionPresentation {
+    /// Title shown for this action in the native selection menu.
+    pub name: SharedString,
+    /// Optional platform-native image name shown beside this action.
+    pub image_name: Option<SharedString>,
+}
+
 /// A custom menu action attached to a selection area.
 pub struct SelectionAction {
     name: SharedString,
+    image_name: Option<SharedString>,
     action: Box<dyn Action>,
 }
 
@@ -69,13 +101,38 @@ impl SelectionAction {
     pub fn new(name: impl Into<SharedString>, action: impl Action) -> Self {
         Self {
             name: name.into(),
+            image_name: None,
             action: Box::new(action),
         }
+    }
+
+    /// Set the platform-native image name shown beside this action.
+    pub fn image(mut self, image_name: impl Into<SharedString>) -> Self {
+        self.image_name = Some(image_name.into());
+        self
+    }
+
+    /// Set the platform-native system image name shown beside this action.
+    pub fn system_image(self, system_image_name: impl Into<SharedString>) -> Self {
+        self.image(system_image_name)
     }
 
     /// Returns the title that should appear in the native selection menu.
     pub fn name(&self) -> &SharedString {
         &self.name
+    }
+
+    /// Returns the platform-native image name for the native selection menu.
+    pub fn image_name(&self) -> Option<&SharedString> {
+        self.image_name.as_ref()
+    }
+
+    /// Returns the native menu presentation metadata for this action.
+    pub fn presentation(&self) -> SelectionActionPresentation {
+        SelectionActionPresentation {
+            name: self.name.clone(),
+            image_name: self.image_name.clone(),
+        }
     }
 
     /// Returns the GPUI action to dispatch when this menu item is chosen.
@@ -88,6 +145,7 @@ impl Clone for SelectionAction {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
+            image_name: self.image_name.clone(),
             action: self.action.boxed_clone(),
         }
     }
@@ -999,6 +1057,29 @@ impl SelectionAreaElement {
         self
     }
 
+    /// Append a custom selection action with a platform-native image name.
+    pub fn action_with_image(
+        mut self,
+        name: impl Into<SharedString>,
+        image_name: impl Into<SharedString>,
+        action: impl Action,
+    ) -> Self {
+        self.selection_area
+            .actions
+            .push(SelectionAction::new(name, action).image(image_name));
+        self
+    }
+
+    /// Append a custom selection action with a platform-native system image name.
+    pub fn action_with_system_image(
+        self,
+        name: impl Into<SharedString>,
+        system_image_name: impl Into<SharedString>,
+        action: impl Action,
+    ) -> Self {
+        self.action_with_image(name, system_image_name, action)
+    }
+
     /// Extend this selection area with pre-built custom actions.
     pub fn with_actions(mut self, actions: impl IntoIterator<Item = SelectionAction>) -> Self {
         self.selection_area.actions.extend(actions);
@@ -1127,7 +1208,7 @@ mod tests {
     impl Render for SelectionActionTestView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             selection_area(div().child(StyledText::new("hello").selectable()))
-                .action("Add to Chat", SelectionMenuAction)
+                .action_with_system_image("Add to Chat", "plus.bubble", SelectionMenuAction)
                 .action("Other", OtherSelectionMenuAction)
         }
     }
@@ -1452,6 +1533,18 @@ mod tests {
             handler.selection_action_names(),
             vec!["Add to Chat", "Other"]
         );
+        let presentations = handler.selection_action_presentations();
+        assert_eq!(presentations[0].name.to_string(), "Add to Chat");
+        assert_eq!(
+            presentations[0]
+                .image_name
+                .as_ref()
+                .map(ToString::to_string),
+            Some("plus.bubble".to_string())
+        );
+        assert_eq!(presentations[1].name.to_string(), "Other");
+        assert!(presentations[1].image_name.is_none());
+
         handler.clear_selected_text_range();
         assert!(handler.selection_action_names().is_empty());
     }

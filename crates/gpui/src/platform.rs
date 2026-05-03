@@ -33,8 +33,9 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
     Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
-    SelectionAction, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab,
-    Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    SelectionAction, SelectionActionPresentation, ShapedGlyph, ShapedRun, SharedString, Size,
+    SvgRenderer, SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point,
+    px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -1464,13 +1465,20 @@ impl PlatformInputHandler {
     }
 
     pub fn selection_action_names(&mut self) -> Vec<String> {
+        self.selection_action_presentations()
+            .into_iter()
+            .map(|action| action.name.to_string())
+            .collect()
+    }
+
+    pub fn selection_action_presentations(&mut self) -> Vec<SelectionActionPresentation> {
         self.cx
             .update(|window, cx| {
                 self.handler
                     .borrow_mut()
                     .selection_actions(window, cx)
                     .into_iter()
-                    .map(|action| action.name().to_string())
+                    .map(|action| action.presentation())
                     .collect()
             })
             .unwrap_or_default()
