@@ -48,9 +48,7 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
 };
-
 const GPUI_VIEW_IVAR: &str = "gpui_view";
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
 
@@ -58,7 +56,6 @@ const FLING_THRESHOLD: f32 = 50.0;
 const TEXT_INTERACTION_NONE: i8 = -1;
 const TEXT_INTERACTION_NONEDITABLE: i8 = 0;
 const TEXT_INTERACTION_EDITABLE: i8 = 1;
-const PENDING_DICTATION_INSERT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditMenuActionPolicy {
@@ -606,258 +603,6 @@ fn ios_window_for_view(view: &Object) -> Option<&IosWindow> {
     }
 }
 
-fn dictation_insert_flags(view: &Object) -> (bool, bool) {
-    ios_window_for_view(view)
-        .map(|window| {
-            let pending = if window.pending_dictation_insert.get()
-                && window
-                    .pending_dictation_insert_at
-                    .get()
-                    .is_some_and(|at| at.elapsed() <= PENDING_DICTATION_INSERT_TIMEOUT)
-            {
-                true
-            } else {
-                window.pending_dictation_insert.set(false);
-                window.pending_dictation_insert_at.set(None);
-                false
-            };
-            (pending, window.insert_text_dictation_active.get())
-        })
-        .unwrap_or((false, false))
-}
-
-fn set_pending_dictation_insert(view: &Object, pending: bool) {
-    if let Some(window) = ios_window_for_view(view) {
-        window.pending_dictation_insert.set(pending);
-        window
-            .pending_dictation_insert_at
-            .set(pending.then(Instant::now));
-    }
-}
-
-fn set_insert_text_dictation_active(view: &Object, active: bool) {
-    if let Some(window) = ios_window_for_view(view) {
-        window.insert_text_dictation_active.set(active);
-        if active {
-            window.streamed_dictation_committed_at.set(None);
-        }
-        if !active {
-            window.pending_dictation_insert.set(false);
-            window.pending_dictation_insert_at.set(None);
-            window.pending_text_input_change.borrow_mut().take();
-            window.native_text_rewrite_active.set(false);
-        }
-    }
-}
-
-fn set_streamed_dictation_committed(view: &Object, committed: bool) {
-    if let Some(window) = ios_window_for_view(view) {
-        window
-            .streamed_dictation_committed_at
-            .set(committed.then(Instant::now));
-    }
-}
-
-fn recently_committed_streamed_dictation(view: &Object) -> bool {
-    ios_window_for_view(view)
-        .map(|window| {
-            if window
-                .streamed_dictation_committed_at
-                .get()
-                .is_some_and(|at| at.elapsed() <= PENDING_DICTATION_INSERT_TIMEOUT)
-            {
-                true
-            } else {
-                window.streamed_dictation_committed_at.set(None);
-                false
-            }
-        })
-        .unwrap_or(false)
-}
-
-fn should_mark_pending_dictation_insert(
-    interaction_mode: i8,
-    software_keyboard_visible: bool,
-    requested_utf16_len: usize,
-) -> bool {
-    interaction_mode == TEXT_INTERACTION_EDITABLE
-        && software_keyboard_visible
-        && requested_utf16_len >= 1000
-}
-
-fn should_begin_pending_dictation_from_text_probe(
-    should_mark_pending: bool,
-    recently_committed_streamed_dictation: bool,
-) -> bool {
-    should_mark_pending && !recently_committed_streamed_dictation
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct NativeDictationInputState {
-    context_expected: bool,
-    input_mode_dictation: bool,
-}
-
-impl NativeDictationInputState {
-    fn expects_dictation(self) -> bool {
-        self.context_expected || self.input_mode_dictation
-    }
-}
-
-fn primary_language_expects_dictation(primary_language: Option<&str>) -> bool {
-    primary_language.is_some_and(|language| language.eq_ignore_ascii_case("dictation"))
-}
-
-fn should_buffer_insert_text_as_dictation(
-    dictation_expected: bool,
-    pending_dictation_insert: bool,
-    insert_text_dictation_active: bool,
-) -> bool {
-    dictation_expected || pending_dictation_insert || insert_text_dictation_active
-}
-
-fn should_route_unconfirmed_insert_as_dictation(
-    confirmed_text_change: bool,
-    dictation_expected: bool,
-    pending_dictation_insert: bool,
-    insert_text_dictation_active: bool,
-    recently_committed_streamed_dictation: bool,
-    text: &str,
-) -> bool {
-    !confirmed_text_change
-        && !text.is_empty()
-        && !should_buffer_insert_text_as_dictation(
-            dictation_expected,
-            pending_dictation_insert,
-            insert_text_dictation_active,
-        )
-        && !recently_committed_streamed_dictation
-}
-
-fn should_route_context_rewrite_as_live_dictation(
-    dictation_expected: bool,
-    pending_dictation_insert: bool,
-    insert_text_dictation_active: bool,
-    recently_committed_streamed_dictation: bool,
-) -> bool {
-    should_buffer_insert_text_as_dictation(
-        dictation_expected,
-        pending_dictation_insert,
-        insert_text_dictation_active,
-    ) && !should_ignore_late_dictation_insert(
-        recently_committed_streamed_dictation,
-        insert_text_dictation_active,
-    )
-}
-
-fn should_ignore_late_dictation_insert(
-    recently_committed_streamed_dictation: bool,
-    insert_text_dictation_active: bool,
-) -> bool {
-    recently_committed_streamed_dictation && !insert_text_dictation_active
-}
-
-fn should_ignore_late_insert_text_after_streamed_dictation(
-    recently_committed_streamed_dictation: bool,
-    insert_text_dictation_active: bool,
-    confirmed_text_change: bool,
-) -> bool {
-    recently_committed_streamed_dictation && !insert_text_dictation_active && !confirmed_text_change
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingTextInputChange {
-    range: Option<Range<usize>>,
-    text: String,
-}
-
-fn set_pending_text_input_change(view: &Object, range: Option<Range<usize>>, text: String) {
-    if let Some(window) = ios_window_for_view(view) {
-        window
-            .pending_text_input_change
-            .replace(Some(PendingTextInputChange { range, text }));
-        window.native_text_rewrite_active.set(false);
-    }
-}
-
-fn take_pending_text_input_change(view: &Object) -> Option<PendingTextInputChange> {
-    let window = ios_window_for_view(view)?;
-    window.pending_text_input_change.borrow_mut().take()
-}
-
-fn clear_pending_text_input_change(view: &Object) {
-    if let Some(window) = ios_window_for_view(view) {
-        window.pending_text_input_change.borrow_mut().take();
-        window.native_text_rewrite_active.set(false);
-    }
-}
-
-fn mark_native_text_rewrite_active(view: &Object) {
-    let Some(window) = ios_window_for_view(view) else {
-        return;
-    };
-
-    let pending_text_input_change = window.pending_text_input_change.borrow();
-    if should_clear_native_text_rewrite_for_delete(pending_text_input_change.as_ref()) {
-        drop(pending_text_input_change);
-        // Critical: a plain backspace preflight has no replacement text. Do not
-        // leave rewrite state armed for a later unconfirmed dictation insert.
-        window.pending_text_input_change.borrow_mut().take();
-        window.native_text_rewrite_active.set(false);
-        return;
-    }
-
-    if should_mark_native_text_rewrite_active_for_delete(
-        pending_text_input_change.as_ref(),
-        window.native_text_rewrite_active.get(),
-    ) {
-        window.native_text_rewrite_active.set(true);
-    }
-}
-
-fn native_text_rewrite_active(view: &Object) -> bool {
-    ios_window_for_view(view).is_some_and(|window| window.native_text_rewrite_active.get())
-}
-
-fn should_keep_native_text_rewrite_active(
-    pending_exists: bool,
-    exact_pending_insert: bool,
-    rewrite_active: bool,
-) -> bool {
-    (pending_exists || rewrite_active) && !(exact_pending_insert && !rewrite_active)
-}
-
-fn should_clear_native_text_rewrite_for_delete(pending: Option<&PendingTextInputChange>) -> bool {
-    pending.is_some_and(|pending| pending.text.is_empty())
-}
-
-fn should_mark_native_text_rewrite_active_for_delete(
-    pending: Option<&PendingTextInputChange>,
-    rewrite_active: bool,
-) -> bool {
-    !should_clear_native_text_rewrite_for_delete(pending) && (rewrite_active || pending.is_some())
-}
-
-fn update_text_input_change_after_insert(
-    view: &Object,
-    pending: Option<&PendingTextInputChange>,
-    text: &str,
-) {
-    let Some(window) = ios_window_for_view(view) else {
-        return;
-    };
-
-    let rewrite_active = window.native_text_rewrite_active.get();
-    let exact_pending_insert = pending.is_some_and(|pending| pending.text == text);
-    window
-        .native_text_rewrite_active
-        .set(should_keep_native_text_rewrite_active(
-            pending.is_some(),
-            exact_pending_insert,
-            rewrite_active,
-        ));
-}
-
 fn offset_text_position_index(index: usize, offset: isize, document_len: usize) -> Option<usize> {
     let index = isize::try_from(index).ok()?;
     let result = index.checked_add(offset)?;
@@ -901,26 +646,6 @@ fn text_input_document_utf16_len(view: &Object) -> Option<usize> {
 
 fn text_input_has_text(document_utf16_len: Option<usize>) -> bool {
     document_utf16_len.is_some_and(|len| len > 0)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DictationPlaceholderRemovalAction {
-    WaitForInsertDictationResult,
-    CommitStreamedHypothesis,
-    Cancel,
-}
-
-fn dictation_placeholder_removal_action(
-    will_insert_result: bool,
-    insert_text_dictation_active: bool,
-) -> DictationPlaceholderRemovalAction {
-    if will_insert_result {
-        DictationPlaceholderRemovalAction::WaitForInsertDictationResult
-    } else if insert_text_dictation_active {
-        DictationPlaceholderRemovalAction::CommitStreamedHypothesis
-    } else {
-        DictationPlaceholderRemovalAction::Cancel
-    }
 }
 
 fn has_active_selection_geometry(view: &Object) -> bool {
@@ -995,49 +720,6 @@ fn autocapitalization_value(value: PlatformTextAutocapitalization) -> i64 {
         PlatformTextAutocapitalization::Words => 1,
         PlatformTextAutocapitalization::Sentences => 2,
         PlatformTextAutocapitalization::AllCharacters => 3,
-    }
-}
-
-fn text_input_context_expects_dictation() -> bool {
-    unsafe {
-        let Some(class) = Class::get("UITextInputContext") else {
-            return false;
-        };
-        let context: *mut Object = msg_send![class, current];
-        if context.is_null() {
-            return false;
-        }
-        let expected: BOOL = msg_send![context, isDictationInputExpected];
-        expected == YES
-    }
-}
-
-fn text_input_mode_primary_language(view: &Object) -> Option<String> {
-    unsafe {
-        let mut input_mode: *mut Object = msg_send![view, textInputMode];
-        if input_mode.is_null() {
-            let Some(class) = Class::get("UITextInputMode") else {
-                return None;
-            };
-            input_mode = msg_send![class, currentInputMode];
-        }
-        if input_mode.is_null() {
-            return None;
-        }
-
-        let primary_language: *mut Object = msg_send![input_mode, primaryLanguage];
-        ns_string_to_rust_string(primary_language)
-    }
-}
-
-fn text_input_mode_expects_dictation(view: &Object) -> bool {
-    primary_language_expects_dictation(text_input_mode_primary_language(view).as_deref())
-}
-
-fn native_dictation_input_state(view: &Object) -> NativeDictationInputState {
-    NativeDictationInputState {
-        context_expected: text_input_context_expects_dictation(),
-        input_mode_dictation: text_input_mode_expects_dictation(view),
     }
 }
 
@@ -1463,54 +1145,7 @@ fn register_metal_view_class() -> &'static Class {
                     }
 
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
-                    let native_dictation_state = native_dictation_input_state(this);
-                    let dictation_expected = native_dictation_state.expects_dictation();
-                    let (pending_dictation_insert, insert_text_dictation_active) =
-                        dictation_insert_flags(this);
-                    let native_buffer_as_dictation = should_buffer_insert_text_as_dictation(
-                        dictation_expected,
-                        pending_dictation_insert,
-                        insert_text_dictation_active,
-                    );
-                    let pending_text_input_change = take_pending_text_input_change(this);
-                    let confirmed_text_change =
-                        pending_text_input_change.is_some() || native_text_rewrite_active(this);
-                    let recently_committed_streamed =
-                        if native_buffer_as_dictation || !confirmed_text_change {
-                            recently_committed_streamed_dictation(this)
-                        } else {
-                            false
-                        };
-                    update_text_input_change_after_insert(
-                        this,
-                        pending_text_input_change.as_ref(),
-                        &text_str,
-                    );
-                    let route_unconfirmed_insert_as_dictation =
-                        should_route_unconfirmed_insert_as_dictation(
-                            confirmed_text_change,
-                            dictation_expected,
-                            pending_dictation_insert,
-                            insert_text_dictation_active,
-                            recently_committed_streamed,
-                            &text_str,
-                        );
-                    let buffer_as_dictation =
-                        native_buffer_as_dictation || route_unconfirmed_insert_as_dictation;
-                    let ignore_late_dictation_insert =
-                        should_ignore_late_insert_text_after_streamed_dictation(
-                            recently_committed_streamed,
-                            insert_text_dictation_active,
-                            confirmed_text_change,
-                        );
                     let has_input_handler = with_input_handler(this, |_handler| ()).is_some();
-                    if ignore_late_dictation_insert {
-                        // Critical: UIKit may send a synthetic insertText and then
-                        // insertDictationResult after a streamed commit. Ignore this
-                        // unconfirmed insert but keep the guard alive for the final result.
-                        set_pending_dictation_insert(this, false);
-                        return;
-                    }
 
                     // First try the input handler directly (for text fields)
                     // This is the preferred path for software keyboard input.
@@ -1522,27 +1157,12 @@ fn register_metal_view_class() -> &'static Class {
                             TextInputMutationSource::TextInputSystem,
                             || {
                                 let _ = with_input_handler(this, |handler| {
-                                    if buffer_as_dictation {
-                                        // Critical: native dictation can stream through
-                                        // insertText before placeholder callbacks, and
-                                        // may be the only system text path that skips
-                                        // shouldChangeText. Keep it as marked text so
-                                        // UIKit can reconcile its last hypothesis.
-                                        set_pending_dictation_insert(this, false);
-                                        set_insert_text_dictation_active(this, true);
-                                        handler.dictation_started();
-                                        handler.insert_dictation_text(&text_str);
-                                    } else {
-                                        set_pending_dictation_insert(this, false);
-                                        handler.replace_text_in_range(None, &text_str);
-                                    }
+                                    handler.insert_text(&text_str);
                                 });
                             },
                         );
                         return;
                     }
-
-                    set_pending_dictation_insert(this, false);
 
                     // Fallback: with_input_handler returned None (no handler set)
                     // Send as key events for non-input-handler scenarios
@@ -1593,10 +1213,6 @@ fn register_metal_view_class() -> &'static Class {
             _style: i64,
         ) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                let text_str = ns_string_to_rust_string(text);
-                if let Some(text_str) = text_str.as_ref() {
-                    set_pending_text_input_change(this, None, text_str.clone());
-                }
                 insert_text(this, sel!(insertText:), text);
             }));
         }
@@ -1610,7 +1226,6 @@ fn register_metal_view_class() -> &'static Class {
                 // Route software-keyboard deletes through the active GPUI input handler.
                 // The callback mirror keeps this available across GPUI's per-frame take/set cycle.
                 let has_input_handler = with_input_handler(this, |_handler| ()).is_some();
-                mark_native_text_rewrite_active(this);
                 if has_input_handler {
                     notify_text_and_selection_change_from(
                         this,
@@ -1947,32 +1562,6 @@ fn register_metal_view_class() -> &'static Class {
                 let Some((start, end)) = get_range_indices(range) else {
                     return std::ptr::null_mut();
                 };
-                let requested_utf16_len = end.saturating_sub(start);
-                let should_mark_pending = should_mark_pending_dictation_insert(
-                    active_text_interaction_mode(this),
-                    software_keyboard_visible(),
-                    requested_utf16_len,
-                );
-                let recently_committed_streamed = if should_mark_pending {
-                    recently_committed_streamed_dictation(this)
-                } else {
-                    false
-                };
-                let should_begin_pending = should_begin_pending_dictation_from_text_probe(
-                    should_mark_pending,
-                    recently_committed_streamed,
-                );
-                if should_begin_pending {
-                    set_pending_dictation_insert(this, true);
-                    let _ = with_input_handler(this, |handler| {
-                        handler.dictation_started();
-                    });
-                } else if should_mark_pending {
-                    // Critical: UIKit probes large ranges again while resolving a
-                    // just-committed streamed dictation. Do not treat those cleanup
-                    // reads as a new dictation session or the preview reopens.
-                    set_pending_dictation_insert(this, false);
-                }
 
                 let mut adjusted = None;
                 let handler_result = with_input_handler(this, |handler| {
@@ -2020,39 +1609,15 @@ fn register_metal_view_class() -> &'static Class {
                         return;
                     }
                     let text_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
-                    let native_dictation_state = native_dictation_input_state(this);
-                    let dictation_expected = native_dictation_state.expects_dictation();
-                    let (pending_dictation_insert, insert_text_dictation_active) =
-                        dictation_insert_flags(this);
-                    let recently_committed_streamed = recently_committed_streamed_dictation(this);
-                    let route_as_live_dictation = should_route_context_rewrite_as_live_dictation(
-                        dictation_expected,
-                        pending_dictation_insert,
-                        insert_text_dictation_active,
-                        recently_committed_streamed,
-                    );
                     notify_text_and_selection_change_from(
                         this,
                         TextInputMutationSource::TextInputSystem,
                         || {
                             let _ = with_input_handler(this, |handler| {
-                                if route_as_live_dictation {
-                                    // Critical: live dictation hypotheses can arrive
-                                    // through replaceRange, not only insertText. Keep
-                                    // them in the marked-text store so UIKit can find
-                                    // the previous hypothesis during reconciliation.
-                                    set_pending_dictation_insert(this, false);
-                                    set_insert_text_dictation_active(this, true);
-                                    handler.dictation_started();
-                                }
-                                handler.replace_text_in_range_from_context(
-                                    Some(start..end),
-                                    &text_str,
-                                );
+                                handler.replace_range(start..end, &text_str);
                             });
                         },
                     );
-                    clear_pending_text_input_change(this);
                 }
             }));
         }
@@ -2067,22 +1632,14 @@ fn register_metal_view_class() -> &'static Class {
             let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                 let range = get_range_indices(range).map(|(start, end)| start..end);
                 let text_str = ns_string_to_rust_string(text).unwrap_or_default();
-                let native_dictation_state = native_dictation_input_state(this);
-                set_pending_text_input_change(this, range.clone(), text_str.clone());
-                if native_dictation_state.expects_dictation() {
-                    // Critical: UIKit may expose dictation only on the
-                    // shouldChangeText preflight. Persist that native signal so
-                    // the following insertText/replaceRange cannot leak to PTY.
-                    set_pending_dictation_insert(this, false);
-                    set_insert_text_dictation_active(this, true);
-                    let _ = with_input_handler(this, |handler| {
-                        handler.dictation_started();
-                    });
-                }
+                let should_change = with_input_handler(this, |handler| {
+                    handler.should_change_text_in_range(range.clone(), &text_str)
+                })
+                .unwrap_or(true);
                 // Critical: UIKit's text system asks this before native IME
-                // rewrites. Returning YES keeps replacement validation on the
-                // platform path instead of forcing language-specific handling.
-                YES
+                // rewrites. Let the handler observe that selector while keeping
+                // replacement validation on the platform path by default.
+                if should_change { YES } else { NO }
             }));
 
             result.unwrap_or(YES)
@@ -2124,7 +1681,6 @@ fn register_metal_view_class() -> &'static Class {
                                 });
                             },
                         );
-                        clear_pending_text_input_change(this);
                         return;
                     }
 
@@ -2157,7 +1713,7 @@ fn register_metal_view_class() -> &'static Class {
                         TextInputMutationSource::TextInputSystem,
                         || {
                             let _ = with_input_handler(this, |handler| {
-                                handler.replace_and_mark_text_in_range(None, &text_str, selected);
+                                handler.set_marked_text(&text_str, selected, None);
                             });
                         },
                     );
@@ -2207,7 +1763,6 @@ fn register_metal_view_class() -> &'static Class {
                         });
                     },
                 );
-                clear_pending_text_input_change(this);
             }));
         }
 
@@ -2223,25 +1778,9 @@ fn register_metal_view_class() -> &'static Class {
                     return;
                 };
 
-                let (_, insert_text_dictation_active) = dictation_insert_flags(this);
-                let recently_committed_streamed = recently_committed_streamed_dictation(this);
-                let ignore_late_dictation_insert = should_ignore_late_dictation_insert(
-                    recently_committed_streamed,
-                    insert_text_dictation_active,
-                );
-                if ignore_late_dictation_insert {
-                    // Critical: streamed dictation already committed through
-                    // marked text; a late final insert would duplicate PTY output.
-                    set_streamed_dictation_committed(this, false);
-                    return;
-                }
-
                 let _ = with_input_handler(this, |handler| {
-                    handler.insert_dictation_text(&text);
-                    handler.dictation_ended();
+                    handler.insert_dictation_result(&text);
                 });
-                set_insert_text_dictation_active(this, false);
-                set_streamed_dictation_committed(this, false);
             }));
         }
 
@@ -2253,7 +1792,7 @@ fn register_metal_view_class() -> &'static Class {
         extern "C" fn dictation_recording_did_end(this: &mut Object, _sel: Sel) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 let _ = with_input_handler(this, |handler| {
-                    handler.dictation_recording_ended();
+                    handler.dictation_recording_did_end();
                 });
             }));
         }
@@ -2263,10 +1802,8 @@ fn register_metal_view_class() -> &'static Class {
         extern "C" fn dictation_recognition_failed(this: &mut Object, _sel: Sel) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 let _ = with_input_handler(this, |handler| {
-                    handler.dictation_cancelled();
+                    handler.dictation_recognition_failed();
                 });
-                set_insert_text_dictation_active(this, false);
-                set_streamed_dictation_committed(this, false);
             }));
         }
 
@@ -2274,11 +1811,8 @@ fn register_metal_view_class() -> &'static Class {
         // IMPORTANT: Uses catch_unwind because panics cannot unwind through extern "C"
         extern "C" fn insert_dictation_result_placeholder(this: &Object, _sel: Sel) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                set_pending_dictation_insert(this, true);
-                set_insert_text_dictation_active(this, true);
-                set_streamed_dictation_committed(this, false);
                 let _ = with_input_handler(this, |handler| {
-                    handler.dictation_started();
+                    handler.insert_dictation_result_placeholder();
                 });
 
                 this as *const Object as *mut Object
@@ -2337,41 +1871,9 @@ fn register_metal_view_class() -> &'static Class {
             will_insert_result: BOOL,
         ) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                let (_, insert_text_dictation_active) = dictation_insert_flags(this);
-                let action = dictation_placeholder_removal_action(
-                    will_insert_result == YES,
-                    insert_text_dictation_active,
-                );
                 let _ = with_input_handler(this, |handler| {
-                    match action {
-                        DictationPlaceholderRemovalAction::WaitForInsertDictationResult => {
-                            // Critical: when UIKit promises a final
-                            // insertDictationResult:, placeholder removal is
-                            // only an ordering step. Committing here can send
-                            // stale partial text before the final result lands.
-                        }
-                        DictationPlaceholderRemovalAction::CommitStreamedHypothesis => {
-                            // Critical: for custom UITextInput clients, UIKit
-                            // can stream the hypothesis through marked text and
-                            // then remove the placeholder with
-                            // willInsertResult=false. That is not cancellation;
-                            // the current marked text is the final transcript.
-                            handler.dictation_ended();
-                            set_streamed_dictation_committed(this, true);
-                        }
-                        DictationPlaceholderRemovalAction::Cancel => {
-                            handler.dictation_cancelled();
-                            set_streamed_dictation_committed(this, false);
-                        }
-                    }
+                    handler.remove_dictation_result_placeholder(will_insert_result == YES);
                 });
-                if matches!(
-                    action,
-                    DictationPlaceholderRemovalAction::WaitForInsertDictationResult
-                ) {
-                    set_streamed_dictation_committed(this, false);
-                }
-                set_insert_text_dictation_active(this, false);
             }));
         }
 
@@ -3373,23 +2875,6 @@ pub(crate) struct IosWindow {
     /// The active route for UIKit text callbacks; editable mode does not currently
     /// install UIKit's editable selection interaction on `view`.
     active_text_interaction_mode: Cell<i8>,
-    /// Set when UIKit has just queried a wide dictation context range and the
-    /// next insertText callback should be treated as a provisional hypothesis.
-    pending_dictation_insert: Cell<bool>,
-    pending_dictation_insert_at: Cell<Option<Instant>>,
-    /// Tracks dictation streams that arrive through insertText rather than
-    /// insertDictationResult.
-    insert_text_dictation_active: Cell<bool>,
-    /// Set briefly after committing a streamed hypothesis from
-    /// removeDictationResultPlaceholder(willInsertResult=false) so late native
-    /// final-result callbacks from the same stop action can be ignored.
-    streamed_dictation_committed_at: Cell<Option<Instant>>,
-    /// Last `shouldChangeTextInRange` validation expected to be followed by
-    /// ordinary keyboard/IME `insertText`.
-    pending_text_input_change: RefCell<Option<PendingTextInputChange>>,
-    /// True while UIKit is expanding a validated native IME rewrite into
-    /// delete/insert callbacks that may not text-match `shouldChangeText`.
-    native_text_rewrite_active: Cell<bool>,
     selectable_text_hit_regions: RefCell<SmallVec<[SelectableTextHitRegion; 8]>>,
     last_selection_geometry: RefCell<Option<SelectionGeometry>>,
     /// Callback for frame requests
@@ -3560,12 +3045,6 @@ impl IosWindow {
                 noneditable_text_interaction,
                 target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
                 active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
-                pending_dictation_insert: Cell::new(false),
-                pending_dictation_insert_at: Cell::new(None),
-                insert_text_dictation_active: Cell::new(false),
-                streamed_dictation_committed_at: Cell::new(None),
-                pending_text_input_change: RefCell::new(None),
-                native_text_rewrite_active: Cell::new(false),
                 selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
@@ -3704,12 +3183,6 @@ impl IosWindow {
                 noneditable_text_interaction,
                 target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
                 active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
-                pending_dictation_insert: Cell::new(false),
-                pending_dictation_insert_at: Cell::new(None),
-                insert_text_dictation_active: Cell::new(false),
-                streamed_dictation_committed_at: Cell::new(None),
-                pending_text_input_change: RefCell::new(None),
-                native_text_rewrite_active: Cell::new(false),
                 selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
@@ -4831,226 +4304,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wide_context_query_marks_pending_dictation_insert() {
-        assert!(should_mark_pending_dictation_insert(
-            TEXT_INTERACTION_EDITABLE,
-            true,
-            1000
-        ));
-        assert!(!should_mark_pending_dictation_insert(
-            TEXT_INTERACTION_EDITABLE,
-            true,
-            999
-        ));
-        assert!(!should_mark_pending_dictation_insert(
-            TEXT_INTERACTION_EDITABLE,
-            false,
-            1000
-        ));
-        assert!(!should_mark_pending_dictation_insert(
-            TEXT_INTERACTION_NONEDITABLE,
-            true,
-            1000
-        ));
-    }
-
-    #[test]
-    fn insert_text_buffers_dictation_from_native_context_probe_or_stream_state() {
-        assert!(should_buffer_insert_text_as_dictation(true, false, false));
-        assert!(should_buffer_insert_text_as_dictation(false, true, false));
-        assert!(should_buffer_insert_text_as_dictation(false, false, true));
-        assert!(!should_buffer_insert_text_as_dictation(false, false, false));
-    }
-
-    #[test]
-    fn native_dictation_signal_includes_input_mode() {
-        assert!(primary_language_expects_dictation(Some("dictation")));
-        assert!(primary_language_expects_dictation(Some("DICTATION")));
-        assert!(!primary_language_expects_dictation(Some("en-US")));
-        assert!(!primary_language_expects_dictation(None));
-
-        assert!(
-            NativeDictationInputState {
-                context_expected: false,
-                input_mode_dictation: true,
-            }
-            .expects_dictation()
-        );
-        assert!(
-            NativeDictationInputState {
-                context_expected: true,
-                input_mode_dictation: false,
-            }
-            .expects_dictation()
-        );
-        assert!(
-            !NativeDictationInputState {
-                context_expected: false,
-                input_mode_dictation: false,
-            }
-            .expects_dictation()
-        );
-    }
-
-    #[test]
-    fn unconfirmed_insert_routes_as_dictation_transaction_not_phrase_shape() {
-        assert!(should_route_unconfirmed_insert_as_dictation(
-            false, false, false, false, false, "Hey"
-        ));
-        assert!(should_route_unconfirmed_insert_as_dictation(
-            false, false, false, false, false, "h"
-        ));
-        assert!(!should_route_unconfirmed_insert_as_dictation(
-            true, false, false, false, false, "Hey"
-        ));
-        assert!(!should_route_unconfirmed_insert_as_dictation(
-            false, true, false, false, false, "Hey"
-        ));
-        assert!(!should_route_unconfirmed_insert_as_dictation(
-            false, false, false, false, true, "Hey"
-        ));
-        assert!(!should_route_unconfirmed_insert_as_dictation(
-            false, false, false, false, false, ""
-        ));
-    }
-
-    #[test]
-    fn native_ime_rewrite_stays_confirmed_across_delete_insert_callbacks() {
-        assert!(
-            !should_keep_native_text_rewrite_active(true, true, false),
-            "ordinary key insert should not leave an IME rewrite open"
-        );
-        assert!(
-            should_keep_native_text_rewrite_active(true, false, false),
-            "validated Telex rewrite can insert different text than shouldChangeText"
-        );
-        assert!(
-            should_keep_native_text_rewrite_active(false, false, true),
-            "multi-step IME rewrite remains confirmed until unmarkText"
-        );
-    }
-
-    #[test]
-    fn delete_preflight_without_replacement_clears_native_rewrite_state() {
-        let plain_delete = PendingTextInputChange {
-            range: Some(1..2),
-            text: String::new(),
-        };
-        let rewrite_delete = PendingTextInputChange {
-            range: Some(1..2),
-            text: "o".to_string(),
-        };
-
-        assert!(should_clear_native_text_rewrite_for_delete(Some(
-            &plain_delete
-        )));
-        assert!(!should_mark_native_text_rewrite_active_for_delete(
-            Some(&plain_delete),
-            true
-        ));
-        assert!(!should_clear_native_text_rewrite_for_delete(Some(
-            &rewrite_delete
-        )));
-        assert!(should_mark_native_text_rewrite_active_for_delete(
-            Some(&rewrite_delete),
-            false
-        ));
-    }
-
-    #[test]
-    fn context_rewrite_routes_live_dictation_without_capturing_late_final_results() {
-        assert!(should_route_context_rewrite_as_live_dictation(
-            true, false, false, false
-        ));
-        assert!(should_route_context_rewrite_as_live_dictation(
-            false, true, false, false
-        ));
-        assert!(should_route_context_rewrite_as_live_dictation(
-            false, false, true, true
-        ));
-
-        assert!(!should_route_context_rewrite_as_live_dictation(
-            true, false, false, true
-        ));
-        assert!(!should_route_context_rewrite_as_live_dictation(
-            false, false, false, false
-        ));
-    }
-
-    #[test]
-    fn context_rewrite_keeps_normal_ime_and_suggestions_off_dictation_path() {
-        assert!(!should_route_context_rewrite_as_live_dictation(
-            false, false, false, false
-        ));
-        assert!(!should_route_context_rewrite_as_live_dictation(
-            false, false, false, true
-        ));
+    fn editable_context_rewrite_reports_text_input_range_geometry() {
         assert!(should_report_text_input_range_geometry(
             TEXT_INTERACTION_EDITABLE
         ));
-    }
-
-    #[test]
-    fn dictation_text_probe_does_not_restart_after_recent_streamed_commit() {
-        assert!(should_begin_pending_dictation_from_text_probe(true, false));
-        assert!(!should_begin_pending_dictation_from_text_probe(true, true));
-        assert!(!should_begin_pending_dictation_from_text_probe(false, true));
-    }
-
-    #[test]
-    fn late_dictation_insert_is_ignored_after_streamed_commit_only_when_stream_closed() {
-        assert!(should_ignore_late_dictation_insert(true, false));
-        assert!(!should_ignore_late_dictation_insert(true, true));
-        assert!(!should_ignore_late_dictation_insert(false, false));
-    }
-
-    #[test]
-    fn unconfirmed_late_insert_text_after_streamed_commit_is_ignored_without_restarting_dictation()
-    {
-        assert!(should_ignore_late_insert_text_after_streamed_dictation(
-            true, false, false
-        ));
-        assert!(!should_route_unconfirmed_insert_as_dictation(
-            false, false, false, false, true, " "
-        ));
-
-        assert!(!should_ignore_late_insert_text_after_streamed_dictation(
-            true, false, true
-        ));
-        assert!(!should_ignore_late_insert_text_after_streamed_dictation(
-            true, true, false
-        ));
-        assert!(!should_ignore_late_insert_text_after_streamed_dictation(
-            false, false, false
-        ));
-    }
-
-    #[test]
-    fn placeholder_removal_waits_when_final_dictation_result_is_promised() {
-        assert_eq!(
-            dictation_placeholder_removal_action(true, true),
-            DictationPlaceholderRemovalAction::WaitForInsertDictationResult
-        );
-        assert_eq!(
-            dictation_placeholder_removal_action(true, false),
-            DictationPlaceholderRemovalAction::WaitForInsertDictationResult
-        );
-    }
-
-    #[test]
-    fn placeholder_removal_commits_streamed_hypothesis_without_final_result() {
-        assert_eq!(
-            dictation_placeholder_removal_action(false, true),
-            DictationPlaceholderRemovalAction::CommitStreamedHypothesis
-        );
-    }
-
-    #[test]
-    fn placeholder_removal_cancels_when_no_stream_or_final_result_exists() {
-        assert_eq!(
-            dictation_placeholder_removal_action(false, false),
-            DictationPlaceholderRemovalAction::Cancel
-        );
     }
 
     #[test]

@@ -73,22 +73,60 @@ pub trait EntityInputHandler: 'static + Sized {
         cx: &mut Context<Self>,
     );
 
-    /// See [`InputHandler::dictation_started`] for details
-    fn dictation_started(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// See [`InputHandler::should_change_text_in_range`] for details
+    fn should_change_text_in_range(
+        &mut self,
+        _replacement_range: Option<Range<usize>>,
+        _text: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        true
+    }
 
-    /// See [`InputHandler::insert_dictation_text`] for details
-    fn insert_dictation_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// See [`InputHandler::insert_text`] for details
+    fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.replace_text_in_range(None, text, window, cx);
     }
 
-    /// See [`InputHandler::dictation_ended`] for details
-    fn dictation_ended(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// See [`InputHandler::replace_range`] for details
+    fn replace_range(
+        &mut self,
+        replacement_range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_text_in_range(Some(replacement_range), text, window, cx);
+    }
 
-    /// See [`InputHandler::dictation_recording_ended`] for details
-    fn dictation_recording_ended(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// See [`InputHandler::insert_dictation_result_placeholder`] for details
+    fn insert_dictation_result_placeholder(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
-    /// See [`InputHandler::dictation_cancelled`] for details
-    fn dictation_cancelled(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// See [`InputHandler::remove_dictation_result_placeholder`] for details
+    fn remove_dictation_result_placeholder(
+        &mut self,
+        _will_insert_result: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    /// See [`InputHandler::insert_dictation_result`] for details
+    fn insert_dictation_result(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_text_in_range(None, text, window, cx);
+    }
+
+    /// See [`InputHandler::dictation_recording_did_end`] for details
+    fn dictation_recording_did_end(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// See [`InputHandler::dictation_recognition_failed`] for details
+    fn dictation_recognition_failed(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     /// See [`InputHandler::bounds_for_range`] for details
     fn bounds_for_range(
@@ -217,29 +255,66 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
             .update(cx, |view, cx| view.unmark_text(window, cx));
     }
 
-    fn dictation_started(&mut self, window: &mut Window, cx: &mut App) {
-        self.view
-            .update(cx, |view, cx| view.dictation_started(window, cx));
+    fn should_change_text_in_range(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        self.view.update(cx, |view, cx| {
+            view.should_change_text_in_range(replacement_range, text, window, cx)
+        })
     }
 
-    fn insert_dictation_text(&mut self, text: &str, window: &mut Window, cx: &mut App) {
+    fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut App) {
         self.view
-            .update(cx, |view, cx| view.insert_dictation_text(text, window, cx));
+            .update(cx, |view, cx| view.insert_text(text, window, cx));
     }
 
-    fn dictation_ended(&mut self, window: &mut Window, cx: &mut App) {
-        self.view
-            .update(cx, |view, cx| view.dictation_ended(window, cx));
+    fn replace_range(
+        &mut self,
+        replacement_range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |view, cx| {
+            view.replace_range(replacement_range, text, window, cx)
+        });
     }
 
-    fn dictation_recording_ended(&mut self, window: &mut Window, cx: &mut App) {
-        self.view
-            .update(cx, |view, cx| view.dictation_recording_ended(window, cx));
+    fn insert_dictation_result_placeholder(&mut self, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |view, cx| {
+            view.insert_dictation_result_placeholder(window, cx)
+        });
     }
 
-    fn dictation_cancelled(&mut self, window: &mut Window, cx: &mut App) {
+    fn remove_dictation_result_placeholder(
+        &mut self,
+        will_insert_result: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |view, cx| {
+            view.remove_dictation_result_placeholder(will_insert_result, window, cx)
+        });
+    }
+
+    fn insert_dictation_result(&mut self, text: &str, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |view, cx| {
+            view.insert_dictation_result(text, window, cx)
+        });
+    }
+
+    fn dictation_recording_did_end(&mut self, window: &mut Window, cx: &mut App) {
         self.view
-            .update(cx, |view, cx| view.dictation_cancelled(window, cx));
+            .update(cx, |view, cx| view.dictation_recording_did_end(window, cx));
+    }
+
+    fn dictation_recognition_failed(&mut self, window: &mut Window, cx: &mut App) {
+        self.view
+            .update(cx, |view, cx| view.dictation_recognition_failed(window, cx));
     }
 
     fn bounds_for_range(

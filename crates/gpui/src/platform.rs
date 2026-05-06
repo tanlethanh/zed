@@ -1255,6 +1255,39 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    pub fn should_change_text_in_range(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+    ) -> bool {
+        self.cx
+            .update(|window, cx| {
+                self.handler.borrow_mut().should_change_text_in_range(
+                    replacement_range,
+                    text,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap_or(true)
+    }
+
+    pub fn insert_text(&mut self, text: &str) {
+        self.cx
+            .update(|window, cx| self.handler.borrow_mut().insert_text(text, window, cx))
+            .ok();
+    }
+
+    pub fn replace_range(&mut self, replacement_range: Range<usize>, text: &str) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .replace_range(replacement_range, text, window, cx);
+            })
+            .ok();
+    }
+
     pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
@@ -1265,26 +1298,6 @@ impl PlatformInputHandler {
                     cx,
                 );
             })
-            .ok();
-    }
-
-    pub fn replace_text_in_range_from_context(
-        &mut self,
-        replacement_range: Option<Range<usize>>,
-        text: &str,
-    ) {
-        self.cx
-            .update(|window, cx| {
-                self.handler
-                    .borrow_mut()
-                    .replace_text_in_range_from_context(replacement_range, text, window, cx);
-            })
-            .ok();
-    }
-
-    pub fn delete_backward(&mut self) {
-        self.cx
-            .update(|window, cx| self.handler.borrow_mut().delete_backward(window, cx))
             .ok();
     }
 
@@ -1302,47 +1315,82 @@ impl PlatformInputHandler {
                     new_selected_range,
                     window,
                     cx,
-                )
+                );
             })
             .ok();
     }
 
-    pub fn dictation_started(&mut self) {
+    pub fn delete_backward(&mut self) {
         self.cx
-            .update(|window, cx| self.handler.borrow_mut().dictation_started(window, cx))
+            .update(|window, cx| self.handler.borrow_mut().delete_backward(window, cx))
             .ok();
     }
 
-    pub fn insert_dictation_text(&mut self, text: &str) {
+    pub fn set_marked_text(
+        &mut self,
+        marked_text: &str,
+        selected_range: Option<Range<usize>>,
+        replacement_range: Option<Range<usize>>,
+    ) {
+        self.cx
+            .update(|window, cx| {
+                self.handler.borrow_mut().set_marked_text(
+                    marked_text,
+                    selected_range,
+                    replacement_range,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    pub fn insert_dictation_result_placeholder(&mut self) {
         self.cx
             .update(|window, cx| {
                 self.handler
                     .borrow_mut()
-                    .insert_dictation_text(text, window, cx);
+                    .insert_dictation_result_placeholder(window, cx)
             })
             .ok();
     }
 
-    pub fn dictation_ended(&mut self) {
-        self.cx
-            .update(|window, cx| self.handler.borrow_mut().dictation_ended(window, cx))
-            .ok();
-    }
-
-    pub fn dictation_recording_ended(&mut self) {
+    pub fn remove_dictation_result_placeholder(&mut self, will_insert_result: bool) {
         self.cx
             .update(|window, cx| {
                 self.handler
                     .borrow_mut()
-                    .dictation_recording_ended(window, cx);
+                    .remove_dictation_result_placeholder(will_insert_result, window, cx)
             })
             .ok();
     }
 
-    pub fn dictation_cancelled(&mut self) {
+    pub fn insert_dictation_result(&mut self, text: &str) {
         self.cx
             .update(|window, cx| {
-                self.handler.borrow_mut().dictation_cancelled(window, cx);
+                self.handler
+                    .borrow_mut()
+                    .insert_dictation_result(text, window, cx);
+            })
+            .ok();
+    }
+
+    pub fn dictation_recording_did_end(&mut self) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .dictation_recording_did_end(window, cx);
+            })
+            .ok();
+    }
+
+    pub fn dictation_recognition_failed(&mut self) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .dictation_recognition_failed(window, cx);
             })
             .ok();
     }
@@ -1645,6 +1693,40 @@ pub trait InputHandler: 'static {
         Some(adjusted_range.map_or_else(|| text.encode_utf16().count(), |range| range.end))
     }
 
+    /// Observe a platform text-change preflight.
+    ///
+    /// Corresponds to UIKit's `shouldChangeTextInRange:replacementText:`.
+    /// Returning `false` rejects the platform text edit.
+    fn should_change_text_in_range(
+        &mut self,
+        _replacement_range: Option<Range<usize>>,
+        _text: &str,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> bool {
+        true
+    }
+
+    /// Insert text through the platform text-input protocol.
+    ///
+    /// Corresponds to UIKit's `insertText:`.
+    fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut App) {
+        self.replace_text_in_range(None, text, window, cx);
+    }
+
+    /// Replace a platform text range through the platform text-input protocol.
+    ///
+    /// Corresponds to UIKit's `replaceRange:withText:`.
+    fn replace_range(
+        &mut self,
+        replacement_range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.replace_text_in_range(Some(replacement_range), text, window, cx);
+    }
+
     /// Replace the text in the given document range with the given text
     /// Corresponds to [insertText(_:replacementRange:)](https://developer.apple.com/documentation/appkit/nstextinputclient/1438258-inserttext)
     ///
@@ -1656,21 +1738,6 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     );
-
-    /// Replace text from a native text-system context rewrite.
-    /// Corresponds to UIKit's replaceRange:withText: path, used by IMEs,
-    /// autocorrect, and smart substitutions.
-    ///
-    /// replacement_range is in terms of UTF-16 characters
-    fn replace_text_in_range_from_context(
-        &mut self,
-        replacement_range: Option<Range<usize>>,
-        text: &str,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.replace_text_in_range(replacement_range, text, window, cx);
-    }
 
     /// Delete one character or the current selection using the handler's native document model.
     ///
@@ -1698,11 +1765,11 @@ pub trait InputHandler: 'static {
     }
 
     /// Replace the text in the given document range with the given text,
-    /// and mark the given text as part of an IME 'composing' state
+    /// and mark the given text as part of an IME 'composing' state.
     /// Corresponds to [setMarkedText(_:selectedRange:replacementRange:)](https://developer.apple.com/documentation/appkit/nstextinputclient/1438246-setmarkedtext)
     ///
-    /// range_utf16 is in terms of UTF-16 characters
-    /// new_selected_range is in terms of UTF-16 characters
+    /// range_utf16 is in terms of UTF-16 characters.
+    /// new_selected_range is in terms of UTF-16 characters.
     fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -1712,22 +1779,49 @@ pub trait InputHandler: 'static {
         cx: &mut App,
     );
 
-    /// Called when the platform starts a native dictation insertion session.
-    fn dictation_started(&mut self, _window: &mut Window, _cx: &mut App) {}
+    /// Set marked text through the platform text-input protocol.
+    ///
+    /// This preserves the native selector argument order while forwarding to
+    /// Zed's existing replacement-first API by default.
+    fn set_marked_text(
+        &mut self,
+        marked_text: &str,
+        selected_range: Option<Range<usize>>,
+        replacement_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.replace_and_mark_text_in_range(
+            replacement_range,
+            marked_text,
+            selected_range,
+            window,
+            cx,
+        );
+    }
 
-    /// Inserts recognized native dictation text.
-    fn insert_dictation_text(&mut self, text: &str, window: &mut Window, cx: &mut App) {
+    /// Called from UIKit's `insertDictationResultPlaceholder`.
+    fn insert_dictation_result_placeholder(&mut self, _window: &mut Window, _cx: &mut App) {}
+
+    /// Called from UIKit's `removeDictationResultPlaceholder:willInsertResult:`.
+    fn remove_dictation_result_placeholder(
+        &mut self,
+        _will_insert_result: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    /// Called from UIKit's `insertDictationResult:`.
+    fn insert_dictation_result(&mut self, text: &str, window: &mut Window, cx: &mut App) {
         self.replace_text_in_range(None, text, window, cx);
     }
 
-    /// Called when the platform finishes a native dictation insertion session.
-    fn dictation_ended(&mut self, _window: &mut Window, _cx: &mut App) {}
+    /// Called from UIKit's `dictationRecordingDidEnd`.
+    fn dictation_recording_did_end(&mut self, _window: &mut Window, _cx: &mut App) {}
 
-    /// Called when native dictation recording stops before final text reconciliation.
-    fn dictation_recording_ended(&mut self, _window: &mut Window, _cx: &mut App) {}
-
-    /// Called when the platform abandons a native dictation insertion session.
-    fn dictation_cancelled(&mut self, _window: &mut Window, _cx: &mut App) {}
+    /// Called from UIKit's `dictationRecognitionFailed`.
+    fn dictation_recognition_failed(&mut self, _window: &mut Window, _cx: &mut App) {}
 
     /// Remove the IME 'composing' state from the document
     /// Corresponds to [unmarkText()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438239-unmarktext)
