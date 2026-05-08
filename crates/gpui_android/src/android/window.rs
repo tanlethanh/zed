@@ -8,7 +8,6 @@ use std::{
 
 use anyhow::Result;
 use futures::channel::oneshot;
-use jni::{JavaVM, objects::GlobalRef};
 use ndk::native_window::NativeWindow;
 use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, HasDisplayHandle, HasWindowHandle,
@@ -18,10 +17,93 @@ use raw_window_handle::{
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent,
+    PointerUpEvent, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
+    ScrollWheelEvent, Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, point, px,
 };
-use gpui_wgpu::{WgpuAtlas, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{GpuContext, WgpuAtlas, WgpuRenderer, WgpuSurfaceConfig};
+
+const TAP_SLOP: f32 = 4.0;
+const FLING_THRESHOLD: f32 = 50.0;
+
+const ACTION_DOWN: i32 = 0;
+const ACTION_UP: i32 = 1;
+const ACTION_MOVE: i32 = 2;
+const ACTION_CANCEL: i32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AndroidWindowRole {
+    Root,
+    EmbeddedSheet,
+}
+
+struct FlingState {
+    velocity_x: f32,
+    velocity_y: f32,
+    last_time: std::time::Instant,
+    position: Point<Pixels>,
+}
+
+struct TouchState {
+    last_position: Option<(f32, f32)>,
+    down_position: Option<(f32, f32)>,
+    is_drag: bool,
+    suppress_scroll: bool,
+    fling: Option<FlingState>,
+}
+
+impl TouchState {
+    fn new() -> Self {
+        Self {
+            last_position: None,
+            down_position: None,
+            is_drag: false,
+            suppress_scroll: false,
+            fling: None,
+        }
+    }
+}
+
+pub(crate) struct AndroidAtlas {
+    atlas: Mutex<Option<Arc<WgpuAtlas>>>,
+}
+
+impl AndroidAtlas {
+    fn new() -> Self {
+        Self {
+            atlas: Mutex::new(None),
+        }
+    }
+
+    fn bind(&self, atlas: Arc<WgpuAtlas>) {
+        *self.atlas.lock().expect("AndroidAtlas poisoned") = Some(atlas);
+    }
+
+    fn gpu_atlas(&self) -> Option<Arc<WgpuAtlas>> {
+        self.atlas.lock().expect("AndroidAtlas poisoned").clone()
+    }
+}
+
+impl PlatformAtlas for AndroidAtlas {
+    fn get_or_insert_with<'a>(
+        &self,
+        key: &gpui::AtlasKey,
+        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, std::borrow::Cow<'a, [u8]>)>>,
+    ) -> Result<Option<gpui::AtlasTile>> {
+        if let Some(atlas) = self.gpu_atlas() {
+            atlas.get_or_insert_with(key, build)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn remove(&self, key: &gpui::AtlasKey) {
+        if let Some(atlas) = self.gpu_atlas() {
+            atlas.remove(key);
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -37,6 +119,7 @@ pub(crate) struct Callbacks {
     hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
 }
 
+#[derive(Clone, Copy, Debug)]
 struct RawWindow {
     window: *mut c_void,
 }
@@ -71,96 +154,109 @@ impl HasDisplayHandle for RawWindow {
 }
 
 pub struct AndroidWindowState {
+    role: AndroidWindowRole,
     raw_window: Option<RawWindow>,
     native_window: Option<NativeWindow>,
     renderer: Option<WgpuRenderer>,
-    atlas: Arc<WgpuAtlas>,
+    atlas: Arc<AndroidAtlas>,
     bounds: Bounds<Pixels>,
     scale: f32,
+    touch_state: TouchState,
     input_handler: Option<PlatformInputHandler>,
     callbacks: Callbacks,
     active: bool,
     appearance: WindowAppearance,
     background_appearance: WindowBackgroundAppearance,
-    jvm: Arc<JavaVM>,
-    activity: Arc<Mutex<GlobalRef>>,
-    handle: AnyWindowHandle,
     modifiers: Modifiers,
     last_mouse_position: Point<Pixels>,
 }
 
 impl AndroidWindowState {
-    pub fn new(
-        handle: AnyWindowHandle,
-        bounds: Bounds<Pixels>,
-        scale: f32,
-        jvm: Arc<JavaVM>,
-        activity: Arc<Mutex<GlobalRef>>,
-        context: &WgpuContext,
-    ) -> Result<Self> {
-        let atlas = Arc::new(WgpuAtlas::new(
-            Arc::clone(&context.device),
-            Arc::clone(&context.queue),
-        ));
-
-        Ok(Self {
+    pub fn new(role: AndroidWindowRole, bounds: Bounds<Pixels>, scale: f32, active: bool) -> Self {
+        Self {
+            role,
             raw_window: None,
             native_window: None,
             renderer: None,
-            atlas,
+            atlas: Arc::new(AndroidAtlas::new()),
             bounds,
             scale,
+            touch_state: TouchState::new(),
             input_handler: None,
             callbacks: Callbacks::default(),
-            active: false,
+            active,
             appearance: WindowAppearance::Light,
-            background_appearance: WindowBackgroundAppearance::Opaque,
-            jvm,
-            activity,
-            handle,
+            background_appearance: WindowBackgroundAppearance::Transparent,
             modifiers: Modifiers::default(),
             last_mouse_position: Point::default(),
-        })
+        }
+    }
+
+    pub fn role(&self) -> AndroidWindowRole {
+        self.role
+    }
+
+    pub fn set_active(&mut self, active: bool) -> bool {
+        if self.active == active {
+            false
+        } else {
+            self.active = active;
+            true
+        }
+    }
+
+    pub fn take_active_status_change_callback(&mut self) -> Option<Box<dyn FnMut(bool)>> {
+        self.callbacks.active_status_change.take()
+    }
+
+    pub fn restore_active_status_change_callback(&mut self, callback: Box<dyn FnMut(bool)>) {
+        self.callbacks.active_status_change = Some(callback);
     }
 
     pub fn handle_surface_created(
         &mut self,
         native_window: NativeWindow,
-        context: &WgpuContext,
+        gpu_context: GpuContext,
     ) -> Result<()> {
-        log::info!("AndroidWindow: surface created");
+        log::info!("AndroidWindow({:?}): surface created", self.role);
 
         let window_ptr = native_window.ptr().as_ptr() as *mut c_void;
         let raw_window = RawWindow { window: window_ptr };
 
-        let size = Size {
-            width: DevicePixels((f32::from(self.bounds.size.width) * self.scale) as i32),
-            height: DevicePixels((f32::from(self.bounds.size.height) * self.scale) as i32),
-        };
+        let config = self.surface_config(self.physical_size());
 
         log::info!(
             "Creating WgpuRenderer with physical size: {}x{} (logical: {}x{}, scale: {})",
-            size.width.0,
-            size.height.0,
+            config.size.width.0,
+            config.size.height.0,
             f32::from(self.bounds.size.width),
             f32::from(self.bounds.size.height),
             self.scale
         );
 
-        let config = WgpuSurfaceConfig {
-            size,
-            transparent: matches!(
-                self.background_appearance,
-                WindowBackgroundAppearance::Transparent | WindowBackgroundAppearance::Blurred
-            ),
-        };
-
-        let renderer =
-            WgpuRenderer::new_with_atlas(context, &raw_window, config, Some(self.atlas.clone()))?;
+        if let Some(renderer) = self.renderer.as_mut() {
+            // Keep the presentation mode selected during initial surface
+            // creation; `replace_surface` does not re-query surface
+            // capabilities, so passing `None` preserves the known-good mode.
+            let mut config = config;
+            config.preferred_present_mode = None;
+            let context = gpu_context.borrow();
+            let context = context
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Cannot replace Android surface before GPU init"))?;
+            renderer.replace_surface(&raw_window, config, &context.instance)?;
+        } else {
+            let renderer = if let Some(atlas) = self.atlas.gpu_atlas() {
+                WgpuRenderer::new_with_atlas(gpu_context, &raw_window, config, None, atlas)?
+            } else {
+                WgpuRenderer::new(gpu_context, &raw_window, config, None)?
+            };
+            self.atlas.bind(renderer.atlas());
+            self.renderer = Some(renderer);
+        }
 
         self.native_window = Some(native_window);
         self.raw_window = Some(raw_window);
-        self.renderer = Some(renderer);
 
         Ok(())
     }
@@ -169,9 +265,13 @@ impl AndroidWindowState {
         &mut self,
         width: u32,
         height: u32,
-        context: &WgpuContext,
     ) -> Result<Option<(Size<Pixels>, f32)>> {
-        log::info!("AndroidWindow: surface changed to {}x{}", width, height);
+        log::info!(
+            "AndroidWindow({:?}): surface changed to {}x{}",
+            self.role,
+            width,
+            height
+        );
 
         let new_bounds = Bounds {
             origin: self.bounds.origin,
@@ -186,30 +286,11 @@ impl AndroidWindowState {
             self.bounds = new_bounds;
         }
 
-        if bounds_changed {
-            if let Some(ref raw_window) = self.raw_window {
-                let size = Size {
-                    width: DevicePixels(width as i32),
-                    height: DevicePixels(height as i32),
-                };
-
-                let config = WgpuSurfaceConfig {
-                    size,
-                    transparent: matches!(
-                        self.background_appearance,
-                        WindowBackgroundAppearance::Transparent
-                            | WindowBackgroundAppearance::Blurred
-                    ),
-                };
-
-                let renderer = WgpuRenderer::new_with_atlas(
-                    context,
-                    raw_window,
-                    config,
-                    Some(self.atlas.clone()),
-                )?;
-                self.renderer = Some(renderer);
-            }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.update_drawable_size(Size {
+                width: DevicePixels(width as i32),
+                height: DevicePixels(height as i32),
+            });
         }
 
         let has_callback = self.callbacks.resize.is_some();
@@ -242,16 +323,46 @@ impl AndroidWindowState {
     }
 
     pub fn handle_surface_destroyed(&mut self) {
-        log::info!("AndroidWindow: surface destroyed");
+        log::info!("AndroidWindow({:?}): surface destroyed", self.role);
 
-        self.renderer = None;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.unconfigure_surface();
+        }
         self.native_window = None;
         self.raw_window = None;
     }
 
     pub fn draw(&mut self, scene: &Scene) {
         if let Some(ref mut renderer) = self.renderer {
+            if renderer.device_lost() {
+                if let Some(raw_window) = self.raw_window {
+                    if let Err(error) = renderer.recover(&raw_window) {
+                        log::error!("Failed to recover Android renderer: {error:?}");
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
             renderer.draw(scene);
+        }
+    }
+
+    fn physical_size(&self) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels((f32::from(self.bounds.size.width) * self.scale) as i32),
+            height: DevicePixels((f32::from(self.bounds.size.height) * self.scale) as i32),
+        }
+    }
+
+    fn surface_config(&self, size: Size<DevicePixels>) -> WgpuSurfaceConfig {
+        WgpuSurfaceConfig {
+            size,
+            transparent: matches!(
+                self.background_appearance,
+                WindowBackgroundAppearance::Transparent | WindowBackgroundAppearance::Blurred
+            ),
+            preferred_present_mode: Some(gpui_wgpu::wgpu::PresentMode::Mailbox),
         }
     }
 
@@ -281,6 +392,197 @@ impl AndroidWindowState {
             DispatchEventResult::default()
         }
     }
+
+    /// Handle a raw Android touch event (ACTION_DOWN/MOVE/UP/CANCEL).
+    ///
+    /// Coordinates are physical pixels. Android windows keep touch state
+    /// independently so root and embedded surfaces do not steal fling or scroll
+    /// suppression state from each other.
+    pub fn handle_touch(&mut self, action: i32, x: f32, y: f32) {
+        let logical_x = x / self.scale;
+        let logical_y = y / self.scale;
+        let position = point(px(logical_x), px(logical_y));
+        self.last_mouse_position = position;
+
+        match action {
+            ACTION_DOWN => {
+                self.touch_state.fling = None;
+                self.touch_state.down_position = Some((logical_x, logical_y));
+                self.touch_state.last_position = Some((logical_x, logical_y));
+                self.touch_state.is_drag = false;
+                self.touch_state.suppress_scroll = false;
+                self.handle_input(PlatformInput::PointerDown(PointerDownEvent {
+                    pointer_id: 1,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
+            }
+            ACTION_UP => {
+                let is_drag = self.touch_state.is_drag;
+                let suppress_scroll = self.touch_state.suppress_scroll;
+                self.touch_state.last_position = None;
+                self.touch_state.down_position = None;
+                self.touch_state.is_drag = false;
+
+                if !is_drag || suppress_scroll {
+                    // Java forwards velocity unconditionally. If the pointer
+                    // handler prevented default, the matching fling must die
+                    // with the suppressed synthetic scroll stream.
+                    self.touch_state.fling = None;
+                } else {
+                    self.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Ended,
+                    }));
+                }
+                self.touch_state.suppress_scroll = false;
+                self.handle_input(PlatformInput::PointerUp(PointerUpEvent {
+                    pointer_id: 1,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
+            }
+            ACTION_MOVE => {
+                let (scroll_delta, should_scroll) = {
+                    if !self.touch_state.is_drag {
+                        if let Some((down_x, down_y)) = self.touch_state.down_position {
+                            let dx = logical_x - down_x;
+                            let dy = logical_y - down_y;
+                            if (dx * dx + dy * dy).sqrt() > TAP_SLOP {
+                                self.touch_state.is_drag = true;
+                            }
+                        }
+                    }
+
+                    if self.touch_state.is_drag {
+                        let delta = self
+                            .touch_state
+                            .last_position
+                            .map(|(last_x, last_y)| (logical_x - last_x, logical_y - last_y));
+                        self.touch_state.last_position = Some((logical_x, logical_y));
+                        (delta, true)
+                    } else {
+                        self.touch_state.last_position = Some((logical_x, logical_y));
+                        (None, false)
+                    }
+                };
+
+                let pointer_result =
+                    self.handle_input(PlatformInput::PointerMove(PointerMoveEvent {
+                        pointer_id: 1,
+                        kind: PointerKind::Touch,
+                        is_primary: true,
+                        pressed_button: Some(PointerButton::Primary),
+                        position,
+                        modifiers: Modifiers::default(),
+                    }));
+                if pointer_result.default_prevented {
+                    self.touch_state.suppress_scroll = true;
+                }
+                if should_scroll {
+                    if let Some((dx, dy)) = scroll_delta {
+                        if !self.touch_state.suppress_scroll {
+                            self.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                position,
+                                delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                                modifiers: Modifiers::default(),
+                                touch_phase: TouchPhase::Moved,
+                            }));
+                        }
+                    }
+                }
+            }
+            ACTION_CANCEL => {
+                self.touch_state.last_position = None;
+                self.touch_state.down_position = None;
+                self.touch_state.is_drag = false;
+                self.touch_state.suppress_scroll = false;
+                self.touch_state.fling = None;
+                self.handle_input(PlatformInput::PointerCancel(PointerCancelEvent {
+                    pointer_id: 1,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a fling gesture in physical pixels/second from Android VelocityTracker.
+    pub fn handle_fling(&mut self, velocity_x: f32, velocity_y: f32) {
+        if self.touch_state.suppress_scroll {
+            self.touch_state.fling = None;
+            return;
+        }
+
+        let vx = velocity_x / self.scale;
+        let vy = velocity_y / self.scale;
+        let position = self
+            .touch_state
+            .last_position
+            .map(|(x, y)| point(px(x), px(y)))
+            .unwrap_or_default();
+
+        if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
+            self.touch_state.fling = Some(FlingState {
+                velocity_x: vx,
+                velocity_y: vy,
+                last_time: std::time::Instant::now(),
+                position,
+            });
+        }
+    }
+
+    pub fn has_active_fling(&self) -> bool {
+        self.touch_state.fling.is_some()
+    }
+
+    pub fn process_fling(&mut self) {
+        let Some(fling) = self.touch_state.fling.as_ref() else {
+            return;
+        };
+
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(fling.last_time).as_secs_f32();
+        let friction = 0.95_f32.powf(dt * 60.0);
+        let new_vx = fling.velocity_x * friction;
+        let new_vy = fling.velocity_y * friction;
+        let position = fling.position;
+
+        if new_vx.abs() < FLING_THRESHOLD && new_vy.abs() < FLING_THRESHOLD {
+            self.touch_state.fling = None;
+            self.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Ended,
+            }));
+            return;
+        }
+
+        if let Some(fling) = self.touch_state.fling.as_mut() {
+            fling.velocity_x = new_vx;
+            fling.velocity_y = new_vy;
+            fling.last_time = now;
+        }
+
+        self.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(new_vx * dt), px(new_vy * dt))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        }));
+    }
 }
 
 pub type AndroidWindowStatePtr = Rc<RefCell<AndroidWindowState>>;
@@ -291,39 +593,33 @@ pub struct AndroidWindow {
 
 impl AndroidWindow {
     pub fn new(
-        handle: AnyWindowHandle,
+        _handle: AnyWindowHandle,
+        role: AndroidWindowRole,
         bounds: Bounds<Pixels>,
         scale: f32,
-        jvm: Arc<JavaVM>,
-        activity: Arc<Mutex<GlobalRef>>,
-        context: &WgpuContext,
-    ) -> Result<Self> {
-        let state = AndroidWindowState::new(handle, bounds, scale, jvm, activity, context)?;
-        Ok(Self {
+        active: bool,
+    ) -> Self {
+        let state = AndroidWindowState::new(role, bounds, scale, active);
+        Self {
             state: Rc::new(RefCell::new(state)),
-        })
+        }
     }
 
     pub fn handle_surface_created(
         &self,
         native_window: NativeWindow,
-        context: &WgpuContext,
+        gpu_context: GpuContext,
     ) -> Result<()> {
         self.state
             .borrow_mut()
-            .handle_surface_created(native_window, context)
+            .handle_surface_created(native_window, gpu_context)
     }
 
-    pub fn handle_surface_changed(
-        &self,
-        width: u32,
-        height: u32,
-        context: &WgpuContext,
-    ) -> Result<()> {
+    pub fn handle_surface_changed(&self, width: u32, height: u32) -> Result<()> {
         let resize_info = self
             .state
             .borrow_mut()
-            .handle_surface_changed(width, height, context)?;
+            .handle_surface_changed(width, height)?;
         if let Some((size, scale)) = resize_info {
             let mut callback = self.state.borrow_mut().take_resize_callback();
             if let Some(ref mut cb) = callback {
@@ -493,7 +789,11 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        None
+        self.state
+            .borrow()
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.gpu_specs())
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
