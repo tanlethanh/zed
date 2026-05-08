@@ -17,7 +17,7 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, sync::Arc};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
-    zeno::{Format, Transform, Vector},
+    zeno::{Format, Vector},
 };
 
 pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
@@ -402,17 +402,25 @@ impl CosmicTextSystemState {
     ) -> Result<swash::scale::image::Image> {
         let loaded_font = &self.loaded_fonts[params.font_id.0];
         let font_ref = loaded_font.font.as_swash();
-        let pixel_size = f32::from(params.font_size);
+        // Rasterize at device-pixel size — hinting decisions (stem snapping,
+        // edge AA) must happen at the same resolution the glyph is sampled at
+        // on screen. Building the scaler at logical size and then applying a
+        // scale_factor transform makes swash hint for the wrong grid and
+        // produces visibly soft strokes when scaled up to the device. iOS gets
+        // away with the equivalent pattern because CoreText is aware of the
+        // CGContext scale, but swash treats `transform` as a post-hint affine
+        // and the hint quality is lost.
+        let device_pixel_size = f32::from(params.font_size) * params.scale_factor;
 
         let subpixel_offset = Vector::new(
-            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor,
-            params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
+            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32,
+            params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32,
         );
 
         let mut scaler = self
             .swash_scale_context
             .builder(font_ref)
-            .size(pixel_size)
+            .size(device_pixel_size)
             .hint(true)
             .build();
 
@@ -427,14 +435,6 @@ impl CosmicTextSystemState {
         };
 
         let mut renderer = Render::new(sources);
-        renderer.transform(Some(Transform {
-            xx: params.scale_factor,
-            xy: 0.0,
-            yx: 0.0,
-            yy: params.scale_factor,
-            x: 0.0,
-            y: 0.0,
-        }));
 
         if params.subpixel_rendering {
             renderer
