@@ -785,7 +785,15 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        false
+        // Mirrors `WgpuRenderer::supports_dual_source_blending` — only true on
+        // Vulkan adapters that expose the feature (most desktop GPUs and some
+        // newer Adreno/PowerVR drivers). Mali-G68 and similar mobile GPUs
+        // return false here and fall back to grayscale alpha rendering.
+        self.state
+            .borrow()
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.supports_dual_source_blending())
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
