@@ -229,6 +229,63 @@ impl WgpuRenderer {
         )
     }
 
+    /// Creates a new WgpuRenderer using an atlas owned by the caller.
+    ///
+    /// This is useful for platforms that keep a stable atlas across native
+    /// surface replacement, such as Android where the `ANativeWindow` can be
+    /// destroyed and recreated independently from the GPUI window.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_with_atlas<W>(
+        gpu_context: GpuContext,
+        window: &W,
+        config: WgpuSurfaceConfig,
+        compositor_gpu: Option<CompositorGpuHint>,
+        atlas: Arc<WgpuAtlas>,
+    ) -> anyhow::Result<Self>
+    where
+        W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+    {
+        let window_handle = window
+            .window_handle()
+            .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            // Fall back to the display handle already provided via InstanceDescriptor::display.
+            raw_display_handle: None,
+            raw_window_handle: window_handle.as_raw(),
+        };
+
+        let instance = gpu_context
+            .borrow()
+            .as_ref()
+            .map(|ctx| ctx.instance.clone())
+            .unwrap_or_else(|| WgpuContext::instance(Box::new(window.clone())));
+
+        let surface = unsafe {
+            instance
+                .create_surface_unsafe(target)
+                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
+        };
+
+        let mut ctx_ref = gpu_context.borrow_mut();
+        let context = match ctx_ref.as_mut() {
+            Some(context) => {
+                context.check_compatible_with_surface(&surface)?;
+                context
+            }
+            None => ctx_ref.insert(WgpuContext::new(instance, &surface, compositor_gpu)?),
+        };
+
+        Self::new_internal(
+            Some(Rc::clone(&gpu_context)),
+            context,
+            surface,
+            config,
+            compositor_gpu,
+            atlas,
+        )
+    }
+
     #[cfg(target_family = "wasm")]
     pub fn new_from_canvas(
         context: &WgpuContext,
@@ -948,6 +1005,19 @@ impl WgpuRenderer {
             self.surface_config.height = clamped_height.max(1);
             let surface_config = self.surface_config.clone();
 
+            if !self.surface_configured {
+                // Android can deliver resize state while its native surface is detached.
+                // Keep the next replacement surface sized correctly without touching
+                // the stale wgpu surface.
+                if let Some(resources) = self.resources.as_mut() {
+                    resources.path_intermediate_texture = None;
+                    resources.path_intermediate_view = None;
+                    resources.path_msaa_texture = None;
+                    resources.path_msaa_view = None;
+                }
+                return;
+            }
+
             let resources = self.resources_mut();
 
             // Wait for any in-flight GPU work to complete before destroying textures
@@ -1049,6 +1119,10 @@ impl WgpuRenderer {
 
     pub fn supports_dual_source_blending(&self) -> bool {
         self.dual_source_blending
+    }
+
+    pub fn atlas(&self) -> Arc<WgpuAtlas> {
+        self.atlas.clone()
     }
 
     pub fn gpu_specs(&self) -> GpuSpecs {
