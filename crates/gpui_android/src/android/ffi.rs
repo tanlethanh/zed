@@ -67,6 +67,10 @@ pub fn create_platform() -> Rc<super::platform::AndroidPlatform> {
          JVM/activity not stored",
     );
     let platform = Rc::new(super::platform::AndroidPlatform::new(jvm, activity));
+    // setDisplayScale may have been pushed from Kotlin before the platform
+    // existed — apply the cached value now so the first window opens at the
+    // device's true density.
+    platform.set_display_scale(display_scale());
     app_state::set_platform(platform.clone());
     platform
 }
