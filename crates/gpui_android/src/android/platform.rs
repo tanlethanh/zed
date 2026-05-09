@@ -600,6 +600,12 @@ impl Platform for AndroidPlatform {
 
     fn set_cursor_style(&self, _style: CursorStyle) {}
 
+    fn hide_cursor_until_mouse_moves(&self) {}
+
+    fn is_cursor_visible(&self) -> bool {
+        true
+    }
+
     fn should_auto_hide_scrollbars(&self) -> bool {
         true
     }
