@@ -60,8 +60,13 @@ const FLING_THRESHOLD: f32 = 50.0;
 const TEXT_INTERACTION_NONE: i8 = -1;
 const TEXT_INTERACTION_NONEDITABLE: i8 = 0;
 const TEXT_INTERACTION_EDITABLE: i8 = 1;
-const INPUT_NATIVE_SELECTION_LONG_PRESS_MIN_DURATION: Duration = Duration::from_millis(350);
-const ACTIVE_SELECTION_INTERACTION_SLOP: f32 = 24.0;
+// GPUI still owns the editable surface's long-press action. UIKit separately
+// asks whether UITextInteraction may begin, so keep editable native selection
+// gated to a matured single-touch press instead of ordinary taps or double taps.
+const EDITABLE_NATIVE_SELECTION_LONG_PRESS_MIN_DURATION: Duration = Duration::from_millis(350);
+// UIKit handle touches often begin just outside the rects returned by GPUI.
+// Keep those touches in the native-selection path instead of clearing selection.
+const NATIVE_SELECTION_HANDLE_HIT_SLOP: f32 = 24.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditMenuActionPolicy {
@@ -72,14 +77,14 @@ enum EditMenuActionPolicy {
 
 fn edit_menu_action_policy(
     interaction_mode: i8,
-    input_handles_native_selection: bool,
+    input_native_selection_enabled: bool,
     is_copy_action: bool,
 ) -> EditMenuActionPolicy {
-    if handles_native_touch_selection(interaction_mode, input_handles_native_selection)
+    if handles_native_touch_selection(interaction_mode, input_native_selection_enabled)
         && is_copy_action
     {
         EditMenuActionPolicy::CopySelection
-    } else if interaction_mode == TEXT_INTERACTION_EDITABLE && !input_handles_native_selection {
+    } else if interaction_mode == TEXT_INTERACTION_EDITABLE && !input_native_selection_enabled {
         EditMenuActionPolicy::DisableNativeMenu
     } else {
         EditMenuActionPolicy::DelegateToSystem
@@ -112,7 +117,7 @@ fn text_input_refresh_plan(
     has_input_handler: bool,
     has_selection_handler: bool,
     input_accepts_text_input: bool,
-    input_handles_native_selection: bool,
+    input_native_selection_enabled: bool,
     _input_uses_manual_focus: bool,
     keyboard_session_requested: bool,
     software_keyboard_visible: bool,
@@ -146,7 +151,7 @@ fn text_input_refresh_plan(
         } else {
             TextInputResponderAction::None
         }
-    } else if target_interaction_mode == TEXT_INTERACTION_EDITABLE && input_handles_native_selection
+    } else if target_interaction_mode == TEXT_INTERACTION_EDITABLE && input_native_selection_enabled
     {
         TextInputResponderAction::None
     } else {
@@ -162,17 +167,17 @@ fn text_input_refresh_plan(
 
 /// Chooses the active text callback route for the current responder state.
 ///
-/// Editable mode routes keyboard and IME callbacks to the input handler.
-/// Handlers can opt into native touch selection UI while staying editable.
+/// Editable mode routes keyboard and IME callbacks to the input handler. An
+/// input handler can also opt into native touch selection while staying editable.
 fn active_text_interaction_mode_for_state(
     target_interaction_mode: i8,
     has_selection_handler: bool,
-    input_handles_native_selection: bool,
+    input_native_selection_enabled: bool,
     is_first_responder: bool,
 ) -> i8 {
     match target_interaction_mode {
         TEXT_INTERACTION_EDITABLE if is_first_responder => TEXT_INTERACTION_EDITABLE,
-        TEXT_INTERACTION_EDITABLE if input_handles_native_selection => TEXT_INTERACTION_EDITABLE,
+        TEXT_INTERACTION_EDITABLE if input_native_selection_enabled => TEXT_INTERACTION_EDITABLE,
         TEXT_INTERACTION_EDITABLE if has_selection_handler => TEXT_INTERACTION_NONEDITABLE,
         TEXT_INTERACTION_EDITABLE => TEXT_INTERACTION_NONE,
         TEXT_INTERACTION_NONEDITABLE => TEXT_INTERACTION_NONEDITABLE,
@@ -203,26 +208,26 @@ fn should_use_system_keyboard(
 
 fn handles_native_touch_selection(
     interaction_mode: i8,
-    input_handles_native_selection: bool,
+    input_native_selection_enabled: bool,
 ) -> bool {
     interaction_mode == TEXT_INTERACTION_NONEDITABLE
-        || (interaction_mode == TEXT_INTERACTION_EDITABLE && input_handles_native_selection)
+        || (interaction_mode == TEXT_INTERACTION_EDITABLE && input_native_selection_enabled)
 }
 
 fn should_report_text_input_range_geometry(
     interaction_mode: i8,
-    input_handles_native_selection: bool,
+    input_native_selection_enabled: bool,
 ) -> bool {
     interaction_mode == TEXT_INTERACTION_EDITABLE
-        || handles_native_touch_selection(interaction_mode, input_handles_native_selection)
+        || handles_native_touch_selection(interaction_mode, input_native_selection_enabled)
 }
 
 fn should_begin_text_interaction(
     interaction_mode: i8,
-    input_handles_native_selection: bool,
+    input_native_selection_enabled: bool,
     hit_selectable_text: bool,
 ) -> bool {
-    handles_native_touch_selection(interaction_mode, input_handles_native_selection)
+    handles_native_touch_selection(interaction_mode, input_native_selection_enabled)
         && hit_selectable_text
 }
 
@@ -239,7 +244,7 @@ fn selection_geometry_contains_interaction_point(
 ) -> bool {
     // UIKit selection handles can begin outside the text rects we report.
     // Treat nearby touches as selection interaction so handle drags are not cleared.
-    let slop = px(ACTIVE_SELECTION_INTERACTION_SLOP);
+    let slop = px(NATIVE_SELECTION_HANDLE_HIT_SLOP);
     geometry
         .bounds
         .as_ref()
@@ -545,9 +550,6 @@ where
         // This releases the borrow before callback execution.
         let preferred_slot = match window.active_text_interaction_mode.get() {
             TEXT_INTERACTION_EDITABLE => Some(HandlerSlot::Input),
-            TEXT_INTERACTION_NONEDITABLE if window.input_handles_native_selection.get() => {
-                Some(HandlerSlot::Input)
-            }
             TEXT_INTERACTION_NONEDITABLE => Some(HandlerSlot::Selection),
             _ => None,
         };
@@ -616,21 +618,21 @@ fn active_text_interaction_mode(view: &Object) -> i8 {
     }
 }
 
-fn input_handles_native_selection_for_gpui(view: &Object) -> bool {
+fn view_input_native_selection_enabled(view: &Object) -> bool {
     unsafe {
         let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
         if window_ptr.is_null() {
             return false;
         }
         let window = &*(window_ptr as *const IosWindow);
-        window.input_handles_native_selection.get()
+        window.input_native_selection_enabled.get()
     }
 }
 
 fn view_handles_native_touch_selection(view: &Object) -> bool {
     handles_native_touch_selection(
         active_text_interaction_mode(view),
-        input_handles_native_selection_for_gpui(view),
+        view_input_native_selection_enabled(view),
     )
 }
 
@@ -1237,16 +1239,17 @@ fn register_metal_view_class() -> &'static Class {
                         false
                     } else {
                         let window = &*(window_ptr as *const IosWindow);
-                        let input_native_selection = window.input_handles_native_selection.get();
+                        let input_native_selection_enabled =
+                            window.input_native_selection_enabled.get();
                         let input_native_tap_count = window.last_touch_tap_count.get();
-                        let input_native_long_press = window
-                            .primary_touch_began_at
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|began_at| {
-                                began_at.elapsed() >= INPUT_NATIVE_SELECTION_LONG_PRESS_MIN_DURATION
-                            });
-                        let hit_selectable_text = if input_native_selection {
+                        let input_native_long_press =
+                            window.primary_touch_began_at.borrow().as_ref().is_some_and(
+                                |began_at| {
+                                    began_at.elapsed()
+                                        >= EDITABLE_NATIVE_SELECTION_LONG_PRESS_MIN_DURATION
+                                },
+                            );
+                        let hit_selectable_text = if input_native_selection_enabled {
                             if input_native_tap_count != 1 || !input_native_long_press {
                                 false
                             } else {
@@ -1261,7 +1264,7 @@ fn register_metal_view_class() -> &'static Class {
                         };
                         should_begin_text_interaction(
                             interaction_mode,
-                            input_native_selection,
+                            input_native_selection_enabled,
                             hit_selectable_text,
                         )
                     }
@@ -1486,10 +1489,10 @@ fn register_metal_view_class() -> &'static Class {
         extern "C" fn set_selected_text_range(this: &mut Object, _sel: Sel, range: *mut Object) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 let interaction_mode = active_text_interaction_mode(this);
-                let input_handles_native_selection = input_handles_native_selection_for_gpui(this);
+                let input_native_selection_enabled = view_input_native_selection_enabled(this);
                 let report_geometry = should_report_text_input_range_geometry(
                     interaction_mode,
-                    input_handles_native_selection,
+                    input_native_selection_enabled,
                 );
                 if !report_geometry {
                     return;
@@ -1498,7 +1501,7 @@ fn register_metal_view_class() -> &'static Class {
                     let requested_range = start..end;
                     let native_touch_selection = handles_native_touch_selection(
                         interaction_mode,
-                        input_handles_native_selection,
+                        input_native_selection_enabled,
                     );
                     let adjusted_range = adjusted_native_selection_range_for_view(
                         this,
@@ -1636,10 +1639,10 @@ fn register_metal_view_class() -> &'static Class {
             sender: *mut Object,
         ) -> BOOL {
             let interaction_mode = active_text_interaction_mode(this);
-            let input_handles_native_selection = input_handles_native_selection_for_gpui(this);
+            let input_native_selection_enabled = view_input_native_selection_enabled(this);
             let policy = edit_menu_action_policy(
                 interaction_mode,
-                input_handles_native_selection,
+                input_native_selection_enabled,
                 action == sel!(copy:),
             );
             let result = match policy {
@@ -2346,10 +2349,10 @@ fn register_metal_view_class() -> &'static Class {
                 // IME candidate UI needs firstRectForRange even when GPUI draws
                 // its own editable caret and selection handles.
                 let interaction_mode = active_text_interaction_mode(this);
-                let input_handles_native_selection = input_handles_native_selection_for_gpui(this);
+                let input_native_selection_enabled = view_input_native_selection_enabled(this);
                 let report_geometry = should_report_text_input_range_geometry(
                     interaction_mode,
-                    input_handles_native_selection,
+                    input_native_selection_enabled,
                 );
                 if !report_geometry {
                     return empty_rect;
@@ -2360,7 +2363,7 @@ fn register_metal_view_class() -> &'static Class {
                 let requested_range = start..end;
                 let native_touch_selection = handles_native_touch_selection(
                     interaction_mode,
-                    input_handles_native_selection,
+                    input_native_selection_enabled,
                 );
                 let effective_range = effective_native_selection_range_for_view(
                     this,
@@ -2396,10 +2399,10 @@ fn register_metal_view_class() -> &'static Class {
         ) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                 let interaction_mode = active_text_interaction_mode(this);
-                let input_handles_native_selection = input_handles_native_selection_for_gpui(this);
+                let input_native_selection_enabled = view_input_native_selection_enabled(this);
                 let native_touch_selection = handles_native_touch_selection(
                     interaction_mode,
-                    input_handles_native_selection,
+                    input_native_selection_enabled,
                 );
                 if !native_touch_selection {
                     return msg_send![class!(NSArray), array];
@@ -3088,8 +3091,10 @@ pub(crate) struct IosWindow {
     input_accepts_text_input: Cell<bool>,
     /// Whether the active input handler belongs to a manual-focus surface.
     input_uses_manual_focus: Cell<bool>,
-    /// Whether the active input handler owns native selection geometry.
-    input_handles_native_selection: Cell<bool>,
+    /// Cached policy bit from the active input handler. UIKit callbacks use
+    /// this to distinguish normal editable input from editable surfaces that
+    /// expose their own native selection geometry.
+    input_native_selection_enabled: Cell<bool>,
     /// Cached text input traits for the active editable handler.
     input_text_input_traits: Cell<PlatformTextInputTraits>,
     /// Whether UIKit should keep the software keyboard up for the active input handler.
@@ -3101,8 +3106,7 @@ pub(crate) struct IosWindow {
     noneditable_text_interaction: *mut Object,
     /// GPUI's desired interaction mode from the current input/selection handlers.
     target_text_interaction_mode: Cell<i8>,
-    /// The active route for UIKit text callbacks; editable mode does not currently
-    /// install UIKit's editable selection interaction on `view`.
+    /// The active route for UIKit text callbacks.
     active_text_interaction_mode: Cell<i8>,
     /// Last UIKit tap count observed for the primary touch.
     last_touch_tap_count: Cell<usize>,
@@ -3273,7 +3277,7 @@ impl IosWindow {
                 callback_selection_handler: RefCell::new(None),
                 input_accepts_text_input: Cell::new(false),
                 input_uses_manual_focus: Cell::new(false),
-                input_handles_native_selection: Cell::new(false),
+                input_native_selection_enabled: Cell::new(false),
                 input_text_input_traits: Cell::new(PlatformTextInputTraits::default()),
                 keyboard_session_requested: Cell::new(false),
                 input_delegate: Cell::new(ptr::null_mut()),
@@ -3415,7 +3419,7 @@ impl IosWindow {
                 callback_selection_handler: RefCell::new(None),
                 input_accepts_text_input: Cell::new(false),
                 input_uses_manual_focus: Cell::new(false),
-                input_handles_native_selection: Cell::new(false),
+                input_native_selection_enabled: Cell::new(false),
                 input_text_input_traits: Cell::new(PlatformTextInputTraits::default()),
                 keyboard_session_requested: Cell::new(false),
                 input_delegate: Cell::new(ptr::null_mut()),
@@ -3528,8 +3532,8 @@ impl IosWindow {
     /// Applies the active text mode without changing GPUI's desired mode.
     ///
     /// Editable input installs UIKit's text interaction for keyboard, IME, and
-    /// dictation plumbing, while the delegate still blocks native touch selection
-    /// for current input handlers.
+    /// dictation plumbing. The delegate only allows touch selection when the
+    /// active input handler explicitly opts into native selection geometry.
     fn install_text_interaction_mode(&self, mode: i8) {
         let previous_mode = self.active_text_interaction_mode.get();
         if previous_mode == mode {
@@ -3571,12 +3575,12 @@ impl IosWindow {
     fn sync_text_interaction_for_current_responder_state(&self) {
         let target_interaction_mode = self.target_text_interaction_mode.get();
         let has_selection_handler = self.selection_handler.borrow().is_some();
-        let input_handles_native_selection = self.input_handles_native_selection.get();
+        let input_native_selection_enabled = self.input_native_selection_enabled.get();
         let is_first_responder = self.active_first_responder_view().is_some();
         let active_mode = active_text_interaction_mode_for_state(
             target_interaction_mode,
             has_selection_handler,
-            input_handles_native_selection,
+            input_native_selection_enabled,
             is_first_responder,
         );
         self.install_text_interaction_mode(active_mode);
@@ -3602,7 +3606,7 @@ impl IosWindow {
         let has_input_handler = self.input_handler.borrow().is_some();
         let has_selection_handler = self.selection_handler.borrow().is_some();
         let input_accepts_text_input = self.input_accepts_text_input.get();
-        let input_handles_native_selection = self.input_handles_native_selection.get();
+        let input_native_selection_enabled = self.input_native_selection_enabled.get();
         let input_uses_manual_focus = self.input_uses_manual_focus.get();
         let keyboard_session_requested = self.keyboard_session_requested.get();
         let software_keyboard_visible = self.is_software_keyboard_visible();
@@ -3611,7 +3615,7 @@ impl IosWindow {
             has_input_handler,
             has_selection_handler,
             input_accepts_text_input,
-            input_handles_native_selection,
+            input_native_selection_enabled,
             input_uses_manual_focus,
             keyboard_session_requested,
             software_keyboard_visible,
@@ -3638,7 +3642,7 @@ impl IosWindow {
     fn refresh_selection_geometry(&self) {
         if !handles_native_touch_selection(
             self.active_text_interaction_mode.get(),
-            self.input_handles_native_selection.get(),
+            self.input_native_selection_enabled.get(),
         ) {
             let cleared = self.last_selection_geometry.borrow_mut().take().is_some();
             if cleared {
@@ -4339,7 +4343,7 @@ impl PlatformWindow for IosWindow {
         let mut input_handler = input_handler;
         let accepts_text_input = input_handler.query_accepts_text_input();
         let uses_manual_focus = input_handler.query_uses_manual_focus();
-        let handles_native_selection = input_handler.query_handles_native_selection();
+        let native_selection_enabled = input_handler.query_handles_native_selection();
         let text_input_traits = input_handler.query_text_input_traits();
         let should_auto_request_keyboard = should_auto_request_soft_keyboard(
             accepts_text_input,
@@ -4351,8 +4355,8 @@ impl PlatformWindow for IosWindow {
         *self.input_handler.borrow_mut() = Some(input_handler);
         self.input_accepts_text_input.set(accepts_text_input);
         self.input_uses_manual_focus.set(uses_manual_focus);
-        self.input_handles_native_selection
-            .set(handles_native_selection);
+        self.input_native_selection_enabled
+            .set(native_selection_enabled);
         let previous_text_input_traits = self.input_text_input_traits.replace(text_input_traits);
         if previous_text_input_traits != text_input_traits {
             self.reload_text_input_views_if_first_responder();
@@ -4372,7 +4376,7 @@ impl PlatformWindow for IosWindow {
         let had_callback_input_handler = self.callback_input_handler.borrow_mut().take().is_some();
         self.input_accepts_text_input.set(false);
         self.input_uses_manual_focus.set(false);
-        self.input_handles_native_selection.set(false);
+        self.input_native_selection_enabled.set(false);
         let previous_text_input_traits = self
             .input_text_input_traits
             .replace(PlatformTextInputTraits::default());
