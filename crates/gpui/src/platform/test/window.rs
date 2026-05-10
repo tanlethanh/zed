@@ -137,7 +137,6 @@ impl TestWindow {
         self.0.lock().selection_handler.take()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn selectable_text_hit_regions_for_test(&self) -> Vec<SelectableTextHitRegion> {
         self.0.lock().selectable_text_hit_regions.clone()
     }

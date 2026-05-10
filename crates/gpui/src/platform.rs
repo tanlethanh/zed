@@ -1919,8 +1919,8 @@ pub trait InputHandler: 'static {
 
     /// Returns whether this handler currently owns native touch-selection geometry.
     ///
-    /// This is for focused surfaces, such as terminals, that need the platform
-    /// text protocol for both keyboard input and an explicitly activated
+    /// This is for surfaces, such as terminals, that need the platform text
+    /// protocol for both keyboard input and an explicitly activated
     /// output-selection document without going through the window-level
     /// read-only selection handler.
     fn handles_native_selection(&mut self, _window: &mut Window, _cx: &mut App) -> bool {

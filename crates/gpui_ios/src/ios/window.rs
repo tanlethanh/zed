@@ -194,7 +194,6 @@ fn should_use_system_keyboard(
     has_input_handler: bool,
     has_callback_input_handler: bool,
     input_accepts_text_input: bool,
-    _input_handles_native_selection: bool,
     keyboard_session_requested: bool,
 ) -> bool {
     keyboard_session_requested
@@ -806,7 +805,6 @@ fn text_input_uses_system_keyboard_for_gpui(view: &Object) -> bool {
             window.input_handler.borrow().is_some(),
             window.callback_input_handler.borrow().is_some(),
             window.input_accepts_text_input.get(),
-            window.input_handles_native_selection.get(),
             window.keyboard_session_requested.get(),
         )
     }
@@ -823,7 +821,6 @@ fn active_text_input_traits_for_gpui(view: &Object) -> PlatformTextInputTraits {
             window.input_handler.borrow().is_some(),
             window.callback_input_handler.borrow().is_some(),
             window.input_accepts_text_input.get(),
-            window.input_handles_native_selection.get(),
             window.keyboard_session_requested.get(),
         ) {
             window.input_text_input_traits.get()
@@ -4875,18 +4872,13 @@ mod tests {
 
     #[test]
     fn system_keyboard_requires_text_input_and_explicit_request() {
-        assert!(should_use_system_keyboard(true, false, true, false, true));
-        assert!(should_use_system_keyboard(false, true, true, false, true));
-        assert!(!should_use_system_keyboard(
-            false, false, false, false, false
-        ));
-        assert!(!should_use_system_keyboard(
-            false, false, false, false, true
-        ));
-        assert!(!should_use_system_keyboard(false, false, true, false, true));
-        assert!(!should_use_system_keyboard(true, false, false, false, true));
-        assert!(!should_use_system_keyboard(true, false, true, false, false));
-        assert!(should_use_system_keyboard(true, false, true, true, true));
+        assert!(should_use_system_keyboard(true, false, true, true));
+        assert!(should_use_system_keyboard(false, true, true, true));
+        assert!(!should_use_system_keyboard(false, false, false, false));
+        assert!(!should_use_system_keyboard(false, false, false, true));
+        assert!(!should_use_system_keyboard(false, false, true, true));
+        assert!(!should_use_system_keyboard(true, false, false, true));
+        assert!(!should_use_system_keyboard(true, false, true, false));
     }
 
     #[test]

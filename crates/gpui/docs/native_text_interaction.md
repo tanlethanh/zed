@@ -14,11 +14,6 @@ selection host view.
 
 Text selection is a read-only document capability layered on top of rendered
 elements. It does not own focus, text mutation, IME, or soft-keyboard policy.
-GPUI splits the model into three parts:
-
-- `SelectionArea`, a logical document boundary for normal element-tree text,
-- `Selectable`, a read-only leaf document for custom-painted surfaces,
-- `WindowSelectionHandler`, the single native selection host for the window.
 
 Use `selection_area(...)` or `div().selection_area()` to create a selectable
 document boundary:
@@ -33,33 +28,21 @@ selection_area(
 
 `div().selection_container()` is an alias for `selection_area()`.
 
-Inside a `SelectionArea`, `StyledText` fragments opt in with:
+`StyledText` fragments opt in with:
 
 - `.selectable()` to register the text with the nearest selection area,
 - `.selection_order(order)` to override paint-order document ordering,
 - `.selection_separator_after(text)` to append copied text across fragment
   boundaries, such as a space or newline.
 
-Custom-painted elements that cannot render through `StyledText` implement
-`Selectable` instead. During paint, they call
-`Window::register_selectable(id, selectable, text_bounds, selection_area_bounds)`.
-The stable id keeps the active range attached to the same custom surface across
-repaints. The selectable answers the same native read-only document queries
-directly: text for UTF-16 range, hit testing, first range bounds, range rects,
-range-change notifications, clearing, and custom selection actions. The active
-range itself remains owned by the window selection state. This keeps custom
-surfaces selectable without making them editable input handlers.
-
 During layout, prepaint, and paint, `SelectionAreaElement` pushes the current
 selection area onto the window stack. During paint it registers the area
 identity and each selectable text fragment painted inside the area. Cached
-subtree reuse must replay area, fragment, and `Selectable` registrations.
+subtree reuse must replay both area and fragment registrations.
 
 After drawing roots, the window installs `PlatformWindow::set_selection_handler`
-if any selection fragments or `Selectable`s were registered. If the frame has no
-read-only selection content, GPUI clears the selection handler and resets
-read-only selection state. There is still only one platform selection handler
-for the window; direct `Selectable`s do not become platform input handlers.
+if any selection fragments were registered. If the frame has no fragments, GPUI
+clears the selection handler and resets read-only selection state.
 
 `WindowSelectionHandler` builds read-only `SelectionDocument`s from the last
 rendered frame:
@@ -73,10 +56,6 @@ rendered frame:
 The document answers selected range, text for a range, hit testing, first range
 bounds, per-line range rects, and selection-range updates from native handles.
 Replacement, marked text, and mutation callbacks are no-ops in this handler.
-When hit testing starts on a registered `Selectable`, `WindowSelectionHandler`
-marks that selectable active and routes subsequent native range, text, rect,
-clear, and action queries to it until the selection is cleared or another
-selection target becomes active.
 
 On iOS, read-only selection uses `TEXT_INTERACTION_NONEDITABLE`. The
 Objective-C `UITextInput` methods dispatch to the selection handler while this
@@ -96,11 +75,9 @@ update.
 
 Current limits:
 
-- built-in fragment registration is implemented for `StyledText`,
-- custom-painted content must provide its own `Selectable` document model and
-  frame-local hit bounds,
+- built-in fragment registration is currently implemented for `StyledText`,
 - selection-scoped custom actions are presented by the iOS edit menu when a
-  read-only `SelectionArea` or `Selectable` is active,
+  read-only `SelectionArea` has an active selection,
 - other platforms can implement native or custom presenters through the
   selection-handler slot without changing the GPUI document model.
 
@@ -117,12 +94,13 @@ whether the handler accepts text input and whether the focused element used
 If the next frame has no input handler, GPUI calls
 `PlatformWindow::clear_input_handler`.
 
-`PlatformInputHandler` carries two policy bits in addition to the callback
+`PlatformInputHandler` carries three policy bits in addition to the callback
 object:
 
 - `accepts_text_input`, from `InputHandler::accepts_text_input`,
 - `uses_manual_focus`, from whether the focused element was registered through
-  `.manual_focus()`.
+  `.manual_focus()`,
+- `handles_native_selection`, from `InputHandler::handles_native_selection`.
 
 Normal editable handlers auto-request the soft keyboard when newly focused.
 Manual-focus handlers still receive text input, but they do not auto-show the
@@ -149,21 +127,21 @@ active.
 Terminal-like views that own focus manually should use `.manual_focus()` on the
 focus-tracked element. They can still provide a normal input handler for PTY
 keyboard input, but keyboard presentation is explicit. Terminal content should
-not register the painted grid as a passive `Selectable`, because ordinary text
-hits would then compete with tap-to-focus keyboard behavior. Instead, a terminal
-input handler can explicitly report `handles_native_selection()` for its
-terminal surface. iOS then asks that same handler whether a native text
-interaction point hits terminal output. GPUI must not
-suppress the window touch stream from that hit test alone. Terminal input-native
-selection is a long-press path; normal taps stay with GPUI keyboard activation,
-and double tap should not start terminal selection. The native path owns range,
-text, rect, copy, and custom selection-action callbacks once the long press
-begins. Blank-cell paste should be implemented by the app as a separate native
-edit menu, not by broadening GPUI text-selection policy. Ordinary terminal taps
-should keep their existing focus/keyboard toggle
-policy: unfocused taps focus and request the keyboard, focused taps with a
-hidden keyboard request it again, and focused taps with a visible keyboard hide
-it and clear focus. The output document remains read-only from the handler's
+not route the painted grid through the read-only `SelectionArea` path, because
+ordinary text hits would then compete with tap-to-focus keyboard behavior.
+Instead, a terminal input handler can explicitly report
+`handles_native_selection()` for its terminal surface. iOS then asks that same
+handler whether a native text interaction point hits terminal output. GPUI must
+not suppress the window touch stream from that hit test alone. Terminal
+input-native selection is a long-press path; normal taps stay with GPUI keyboard
+activation, and double tap should not start terminal selection. The native path
+owns range, text, rect, copy, and custom selection-action callbacks once the
+long press begins. Blank-cell paste should be implemented by the app as a
+separate native edit menu, not by broadening GPUI text-selection policy.
+Ordinary terminal taps should keep their existing focus/keyboard toggle policy:
+unfocused taps focus and request the keyboard, focused taps with a hidden
+keyboard request it again, and focused taps with a visible keyboard hide it and
+clear focus. The output document remains read-only from the handler's
 perspective: keyboard, IME, and dictation mutations must clear or ignore output
 selection and continue through the terminal input path rather than replacing
 terminal output. If a touch only dismisses an active native output selection,
