@@ -11,17 +11,17 @@ use crate::{
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformTextInputTraits, PlatformWindow,
     Point, PointerCancelEvent, PointerEvent, PointerUpEvent, PolychromeSprite, Priority,
-    PromptButton, PromptLevel, Quad, ReadOnlySelectionSnapshot, RegisteredSelectionArea,
-    RegisteredTextSelectionFragment, Render, RenderGlyphParams, RenderImage, RenderImageParams,
-    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SelectableTextHitRegion, SelectionArea,
-    SelectionState, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextSelectionFragment, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowSelectionHandler, WindowTextSystem, point, prelude::*, px,
-    rems, size, transparent_black,
+    PromptButton, PromptLevel, Quad, ReadOnlySelectionSnapshot, RegisteredSelectable,
+    RegisteredSelectionArea, RegisteredTextSelectionFragment, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Selectable,
+    SelectableTextHitRegion, SelectionArea, SelectionState, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode,
+    TextSelectionFragment, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowSelectionHandler,
+    WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -782,6 +782,7 @@ pub(crate) struct Frame {
     pub(crate) manual_focus_handles: Vec<FocusId>,
     pub(crate) selection_areas: Vec<RegisteredSelectionArea>,
     pub(crate) selection_fragments: Vec<RegisteredTextSelectionFragment>,
+    pub(crate) selectables: Vec<RegisteredSelectable>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
@@ -811,6 +812,7 @@ pub(crate) struct PaintIndex {
     manual_focus_handles_index: usize,
     selection_areas_index: usize,
     selection_fragments_index: usize,
+    selectables_index: usize,
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
@@ -834,6 +836,7 @@ impl Frame {
             manual_focus_handles: Vec::new(),
             selection_areas: Vec::new(),
             selection_fragments: Vec::new(),
+            selectables: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
 
@@ -859,6 +862,7 @@ impl Frame {
         self.manual_focus_handles.clear();
         self.selection_areas.clear();
         self.selection_fragments.clear();
+        self.selectables.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
@@ -1718,7 +1722,9 @@ impl Window {
     }
 
     fn clear_active_selection(&mut self) {
-        if self.selection_state.active_area.is_none() && self.selection_state.range_utf16.is_none()
+        if self.selection_state.active_area.is_none()
+            && self.selection_state.range_utf16.is_none()
+            && self.selection_state.selectable_id.is_none()
         {
             return;
         }
@@ -1745,6 +1751,13 @@ impl Window {
     /// Clear the cached read-only text selection.
     pub fn clear_read_only_selection_cache(&mut self) {
         self.latest_read_only_selection = None;
+    }
+
+    /// Clear any active platform-owned read-only text selection.
+    pub fn clear_read_only_selection(&mut self) {
+        self.selection_state = SelectionState::default();
+        self.latest_read_only_selection = None;
+        self.platform_window.clear_active_selection();
     }
 
     /// Move focus to the element associated with the given [`FocusHandle`].
@@ -2412,27 +2425,35 @@ impl Window {
         } else {
             self.platform_window.clear_input_handler();
         }
-        self.platform_window.set_selectable_text_hit_regions(
-            self.next_frame
-                .selection_fragments
-                .iter()
-                .map(|fragment| {
-                    let text_bounds = fragment.fragment().layout().bounds();
-                    let selection_area_bounds =
-                        fragment.selection_area_bounds().unwrap_or(text_bounds);
-                    SelectableTextHitRegion::new(
-                        text_bounds,
+        let selectable_text_hit_regions = self
+            .next_frame
+            .selection_fragments
+            .iter()
+            .map(|fragment| {
+                let text_bounds = fragment.fragment().layout().bounds();
+                let selection_area_bounds = fragment.selection_area_bounds().unwrap_or(text_bounds);
+                SelectableTextHitRegion::new(
+                    text_bounds,
+                    selection_area_bounds,
+                    selectable_text_occluding_bounds(
+                        &self.next_frame,
                         selection_area_bounds,
-                        selectable_text_occluding_bounds(
-                            &self.next_frame,
-                            selection_area_bounds,
-                            fragment.selection_area_hitbox_range(),
-                        ),
-                    )
-                })
-                .collect(),
-        );
-        if self.next_frame.selection_fragments.is_empty() {
+                        fragment.selection_area_hitbox_range(),
+                    ),
+                )
+            })
+            .chain(
+                self.next_frame
+                    .selectables
+                    .iter()
+                    .map(|selectable| selectable.hit_region.clone()),
+            )
+            .collect();
+        self.platform_window
+            .set_selectable_text_hit_regions(selectable_text_hit_regions);
+
+        if self.next_frame.selection_fragments.is_empty() && self.next_frame.selectables.is_empty()
+        {
             self.selection_state = SelectionState::default();
             self.latest_read_only_selection = None;
             self.platform_window.clear_selection_handler();
@@ -2441,6 +2462,7 @@ impl Window {
                 .set_selection_handler(PlatformInputHandler::new(
                     self.to_async(cx),
                     Box::new(WindowSelectionHandler),
+                    false,
                     false,
                     false,
                     PlatformTextInputTraits::default(),
@@ -2849,6 +2871,7 @@ impl Window {
             manual_focus_handles_index: self.next_frame.manual_focus_handles.len(),
             selection_areas_index: self.next_frame.selection_areas.len(),
             selection_fragments_index: self.next_frame.selection_fragments.len(),
+            selectables_index: self.next_frame.selectables.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
@@ -2884,6 +2907,12 @@ impl Window {
         self.next_frame.selection_fragments.extend(
             self.rendered_frame.selection_fragments
                 [range.start.selection_fragments_index..range.end.selection_fragments_index]
+                .iter()
+                .cloned(),
+        );
+        self.next_frame.selectables.extend(
+            self.rendered_frame.selectables
+                [range.start.selectables_index..range.end.selectables_index]
                 .iter()
                 .cloned(),
         );
@@ -4236,7 +4265,11 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        if focus_handle.is_focused(self) {
+        // Native-selection handlers must be installed before focus so UIKit can
+        // claim gestures like double-tap selection instead of losing the first
+        // tap to a GPUI focus/keyboard press.
+        let handles_native_selection = input_handler.handles_native_selection(self, cx);
+        if focus_handle.is_focused(self) || handles_native_selection {
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
             let text_input_traits = input_handler.text_input_traits(self, cx);
             let uses_manual_focus = self
@@ -4251,9 +4284,31 @@ impl Window {
                     Box::new(input_handler),
                     accepts_text_input,
                     uses_manual_focus,
+                    handles_native_selection,
                     text_input_traits,
                 )));
         }
+    }
+
+    /// Registers a selectable document for custom-painted text in the current frame.
+    ///
+    /// This is for surfaces that render text themselves and cannot provide styled text fragments,
+    /// but can still answer native text-selection queries in UTF-16 document coordinates. The id
+    /// keeps an active selection attached to the same custom surface across repaints.
+    pub fn register_selectable(
+        &mut self,
+        id: impl Into<ElementId>,
+        selectable: impl Selectable,
+        text_bounds: Bounds<Pixels>,
+        selection_area_bounds: Bounds<Pixels>,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let hit_region =
+            SelectableTextHitRegion::new(text_bounds, selection_area_bounds, SmallVec::new());
+        self.next_frame
+            .selectables
+            .push(RegisteredSelectable::new(id, selectable, hit_region));
     }
 
     /// Register a mouse event listener on the window for the next frame. The type of event
@@ -6138,6 +6193,39 @@ mod tests {
     use super::*;
     use crate::{Empty, TestAppContext};
 
+    struct TestSelectable;
+
+    impl Selectable for TestSelectable {
+        fn text_for_range(
+            &mut self,
+            _range_utf16: Range<usize>,
+            adjusted_range: &mut Option<Range<usize>>,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Option<String> {
+            *adjusted_range = Some(0..0);
+            Some(String::new())
+        }
+
+        fn bounds_for_range(
+            &mut self,
+            _range_utf16: Range<usize>,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _point: Point<Pixels>,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Option<usize> {
+            None
+        }
+    }
+
     #[test]
     fn reuse_paint_replays_manual_focus_handles() {
         let mut cx = TestAppContext::single();
@@ -6165,6 +6253,45 @@ mod tests {
                     .next_frame
                     .manual_focus_handles
                     .contains(&focus_handle.id)
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reuse_paint_replays_selectables() {
+        let mut cx = TestAppContext::single();
+        let window_handle = cx.add_window(|_, _| Empty);
+
+        cx.update_window(window_handle.into(), |_, window, _| {
+            let start = PaintIndex {
+                selectables_index: 0,
+                ..Default::default()
+            };
+            let bounds = Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(10.0), px(10.0)),
+            };
+            window
+                .rendered_frame
+                .selectables
+                .push(RegisteredSelectable::new(
+                    "test-selectable",
+                    TestSelectable,
+                    SelectableTextHitRegion::new(bounds, bounds, SmallVec::new()),
+                ));
+            let end = PaintIndex {
+                selectables_index: 1,
+                ..Default::default()
+            };
+
+            window.reuse_paint(start..end);
+
+            assert_eq!(window.next_frame.selectables.len(), 1);
+            assert!(
+                window.next_frame.selectables[0]
+                    .hit_region
+                    .contains_text(point(px(1.0), px(1.0)))
             );
         })
         .unwrap();

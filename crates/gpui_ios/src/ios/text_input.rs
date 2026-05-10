@@ -223,6 +223,18 @@ pub fn get_range_indices(range: *mut Object) -> Option<(usize, usize)> {
     }
 }
 
+/// Update the start and end indices of a GPUITextRange in place.
+pub fn set_range_indices(range: *mut Object, start: usize, end: usize) -> bool {
+    if range.is_null() {
+        return false;
+    }
+    unsafe {
+        (*range).set_ivar(GPUI_RANGE_START_IVAR, start);
+        (*range).set_ivar(GPUI_RANGE_END_IVAR, end);
+    }
+    true
+}
+
 /// Convert a key code from UIKeyboardHIDUsage to a GPUI key string.
 ///
 /// UIKeyboardHIDUsage values are based on the USB HID specification.

@@ -1,10 +1,10 @@
 use crate::{
     Action, AnyElement, App, Bounds, Element, ElementId, EntityId, GlobalElementId, HitboxBehavior,
-    InputHandler, InspectorElementId, IntoElement, LayoutId, Pixels, Point, SharedString,
-    TextLayout, UTF16Selection, Window,
+    InputHandler, InspectorElementId, IntoElement, LayoutId, Pixels, Point,
+    SelectableTextHitRegion, SharedString, TextLayout, UTF16Selection, Window,
 };
 use smallvec::SmallVec;
-use std::ops::Range;
+use std::{cell::RefCell, ops::Range, rc::Rc};
 
 /// Wrap a subtree in a logical text-selection boundary.
 ///
@@ -148,6 +148,194 @@ impl Clone for SelectionAction {
             image_name: self.image_name.clone(),
             action: self.action.boxed_clone(),
         }
+    }
+}
+
+/// A read-only selectable document owned by a rendered element.
+///
+/// `Selectable` is the leaf contract for custom-painted content that wants to
+/// participate in native text selection without becoming an editable text
+/// input. Implementations use UTF-16 document offsets because the platform
+/// selection protocols use UTF-16.
+pub trait Selectable: 'static {
+    /// Returns text for the given UTF-16 range and the clamped range used.
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String>;
+
+    /// Returns the document length in UTF-16 code units.
+    fn text_len_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
+        let mut adjusted_range = None;
+        let text = self.text_for_range(usize::MAX..usize::MAX, &mut adjusted_range, window, cx)?;
+        Some(adjusted_range.map_or_else(|| utf16_len(&text), |range| range.end))
+    }
+
+    /// Returns the first visual bounds for a UTF-16 range.
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>>;
+
+    /// Returns visual rects for a UTF-16 range.
+    fn rects_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> SmallVec<[Bounds<Pixels>; 4]> {
+        if range_utf16.is_empty() {
+            SmallVec::new()
+        } else {
+            self.bounds_for_range(range_utf16, window, cx)
+                .into_iter()
+                .collect()
+        }
+    }
+
+    /// Returns the character offset at a selectable point.
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize>;
+
+    /// Returns the nearest character offset once selection is active.
+    fn nearest_character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.character_index_for_point(point, window, cx)
+    }
+
+    /// Notifies the selectable that the active selection range changed.
+    fn set_selected_text_range(
+        &mut self,
+        _range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    /// Clears the active selection range.
+    fn clear_selected_text_range(&mut self, _window: &mut Window, _cx: &mut App) {}
+
+    /// Returns custom actions for the native selection menu.
+    fn selection_actions(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> SmallVec<[SelectionAction; 4]> {
+        SmallVec::new()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RegisteredSelectable {
+    pub(crate) id: ElementId,
+    selectable: Rc<RefCell<Box<dyn Selectable>>>,
+    pub(crate) hit_region: SelectableTextHitRegion,
+}
+
+impl RegisteredSelectable {
+    pub(crate) fn new(
+        id: impl Into<ElementId>,
+        selectable: impl Selectable,
+        hit_region: SelectableTextHitRegion,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            selectable: Rc::new(RefCell::new(Box::new(selectable))),
+            hit_region,
+        }
+    }
+
+    fn text_for_range(
+        &self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        self.selectable
+            .borrow_mut()
+            .text_for_range(range_utf16, adjusted_range, window, cx)
+    }
+
+    fn text_len_utf16(&self, window: &mut Window, cx: &mut App) -> Option<usize> {
+        self.selectable.borrow_mut().text_len_utf16(window, cx)
+    }
+
+    fn bounds_for_range(
+        &self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        self.selectable
+            .borrow_mut()
+            .bounds_for_range(range_utf16, window, cx)
+    }
+
+    fn rects_for_range(
+        &self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> SmallVec<[Bounds<Pixels>; 4]> {
+        self.selectable
+            .borrow_mut()
+            .rects_for_range(range_utf16, window, cx)
+    }
+
+    fn character_index_for_point(
+        &self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.selectable
+            .borrow_mut()
+            .character_index_for_point(point, window, cx)
+    }
+
+    fn nearest_character_index_for_point(
+        &self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.selectable
+            .borrow_mut()
+            .nearest_character_index_for_point(point, window, cx)
+    }
+
+    fn set_selected_text_range(&self, range: Range<usize>, window: &mut Window, cx: &mut App) {
+        self.selectable
+            .borrow_mut()
+            .set_selected_text_range(range, window, cx);
+    }
+
+    fn clear_selected_text_range(&self, window: &mut Window, cx: &mut App) {
+        self.selectable
+            .borrow_mut()
+            .clear_selected_text_range(window, cx);
+    }
+
+    fn selection_actions(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> SmallVec<[SelectionAction; 4]> {
+        self.selectable.borrow_mut().selection_actions(window, cx)
     }
 }
 
@@ -370,6 +558,7 @@ impl SelectionAreaKey {
 #[derive(Clone, Default)]
 pub(crate) struct SelectionState {
     pub(crate) active_area: Option<SelectionAreaKey>,
+    pub(crate) selectable_id: Option<ElementId>,
     pub(crate) range_utf16: Option<Range<usize>>,
     pub(crate) reversed: bool,
 }
@@ -764,11 +953,44 @@ fn cache_read_only_selection(
     }
 }
 
+fn active_selectable(window: &Window) -> Option<RegisteredSelectable> {
+    let active_id = window.selection_state.selectable_id.as_ref()?;
+    window
+        .rendered_frame
+        .selectables
+        .iter()
+        .find(|selectable| &selectable.id == active_id)
+        .cloned()
+}
+
+fn clamp_utf16_range(range: Range<usize>, len_utf16: usize) -> Range<usize> {
+    let start = range.start.min(len_utf16);
+    let end = range.end.min(len_utf16);
+    start.min(end)..start.max(end)
+}
+
+fn active_selectable_range(
+    window: &mut Window,
+    cx: &mut App,
+    selectable: &RegisteredSelectable,
+) -> Option<Range<usize>> {
+    let len_utf16 = selectable.text_len_utf16(window, cx)?;
+    let range = window
+        .selection_state
+        .range_utf16
+        .clone()
+        .map(|range| clamp_utf16_range(range, len_utf16))
+        .unwrap_or(0..0);
+    window.selection_state.range_utf16 = Some(range.clone());
+    Some(range)
+}
+
 /// Window-level read-only selection bridge.
 ///
 /// Platform backends expose this through their native text-input surface so
 /// system selection UI, such as iOS noneditable `UITextInteraction`, can query
-/// text, ranges, hit testing, and selection rects for GPUI `SelectionArea`s.
+/// text, ranges, hit testing, and selection rects for GPUI `SelectionArea`s and
+/// custom-painted [`Selectable`]s.
 #[derive(Default)]
 pub(crate) struct WindowSelectionHandler;
 
@@ -777,8 +999,15 @@ impl InputHandler for WindowSelectionHandler {
         &mut self,
         _ignore_disabled_input: bool,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<UTF16Selection> {
+        if let Some(selectable) = active_selectable(window) {
+            return Some(UTF16Selection {
+                range: active_selectable_range(window, cx, &selectable)?,
+                reversed: window.selection_state.reversed,
+            });
+        }
+
         let document = SelectionDocument::active(window)?;
         let range = window
             .selection_state
@@ -803,12 +1032,24 @@ impl InputHandler for WindowSelectionHandler {
         range_utf16: Range<usize>,
         adjusted_range: &mut Option<Range<usize>>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<String> {
+        if let Some(selectable) = active_selectable(window) {
+            return selectable.text_for_range(range_utf16, adjusted_range, window, cx);
+        }
+
         let document = SelectionDocument::active(window)?;
         let range_utf16 = document.clamped_range(range_utf16);
         *adjusted_range = Some(range_utf16.clone());
         document.text_for_range(range_utf16)
+    }
+
+    fn text_len_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
+        if let Some(selectable) = active_selectable(window) {
+            return selectable.text_len_utf16(window, cx);
+        }
+
+        Some(SelectionDocument::active(window)?.len_utf16)
     }
 
     fn replace_text_in_range(
@@ -836,8 +1077,12 @@ impl InputHandler for WindowSelectionHandler {
         &mut self,
         range_utf16: Range<usize>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(selectable) = active_selectable(window) {
+            return selectable.bounds_for_range(range_utf16, window, cx);
+        }
+
         SelectionDocument::active(window)?.bounds_for_range(range_utf16)
     }
 
@@ -845,8 +1090,12 @@ impl InputHandler for WindowSelectionHandler {
         &mut self,
         range_utf16: Range<usize>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> SmallVec<[Bounds<Pixels>; 4]> {
+        if let Some(selectable) = active_selectable(window) {
+            return selectable.rects_for_range(range_utf16, window, cx);
+        }
+
         SelectionDocument::active(window)
             .map(|document| document.rects_for_range(range_utf16))
             .unwrap_or_default()
@@ -856,8 +1105,31 @@ impl InputHandler for WindowSelectionHandler {
         &mut self,
         point: Point<Pixels>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<usize> {
+        let selectables = window.rendered_frame.selectables.clone();
+        for selectable in selectables {
+            if !selectable.hit_region.contains_text(point) {
+                continue;
+            }
+
+            let Some(index) = selectable.character_index_for_point(point, window, cx) else {
+                continue;
+            };
+
+            let selectable_changed =
+                window.selection_state.selectable_id.as_ref() != Some(&selectable.id);
+            window.selection_state.active_area = None;
+            window.selection_state.selectable_id = Some(selectable.id.clone());
+            if selectable_changed || window.selection_state.range_utf16.is_none() {
+                window.selection_state.range_utf16 = Some(index..index);
+                window.selection_state.reversed = false;
+                selectable.set_selected_text_range(index..index, window, cx);
+            }
+
+            return Some(index);
+        }
+
         let documents = SelectionDocument::all(window);
         let hit = documents.iter().find_map(|document| {
             document
@@ -868,6 +1140,7 @@ impl InputHandler for WindowSelectionHandler {
 
         let area_changed = window.selection_state.active_area.as_ref() != Some(key);
         window.selection_state.active_area = Some(key.clone());
+        window.selection_state.selectable_id = None;
         if area_changed || window.selection_state.range_utf16.is_none() {
             window.selection_state.range_utf16 = Some(index..index);
             window.selection_state.reversed = false;
@@ -880,8 +1153,12 @@ impl InputHandler for WindowSelectionHandler {
         &mut self,
         point: Point<Pixels>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<usize> {
+        if let Some(selectable) = active_selectable(window) {
+            return selectable.nearest_character_index_for_point(point, window, cx);
+        }
+
         let active_document = SelectionDocument::active(window);
         let documents = SelectionDocument::all(window);
         active_document
@@ -894,7 +1171,16 @@ impl InputHandler for WindowSelectionHandler {
         false
     }
 
-    fn set_selected_text_range(&mut self, range: Range<usize>, window: &mut Window, _cx: &mut App) {
+    fn set_selected_text_range(&mut self, range: Range<usize>, window: &mut Window, cx: &mut App) {
+        if let Some(selectable) = active_selectable(window) {
+            let len_utf16 = selectable.text_len_utf16(window, cx).unwrap_or(range.end);
+            let range = clamp_utf16_range(range, len_utf16);
+            window.selection_state.range_utf16 = Some(range.clone());
+            window.selection_state.reversed = false;
+            selectable.set_selected_text_range(range, window, cx);
+            return;
+        }
+
         let Some(document) = SelectionDocument::active(window) else {
             return;
         };
@@ -904,15 +1190,22 @@ impl InputHandler for WindowSelectionHandler {
         cache_read_only_selection(window, &document, range);
     }
 
-    fn clear_selected_text_range(&mut self, window: &mut Window, _cx: &mut App) {
+    fn clear_selected_text_range(&mut self, window: &mut Window, cx: &mut App) {
+        if let Some(selectable) = active_selectable(window) {
+            selectable.clear_selected_text_range(window, cx);
+        }
         window.selection_state = SelectionState::default();
     }
 
     fn selection_actions(
         &mut self,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> SmallVec<[SelectionAction; 4]> {
+        if let Some(selectable) = active_selectable(window) {
+            return selectable.selection_actions(window, cx);
+        }
+
         let Some(document) = SelectionDocument::active(window) else {
             return SmallVec::new();
         };
@@ -1169,16 +1462,18 @@ impl IntoElement for SelectionAreaElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectionAreaKey, SelectionDocument, SelectionState};
+    use super::{Selectable, SelectionAction, SelectionAreaKey, SelectionDocument, SelectionState};
     use crate::EntityId;
     use crate::{
         self as gpui, AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement,
         InteractiveText, IntoElement, Modifiers, ParentElement, Pixels, PointerButton,
         PointerDownEvent, PointerKind, PointerUpEvent, Render, Styled, StyledText, TestAppContext,
-        TextLayout, Window, div, point, px, selection_area,
+        TextLayout, Window, canvas, div, point, px, selection_area,
     };
+    use smallvec::{SmallVec, smallvec};
     use std::{
         cell::{Cell, RefCell},
+        ops::Range,
         rc::Rc,
     };
 
@@ -1210,6 +1505,120 @@ mod tests {
             selection_area(div().child(StyledText::new("hello").selectable()))
                 .action_with_system_image("Add to Chat", "plus.bubble", SelectionMenuAction)
                 .action("Other", OtherSelectionMenuAction)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestSelectableState {
+        range: Rc<RefCell<Option<Range<usize>>>>,
+    }
+
+    struct TestSelectable {
+        state: TestSelectableState,
+        bounds: crate::Bounds<Pixels>,
+    }
+
+    impl Selectable for TestSelectable {
+        fn text_for_range(
+            &mut self,
+            range_utf16: Range<usize>,
+            adjusted_range: &mut Option<Range<usize>>,
+            _window: &mut Window,
+            _cx: &mut crate::App,
+        ) -> Option<String> {
+            let text = "terminal";
+            let start = range_utf16.start.min(text.len());
+            let end = range_utf16.end.min(text.len());
+            let range = start.min(end)..start.max(end);
+            *adjusted_range = Some(range.clone());
+            Some(text[range].to_string())
+        }
+
+        fn text_len_utf16(&mut self, _window: &mut Window, _cx: &mut crate::App) -> Option<usize> {
+            Some("terminal".len())
+        }
+
+        fn bounds_for_range(
+            &mut self,
+            _range_utf16: Range<usize>,
+            _window: &mut Window,
+            _cx: &mut crate::App,
+        ) -> Option<crate::Bounds<Pixels>> {
+            Some(self.bounds)
+        }
+
+        fn rects_for_range(
+            &mut self,
+            _range_utf16: Range<usize>,
+            _window: &mut Window,
+            _cx: &mut crate::App,
+        ) -> SmallVec<[crate::Bounds<Pixels>; 4]> {
+            smallvec![self.bounds]
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            point: crate::Point<Pixels>,
+            _window: &mut Window,
+            _cx: &mut crate::App,
+        ) -> Option<usize> {
+            self.bounds.contains(&point).then_some(1)
+        }
+
+        fn nearest_character_index_for_point(
+            &mut self,
+            point: crate::Point<Pixels>,
+            _window: &mut Window,
+            _cx: &mut crate::App,
+        ) -> Option<usize> {
+            self.bounds.contains(&point).then_some(2)
+        }
+
+        fn set_selected_text_range(
+            &mut self,
+            range: Range<usize>,
+            _window: &mut Window,
+            _cx: &mut crate::App,
+        ) {
+            self.state.range.replace(Some(range));
+        }
+
+        fn clear_selected_text_range(&mut self, _window: &mut Window, _cx: &mut crate::App) {
+            self.state.range.take();
+        }
+
+        fn selection_actions(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut crate::App,
+        ) -> SmallVec<[SelectionAction; 4]> {
+            smallvec![SelectionAction::new("Paste", SelectionMenuAction)]
+        }
+    }
+
+    struct CustomSelectableTestView {
+        state: TestSelectableState,
+    }
+
+    impl Render for CustomSelectableTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let state = self.state.clone();
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    window.register_selectable(
+                        "custom-selectable",
+                        TestSelectable {
+                            state: state.clone(),
+                            bounds,
+                        },
+                        bounds,
+                        bounds,
+                    );
+                },
+            )
+            .w(px(100.0))
+            .h(px(24.0))
         }
     }
 
@@ -1460,6 +1869,7 @@ mod tests {
                 let document = SelectionDocument::all(window).into_iter().next().unwrap();
                 window.selection_state = SelectionState {
                     active_area: Some(document.key.clone()),
+                    selectable_id: None,
                     range_utf16: Some(0..11),
                     reversed: false,
                 };
@@ -1520,6 +1930,7 @@ mod tests {
                 let document = SelectionDocument::all(window).into_iter().next().unwrap();
                 window.selection_state = SelectionState {
                     active_area: Some(document.key.clone()),
+                    selectable_id: None,
                     range_utf16: Some(0..5),
                     reversed: false,
                 };
@@ -1577,6 +1988,7 @@ mod tests {
                 let document = SelectionDocument::all(window).into_iter().next().unwrap();
                 window.selection_state = SelectionState {
                     active_area: Some(document.key.clone()),
+                    selectable_id: None,
                     range_utf16: Some(0..5),
                     reversed: false,
                 };
@@ -1629,6 +2041,7 @@ mod tests {
                 let document = SelectionDocument::all(window).into_iter().next().unwrap();
                 window.selection_state = SelectionState {
                     active_area: Some(document.key.clone()),
+                    selectable_id: None,
                     range_utf16: Some(10..20),
                     reversed: false,
                 };
@@ -1646,6 +2059,61 @@ mod tests {
     }
 
     #[gpui::test]
+    fn selection_handler_routes_custom_selectable(cx: &mut TestAppContext) {
+        let state = TestSelectableState::default();
+        let paste_count = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            let paste_count = paste_count.clone();
+            cx.on_action(move |_: &SelectionMenuAction, _| {
+                paste_count.set(paste_count.get() + 1);
+            });
+        });
+
+        let window = cx.update(|cx| {
+            let state = state.clone();
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| CustomSelectableTestView { state })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+
+        let hit_point = point(px(10.0), px(10.0));
+        assert!(selection_fast_hit_cache_claims_point(
+            cx, *window, hit_point
+        ));
+
+        let mut handler = cx
+            .test_window(*window)
+            .take_selection_handler_for_test()
+            .unwrap();
+        assert_eq!(handler.character_index_for_point(hit_point), Some(1));
+        assert_eq!(*state.range.borrow(), Some(1..1));
+        assert_eq!(
+            handler.nearest_character_index_for_point(hit_point),
+            Some(2)
+        );
+
+        let mut adjusted_range = None;
+        assert_eq!(
+            handler.text_for_range(0..4, &mut adjusted_range).as_deref(),
+            Some("term")
+        );
+        assert_eq!(adjusted_range, Some(0..4));
+        assert_eq!(handler.text_len_utf16(), Some("terminal".len()));
+
+        handler.set_selected_text_range(0..4);
+        assert_eq!(handler.selected_text_range(false).unwrap().range, 0..4);
+        assert_eq!(handler.selection_action_names(), vec!["Paste"]);
+        handler.perform_selection_action(0);
+        cx.run_until_parked();
+        assert_eq!(paste_count.get(), 1);
+
+        handler.clear_selected_text_range();
+        assert!(state.range.borrow().is_none());
+    }
+
+    #[gpui::test]
     fn selection_handler_preserves_selection_when_global_key_shifts(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |_, cx| cx.new(|_| SelectionTestView))
@@ -1659,6 +2127,7 @@ mod tests {
                 let area_id = document.key.selection_area_id().unwrap().clone();
                 window.selection_state = SelectionState {
                     active_area: Some(SelectionAreaKey::ViewScoped(EntityId::from(9_999), area_id)),
+                    selectable_id: None,
                     range_utf16: Some(0..5),
                     reversed: false,
                 };
@@ -1951,6 +2420,7 @@ mod tests {
                 let document = SelectionDocument::all(window).into_iter().next().unwrap();
                 window.selection_state = SelectionState {
                     active_area: Some(document.key.clone()),
+                    selectable_id: None,
                     range_utf16: Some(0..5),
                     reversed: false,
                 };
