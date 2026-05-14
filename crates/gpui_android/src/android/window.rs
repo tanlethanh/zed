@@ -20,7 +20,7 @@ use gpui::{
     Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent,
     PointerUpEvent, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
     ScrollWheelEvent, Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, point, px,
+    WindowControlArea, point, px, should_auto_request_soft_keyboard,
 };
 use gpui_wgpu::{GpuContext, WgpuAtlas, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -393,6 +393,58 @@ impl AndroidWindowState {
         }
     }
 
+    fn with_text_input_handler(&mut self, f: impl FnOnce(&mut PlatformInputHandler)) -> bool {
+        let Some(mut input_handler) = self.input_handler.take() else {
+            return false;
+        };
+
+        let handled = if input_handler.query_accepts_text_input() {
+            f(&mut input_handler);
+            true
+        } else {
+            false
+        };
+        self.input_handler = Some(input_handler);
+        handled
+    }
+
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        self.with_text_input_handler(|handler| handler.insert_text(text))
+    }
+
+    pub fn delete_backward(&mut self, count: usize) -> bool {
+        if count == 0 {
+            return false;
+        }
+        self.with_text_input_handler(|handler| {
+            for _ in 0..count {
+                handler.delete_backward();
+            }
+        })
+    }
+
+    pub fn set_composing_text(&mut self, text: &str, new_cursor_position: i32) -> bool {
+        let len = text.encode_utf16().count();
+        let cursor = if new_cursor_position > 0 {
+            len.saturating_add((new_cursor_position - 1) as usize)
+        } else {
+            new_cursor_position.saturating_neg() as usize
+        }
+        .min(len);
+
+        self.with_text_input_handler(|handler| {
+            if text.is_empty() {
+                handler.unmark_text();
+            } else {
+                handler.set_marked_text(text, Some(cursor..cursor), None);
+            }
+        })
+    }
+
+    pub fn finish_composing_text(&mut self) -> bool {
+        self.with_text_input_handler(|handler| handler.unmark_text())
+    }
+
     /// Handle a raw Android touch event (ACTION_DOWN/MOVE/UP/CANCEL).
     ///
     /// Coordinates are physical pixels. Android windows keep touch state
@@ -689,11 +741,46 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
-        self.state.borrow_mut().input_handler = Some(input_handler);
+        let mut input_handler = input_handler;
+        let should_auto_request_keyboard = {
+            let mut state = self.state.borrow_mut();
+            let had_input_handler = state.input_handler.is_some();
+            let accepts_text_input = input_handler.query_accepts_text_input();
+            let uses_manual_focus = input_handler.query_uses_manual_focus();
+            state.input_handler = Some(input_handler);
+            should_auto_request_soft_keyboard(
+                accepts_text_input,
+                uses_manual_focus,
+                had_input_handler,
+            )
+        };
+
+        if should_auto_request_keyboard {
+            super::app_state::with_platform(|platform| platform.request_soft_keyboard());
+        }
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.state.borrow_mut().input_handler.take()
+    }
+
+    fn clear_input_handler(&mut self) {
+        let had_input_handler = self.state.borrow_mut().input_handler.take().is_some();
+        if had_input_handler {
+            super::app_state::with_platform(|platform| platform.hide_soft_keyboard());
+        }
+    }
+
+    fn show_soft_keyboard(&self) {
+        super::app_state::with_platform(|platform| platform.request_soft_keyboard());
+    }
+
+    fn hide_soft_keyboard(&self) {
+        super::app_state::with_platform(|platform| platform.hide_soft_keyboard());
+    }
+
+    fn is_soft_keyboard_visible(&self) -> bool {
+        super::ffi::keyboard_height() > 0
     }
 
     fn prompt(

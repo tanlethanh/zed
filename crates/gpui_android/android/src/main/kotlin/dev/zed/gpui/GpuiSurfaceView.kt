@@ -68,6 +68,13 @@ class GpuiSurfaceView
 
             @JvmStatic private external fun nativeImeInput(text: String)
 
+            @JvmStatic private external fun nativeImeSetComposingText(
+                text: String,
+                newCursorPosition: Int,
+            )
+
+            @JvmStatic private external fun nativeImeFinishComposingText()
+
             @JvmStatic private external fun nativeFlingEvent(
                 velocityX: Float,
                 velocityY: Float,
@@ -122,12 +129,16 @@ class GpuiSurfaceView
             keyboardRequested = true
             requestFocus()
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            // The surface view is normally already focused. Restart the input
+            // connection after flipping text-editor state so IME show is honored.
+            imm?.restartInput(this)
             imm?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
         }
 
         fun dismissKeyboard() {
             keyboardRequested = false
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.restartInput(this)
             imm?.hideSoftInputFromWindow(windowToken, 0)
         }
 
@@ -138,9 +149,15 @@ class GpuiSurfaceView
             outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_NONE
 
             return object : BaseInputConnection(this, false) {
-                override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean = true
+                override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                    nativeImeSetComposingText(text?.toString().orEmpty(), newCursorPosition)
+                    return true
+                }
 
-                override fun finishComposingText(): Boolean = true
+                override fun finishComposingText(): Boolean {
+                    nativeImeFinishComposingText()
+                    return true
+                }
 
                 override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
                     val s = text?.toString().orEmpty()
@@ -156,6 +173,9 @@ class GpuiSurfaceView
                     }
                     return true
                 }
+
+                override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
+                    deleteSurroundingText(beforeLength, afterLength)
 
                 override fun sendKeyEvent(event: KeyEvent): Boolean {
                     if (event.action == KeyEvent.ACTION_DOWN) {

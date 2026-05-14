@@ -7,6 +7,7 @@ import android.view.Choreographer
 import android.view.View
 import android.view.Window
 import android.widget.FrameLayout
+import java.lang.ref.WeakReference
 
 /**
  * Bridges an [Activity] lifecycle to the GPUI Android framework.
@@ -65,6 +66,7 @@ class GpuiRuntimeController(private val activity: Activity) {
         )
         view.requestFocus()
         surfaceView = view
+        activeSurfaceView = WeakReference(view)
         return view
     }
 
@@ -93,6 +95,9 @@ class GpuiRuntimeController(private val activity: Activity) {
 
     fun onDestroy() {
         isRunning = false
+        if (activeSurfaceView?.get() === surfaceView) {
+            activeSurfaceView = null
+        }
         gpuiDestroy()
     }
 
@@ -112,6 +117,19 @@ class GpuiRuntimeController(private val activity: Activity) {
 
     companion object {
         private const val TAG = "GpuiRuntimeController"
+        private var activeSurfaceView: WeakReference<GpuiSurfaceView>? = null
+
+        @JvmStatic
+        fun requestSoftKeyboard() {
+            val view = activeSurfaceView?.get() ?: return
+            view.post { activeSurfaceView?.get()?.requestKeyboard() }
+        }
+
+        @JvmStatic
+        fun hideSoftKeyboard() {
+            val view = activeSurfaceView?.get() ?: return
+            view.post { activeSurfaceView?.get()?.dismissKeyboard() }
+        }
 
         @JvmStatic external fun gpuiInit(activity: Activity)
 

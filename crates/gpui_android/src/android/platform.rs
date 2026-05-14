@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
-use jni::{JavaVM, objects::GlobalRef};
+use jni::{JNIEnv, JavaVM, objects::GlobalRef};
 
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DispatchEventResult,
@@ -378,6 +378,72 @@ impl AndroidPlatform {
 
     fn with_common<R>(&self, f: impl FnOnce(&mut AndroidCommon) -> R) -> R {
         f(&mut self.common.borrow_mut())
+    }
+
+    fn with_jni_env(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut JNIEnv<'_>) -> jni::errors::Result<()>,
+    ) {
+        let jvm = self.with_common(|common| common.jvm.clone());
+        let mut env = match jvm.get_env() {
+            Ok(env) => env,
+            Err(_) => match jvm.attach_current_thread_as_daemon() {
+                Ok(env) => env,
+                Err(error) => {
+                    log::error!("gpui_android: {operation} failed to attach thread: {error:?}");
+                    return;
+                }
+            },
+        };
+
+        if let Err(error) = f(&mut env) {
+            log::error!("gpui_android: {operation} failed: {error:?}");
+        }
+        if env.exception_check().unwrap_or(false) {
+            env.exception_describe().ok();
+            env.exception_clear().ok();
+        }
+    }
+
+    fn call_runtime_controller_static(&self, operation: &'static str, method: &'static str) {
+        self.with_jni_env(operation, |env| {
+            let class = env.find_class("dev/zed/gpui/GpuiRuntimeController")?;
+            env.call_static_method(class, method, "()V", &[])?;
+            Ok(())
+        });
+    }
+
+    pub(crate) fn request_soft_keyboard(&self) {
+        self.call_runtime_controller_static("request_soft_keyboard", "requestSoftKeyboard");
+    }
+
+    pub(crate) fn hide_soft_keyboard(&self) {
+        self.call_runtime_controller_static("hide_soft_keyboard", "hideSoftKeyboard");
+    }
+
+    pub fn insert_text(&self, text: &str) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().insert_text(text))
+    }
+
+    pub fn delete_backward(&self, count: usize) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().delete_backward(count))
+    }
+
+    pub fn set_composing_text(&self, text: &str, new_cursor_position: i32) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| {
+                window
+                    .borrow_mut()
+                    .set_composing_text(text, new_cursor_position)
+            })
+    }
+
+    pub fn finish_composing_text(&self) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().finish_composing_text())
     }
 
     fn load_essential_fonts(text_system: &Arc<dyn PlatformTextSystem>) {

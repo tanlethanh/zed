@@ -23,6 +23,17 @@ static SYSTEM_INSET_TOP: AtomicU32 = AtomicU32::new(0);
 static SYSTEM_INSET_BOTTOM: AtomicU32 = AtomicU32::new(0);
 static DISPLAY_SCALE_BITS: AtomicU32 = AtomicU32::new(0);
 
+const KEYCODE_DEL: i32 = 67;
+const KEYCODE_FORWARD_DEL: i32 = 112;
+const KEYCODE_ENTER: i32 = 66;
+const KEYCODE_TAB: i32 = 61;
+const KEYCODE_SPACE: i32 = 62;
+const KEYCODE_ESCAPE: i32 = 111;
+const KEYCODE_DPAD_UP: i32 = 19;
+const KEYCODE_DPAD_DOWN: i32 = 20;
+const KEYCODE_DPAD_LEFT: i32 = 21;
+const KEYCODE_DPAD_RIGHT: i32 = 22;
+
 /// Current Android soft-keyboard height in physical pixels (0 = hidden).
 pub fn keyboard_height() -> u32 {
     KEYBOARD_HEIGHT.load(Ordering::Relaxed)
@@ -294,6 +305,9 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeKeyEvent(
     if action != 0 {
         return;
     }
+    if dispatch_text_input_key(key_code, unicode) {
+        return;
+    }
     let Some(keystroke) = android_keycode_to_keystroke(key_code, unicode) else {
         return;
     };
@@ -321,6 +335,10 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeImeInput(
         }
     };
 
+    if app_state::with_platform(|platform| platform.insert_text(&text)).unwrap_or(false) {
+        return;
+    }
+
     app_state::with_platform(|platform| {
         for ch in text.chars() {
             let keystroke = Keystroke {
@@ -334,6 +352,36 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeImeInput(
                 prefer_character_input: true,
             }));
         }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeImeSetComposingText(
+    mut env: JNIEnv,
+    _class: JClass,
+    text: JString,
+    new_cursor_position: jint,
+) {
+    let text: String = match env.get_string(&text) {
+        Ok(s) => s.into(),
+        Err(error) => {
+            log::error!("gpui_android: failed to read composing text: {error:?}");
+            return;
+        }
+    };
+
+    app_state::with_platform(|platform| {
+        platform.set_composing_text(&text, new_cursor_position);
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeImeFinishComposingText(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    app_state::with_platform(|platform| {
+        platform.finish_composing_text();
     });
 }
 
@@ -361,18 +409,24 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeSystemInsetsChang
 
 // ===== Helpers =====
 
-fn android_keycode_to_keystroke(key_code: i32, unicode: i32) -> Option<Keystroke> {
-    const KEYCODE_DEL: i32 = 67;
-    const KEYCODE_FORWARD_DEL: i32 = 112;
-    const KEYCODE_ENTER: i32 = 66;
-    const KEYCODE_TAB: i32 = 61;
-    const KEYCODE_SPACE: i32 = 62;
-    const KEYCODE_ESCAPE: i32 = 111;
-    const KEYCODE_DPAD_UP: i32 = 19;
-    const KEYCODE_DPAD_DOWN: i32 = 20;
-    const KEYCODE_DPAD_LEFT: i32 = 21;
-    const KEYCODE_DPAD_RIGHT: i32 = 22;
+fn dispatch_text_input_key(key_code: i32, unicode: i32) -> bool {
+    if key_code == KEYCODE_DEL {
+        return app_state::with_platform(|platform| platform.delete_backward(1)).unwrap_or(false);
+    }
 
+    let text = match key_code {
+        KEYCODE_ENTER => Some("\n".to_string()),
+        KEYCODE_TAB => Some("\t".to_string()),
+        _ if unicode > 0 => char::from_u32(unicode as u32).map(|ch| ch.to_string()),
+        _ => None,
+    };
+
+    text.is_some_and(|text| {
+        app_state::with_platform(|platform| platform.insert_text(&text)).unwrap_or(false)
+    })
+}
+
+fn android_keycode_to_keystroke(key_code: i32, unicode: i32) -> Option<Keystroke> {
     let key = match key_code {
         KEYCODE_DEL => "backspace".to_string(),
         KEYCODE_FORWARD_DEL => "delete".to_string(),
