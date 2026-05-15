@@ -11,6 +11,11 @@ workspace = true
 [lib]
 path = "src/gpui_android.rs"
 
+[features]
+default = []
+# Passthrough that activates the matching experimental optimisation in gpui_wgpu.
+atlas-oldest-first = ["gpui_wgpu/atlas-oldest-first"]
+
 [target.'cfg(target_os = "android")'.dependencies]
 gpui.workspace = true
 gpui_wgpu.workspace = true
