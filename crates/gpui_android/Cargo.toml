@@ -33,4 +33,5 @@ ndk-context = "0.1"
 jni = "0.21"
 cosmic-text = "0.14.0"
 swash = "0.2.6"
+unicode-script.workspace = true
 raw-window-handle = "0.6"

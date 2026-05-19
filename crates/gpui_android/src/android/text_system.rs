@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
-    Attrs, AttrsList, Family, Font as CosmicTextFont, FontFeatures as CosmicFontFeatures,
+    Attrs, AttrsList, Fallback, Family, Font as CosmicTextFont, FontFeatures as CosmicFontFeatures,
     FontSystem, ShapeBuffer, ShapeLine,
 };
 use gpui::{
@@ -19,6 +19,7 @@ use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
 };
+use unicode_script::Script;
 
 pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 
@@ -48,9 +49,48 @@ struct LoadedFont {
     is_known_emoji_font: bool,
 }
 
+struct AndroidFontFallback;
+
+impl Fallback for AndroidFontFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        &[
+            "Roboto",
+            "Droid Sans",
+            "DroidSans",
+            "Noto Sans",
+            "Noto Sans Mono",
+            "Droid Sans Mono",
+            "DroidSansMono",
+            "Noto Sans Symbols",
+            "Noto Sans Symbols2",
+            "Noto Sans Symbols 2",
+            "Noto Color Emoji",
+            "NotoColorEmoji",
+        ]
+    }
+
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        &[]
+    }
+
+    fn script_fallback(&self, _script: Script, _locale: &str) -> &[&'static str] {
+        &[]
+    }
+}
+
 impl CosmicTextSystem {
     pub(crate) fn new() -> Self {
-        let font_system = FontSystem::new();
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.set_sans_serif_family("Roboto");
+        db.set_monospace_family("Droid Sans Mono");
+        db.set_serif_family("Noto Serif");
+        // Android hits cosmic-text's generic empty fallback by default, so keep
+        // platform fallbacks explicit like iOS does through CoreText cascade.
+        let font_system = FontSystem::new_with_locale_and_db_and_fallback(
+            "en-US".to_string(),
+            db,
+            AndroidFontFallback,
+        );
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
             scratch: ShapeBuffer::default(),

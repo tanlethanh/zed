@@ -512,6 +512,8 @@ impl AndroidPlatform {
             "/system/fonts/DroidSans-Bold.ttf",
             "/system/fonts/DroidSansMono.ttf",
             "/system/fonts/MiSansC_3.005.ttf",
+            "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf",
+            "/system/fonts/NotoSansSymbols2-Regular.ttf",
             "/system/fonts/NotoColorEmoji.ttf",
         ];
 
