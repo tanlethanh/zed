@@ -261,6 +261,7 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeSurfaceChanged(
             log::error!("gpui_android: surface changed failed: {error:?}");
         }
     }
+    app_state::with_platform(|platform| platform.request_frame_forced());
 }
 
 #[unsafe(no_mangle)]

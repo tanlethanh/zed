@@ -1279,6 +1279,8 @@ impl WgpuRenderer {
                     res.invalidate_intermediate_textures();
                 }
                 self.atlas.clear();
+                #[cfg(target_os = "android")]
+                self.clear_texture_bind_group_cache();
                 self.needs_redraw = true;
                 self.failed_frame_count = 0;
                 return false;
@@ -1890,6 +1892,10 @@ impl WgpuRenderer {
         // Drop intermediate textures since they reference the old surface size.
         if let Some(res) = self.resources.as_mut() {
             res.invalidate_intermediate_textures();
+            #[cfg(target_os = "android")]
+            {
+                res.texture_bind_groups.clear();
+            }
         }
         #[cfg(target_os = "android")]
         {
@@ -1946,6 +1952,10 @@ impl WgpuRenderer {
 
             // Invalidate intermediate textures — they'll be recreated lazily.
             res.invalidate_intermediate_textures();
+            #[cfg(target_os = "android")]
+            {
+                res.texture_bind_groups.clear();
+            }
         }
 
         self.surface_configured = true;
@@ -2201,6 +2211,14 @@ impl WgpuRenderer {
             });
         resources.path_intermediate_bind_group = None;
         resources.texture_bind_groups.clear();
+    }
+
+    fn clear_texture_bind_group_cache(&mut self) {
+        if let Some(resources) = self.resources.as_mut() {
+            // AtlasTextureId values are reused after atlas clears; cached
+            // texture bind groups must be rebuilt for the new atlas pages.
+            resources.texture_bind_groups.clear();
+        }
     }
 
     fn draw_android_inner(
