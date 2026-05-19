@@ -2504,14 +2504,14 @@ impl WgpuRenderer {
         //    the clear value.
         // 3) Group consecutive surviving quads by opacity so each contiguous
         //    run can use either the blending or REPLACE pipeline.
-        let needs_filter = clear_skip_order.is_some()
-            || quads.iter().any(|q| q.background.is_transparent());
+        let needs_filter =
+            clear_skip_order.is_some() || quads.iter().any(quad_has_no_visible_fragments);
         let filtered_storage: Vec<Quad>;
         let surviving: &[Quad] = if needs_filter {
             filtered_storage = quads
                 .iter()
                 .filter(|q| {
-                    if q.background.is_transparent() {
+                    if quad_has_no_visible_fragments(q) {
                         return false;
                     }
                     if Some(q.order) == clear_skip_order {
@@ -2880,6 +2880,22 @@ impl WgpuRenderer {
 
         true
     }
+}
+
+#[cfg(target_os = "android")]
+fn quad_has_no_visible_fragments(q: &Quad) -> bool {
+    if !q.background.is_transparent() {
+        return false;
+    }
+
+    let borders = &q.border_widths;
+    let has_border = borders.top.0 > 0.0
+        || borders.bottom.0 > 0.0
+        || borders.left.0 > 0.0
+        || borders.right.0 > 0.0;
+
+    // Outline-only quads have transparent backgrounds but visible borders.
+    !has_border || q.border_color.is_transparent()
 }
 
 // See: docs/GPUI_ANDROID_PERFORMANCE.md § opaque-quads-pipeline
