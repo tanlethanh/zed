@@ -162,11 +162,8 @@ impl WgpuAtlasState {
         {
             let textures = &mut self.storage[texture_kind];
 
-            // With `atlas-oldest-first`, mono atlas allocations search oldest →
-            // newest so frequent glyphs stay in the primary texture, reducing
-            // texture-bind churn during text-heavy frames. Upstream behaviour
-            // (search newest → oldest) applies in every other case.
-            #[cfg(all(target_os = "android", feature = "atlas-oldest-first"))]
+            // See: docs/GPUI_ANDROID_PERFORMANCE.md § atlas-oldest-first
+            #[cfg(target_os = "android")]
             let tile = if texture_kind == AtlasTextureKind::Monochrome {
                 textures
                     .iter_mut()
@@ -177,7 +174,7 @@ impl WgpuAtlasState {
                     .rev()
                     .find_map(|texture| texture.allocate(size))
             };
-            #[cfg(not(all(target_os = "android", feature = "atlas-oldest-first")))]
+            #[cfg(not(target_os = "android"))]
             let tile = textures
                 .iter_mut()
                 .rev()
@@ -201,10 +198,8 @@ impl WgpuAtlasState {
             width: DevicePixels(1024),
             height: DevicePixels(1024),
         };
-        // Paired with `atlas-oldest-first`: a larger mono atlas trades ~3 MB
-        // of R8 memory per atlas for fewer overall mono textures, which in
-        // turn reduces bind-group switching during text rendering.
-        #[cfg(all(target_os = "android", feature = "atlas-oldest-first"))]
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § atlas-oldest-first
+        #[cfg(target_os = "android")]
         const ANDROID_MONOCHROME_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(2048),
             height: DevicePixels(2048),
@@ -215,13 +210,13 @@ impl WgpuAtlasState {
             height: DevicePixels(max_texture_size),
         };
 
-        #[cfg(all(target_os = "android", feature = "atlas-oldest-first"))]
+        #[cfg(target_os = "android")]
         let default_size = if kind == AtlasTextureKind::Monochrome {
             ANDROID_MONOCHROME_ATLAS_SIZE
         } else {
             DEFAULT_ATLAS_SIZE
         };
-        #[cfg(not(all(target_os = "android", feature = "atlas-oldest-first")))]
+        #[cfg(not(target_os = "android"))]
         let default_size = {
             let _ = kind;
             DEFAULT_ATLAS_SIZE

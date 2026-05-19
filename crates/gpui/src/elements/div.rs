@@ -2973,7 +2973,6 @@ impl Interactivity {
                                             for listener in &long_press_listeners {
                                                 listener(&press_event, window, cx);
                                             }
-                                            window.refresh();
                                         })
                                         .ok();
                                     }
@@ -3164,6 +3163,7 @@ impl Interactivity {
                 );
             }
 
+            // See: docs/GPUI_ANDROID_PERFORMANCE.md § skip-active-refresh
             // We unconditionally bind both the mouse up and mouse down active state handlers
             // Because we might not get a chance to render a frame before the mouse up event arrives.
             let active_state = element_state
@@ -3176,6 +3176,7 @@ impl Interactivity {
                 window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
                     if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
                         *active_state.borrow_mut() = ElementClickedState::default();
+                        #[cfg(not(target_os = "android"))]
                         window.refresh();
                     }
                 });
@@ -3189,6 +3190,7 @@ impl Interactivity {
                         && active_state.borrow().is_clicked()
                     {
                         *active_state.borrow_mut() = ElementClickedState::default();
+                        #[cfg(not(target_os = "android"))]
                         window.refresh();
                     }
                 });
@@ -3202,6 +3204,7 @@ impl Interactivity {
                         && active_state.borrow().is_clicked()
                     {
                         *active_state.borrow_mut() = ElementClickedState::default();
+                        #[cfg(not(target_os = "android"))]
                         window.refresh();
                     }
                 });
@@ -3224,6 +3227,7 @@ impl Interactivity {
                                 group: group_hovered,
                                 element: element_hovered,
                             };
+                            #[cfg(not(target_os = "android"))]
                             window.refresh();
                         }
                     }
@@ -3250,6 +3254,7 @@ impl Interactivity {
                                 group: group_hovered,
                                 element: element_hovered,
                             };
+                            #[cfg(not(target_os = "android"))]
                             window.refresh();
                         }
                     }

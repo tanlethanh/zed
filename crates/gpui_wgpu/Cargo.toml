@@ -15,13 +15,6 @@ path = "src/gpui_wgpu.rs"
 default = []
 font-kit = ["dep:font-kit"]
 
-# Experimental Android backend optimisation (off by default). A/B against
-# upstream behaviour to measure the perf gain.
-# Mono atlas oldest-to-newest texture search + larger Android mono atlas —
-# keeps new glyphs in the primary atlas while it has room, reducing texture
-# bind-group churn during text-heavy frames.
-atlas-oldest-first = []
-
 [dependencies]
 gpui.workspace = true
 anyhow.workspace = true

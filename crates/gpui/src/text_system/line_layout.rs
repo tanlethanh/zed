@@ -498,13 +498,29 @@ impl LineLayoutCache {
         let mut prev_frame = self.previous_frame.lock();
         let mut curr_frame = self.current_frame.write();
         std::mem::swap(&mut *prev_frame, &mut *curr_frame);
-        curr_frame.lines.clear();
-        curr_frame.wrapped_lines.clear();
+
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § sticky-line-cache
+        #[cfg(target_os = "android")]
+        {
+            const SOFT_CAP: usize = 10_000;
+            if curr_frame.lines.len() > SOFT_CAP {
+                curr_frame.lines.clear();
+                curr_frame.lines_by_hash.clear();
+            }
+            if curr_frame.wrapped_lines.len() > SOFT_CAP {
+                curr_frame.wrapped_lines.clear();
+                curr_frame.wrapped_lines_by_hash.clear();
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            curr_frame.lines.clear();
+            curr_frame.wrapped_lines.clear();
+            curr_frame.lines_by_hash.clear();
+            curr_frame.wrapped_lines_by_hash.clear();
+        }
         curr_frame.used_lines.clear();
         curr_frame.used_wrapped_lines.clear();
-
-        curr_frame.lines_by_hash.clear();
-        curr_frame.wrapped_lines_by_hash.clear();
         curr_frame.used_lines_by_hash.clear();
         curr_frame.used_wrapped_lines_by_hash.clear();
     }

@@ -153,11 +153,13 @@ impl HasDisplayHandle for RawWindow {
     }
 }
 
+type AndroidRenderer = super::pipelined_renderer::PipelinedRenderer;
+
 pub struct AndroidWindowState {
     role: AndroidWindowRole,
     raw_window: Option<RawWindow>,
     native_window: Option<NativeWindow>,
-    renderer: Option<WgpuRenderer>,
+    renderer: Option<AndroidRenderer>,
     atlas: Arc<AndroidAtlas>,
     bounds: Bounds<Pixels>,
     scale: f32,
@@ -169,6 +171,7 @@ pub struct AndroidWindowState {
     background_appearance: WindowBackgroundAppearance,
     modifiers: Modifiers,
     last_mouse_position: Point<Pixels>,
+    subpixel_supported: Option<bool>,
 }
 
 impl AndroidWindowState {
@@ -186,9 +189,11 @@ impl AndroidWindowState {
             callbacks: Callbacks::default(),
             active,
             appearance: WindowAppearance::Light,
-            background_appearance: WindowBackgroundAppearance::Transparent,
+            // See: docs/GPUI_ANDROID_PERFORMANCE.md § opaque-window-default
+            background_appearance: WindowBackgroundAppearance::Opaque,
             modifiers: Modifiers::default(),
             last_mouse_position: Point::default(),
+            subpixel_supported: None,
         }
     }
 
@@ -244,7 +249,9 @@ impl AndroidWindowState {
             let context = context
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Cannot replace Android surface before GPU init"))?;
-            renderer.replace_surface(&raw_window, config, &context.instance)?;
+            renderer
+                .lock()
+                .replace_surface(&raw_window, config, &context.instance)?;
         } else {
             let renderer = if let Some(atlas) = self.atlas.gpu_atlas() {
                 WgpuRenderer::new_with_atlas(gpu_context, &raw_window, config, None, atlas)?
@@ -252,7 +259,11 @@ impl AndroidWindowState {
                 WgpuRenderer::new(gpu_context, &raw_window, config, None)?
             };
             self.atlas.bind(renderer.atlas());
-            self.renderer = Some(renderer);
+            let supports_subpixel = renderer.supports_dual_source_blending();
+            self.subpixel_supported = Some(supports_subpixel);
+            {
+                self.renderer = Some(super::pipelined_renderer::PipelinedRenderer::new(renderer));
+            }
         }
 
         self.native_window = Some(native_window);
@@ -287,10 +298,11 @@ impl AndroidWindowState {
         }
 
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.update_drawable_size(Size {
+            let size = Size {
                 width: DevicePixels(width as i32),
                 height: DevicePixels(height as i32),
-            });
+            };
+            renderer.lock().update_drawable_size(size);
         }
 
         let has_callback = self.callbacks.resize.is_some();
@@ -326,22 +338,28 @@ impl AndroidWindowState {
         log::info!("AndroidWindow({:?}): surface destroyed", self.role);
 
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.unconfigure_surface();
+            renderer.lock().unconfigure_surface();
         }
         self.native_window = None;
         self.raw_window = None;
     }
 
     pub fn draw(&mut self, scene: &Scene) {
-        if let Some(ref mut renderer) = self.renderer {
-            if renderer.device_lost() {
-                if let Some(raw_window) = self.raw_window {
-                    if let Err(error) = renderer.recover(&raw_window) {
-                        log::error!("Failed to recover Android renderer: {error:?}");
+        if let Some(ref renderer) = self.renderer {
+            // Device-lost recovery requires `raw_window` and mutable
+            // access to the renderer. Check briefly under the lock; if
+            // lost, recover synchronously, then dispatch the draw async.
+            {
+                let mut r = renderer.lock();
+                if r.device_lost() {
+                    if let Some(raw_window) = self.raw_window {
+                        if let Err(error) = r.recover(&raw_window) {
+                            log::error!("Failed to recover Android renderer: {error:?}");
+                            return;
+                        }
+                    } else {
                         return;
                     }
-                } else {
-                    return;
                 }
             }
             renderer.draw(scene);
@@ -362,7 +380,8 @@ impl AndroidWindowState {
                 self.background_appearance,
                 WindowBackgroundAppearance::Transparent | WindowBackgroundAppearance::Blurred
             ),
-            preferred_present_mode: Some(gpui_wgpu::wgpu::PresentMode::Mailbox),
+            // See: docs/GPUI_ANDROID_PERFORMANCE.md § present-fifo
+            preferred_present_mode: Some(gpui_wgpu::wgpu::PresentMode::Fifo),
         }
     }
 
@@ -409,7 +428,23 @@ impl AndroidWindowState {
     }
 
     pub fn insert_text(&mut self, text: &str) -> bool {
-        self.with_text_input_handler(|handler| handler.insert_text(text))
+        let Some(mut input_handler) = self.input_handler.take() else {
+            return false;
+        };
+
+        let handled = if input_handler.query_accepts_text_input() {
+            // Android commitText is already confirmed input. Mirror iOS'
+            // shouldChangeText preflight so terminal typing does not look like
+            // UIKit's no-preflight dictation stream.
+            if input_handler.should_change_text_in_range(None, text) {
+                input_handler.insert_text(text);
+            }
+            true
+        } else {
+            false
+        };
+        self.input_handler = Some(input_handler);
+        handled
     }
 
     pub fn delete_backward(&mut self, count: usize) -> bool {
@@ -872,15 +907,10 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        // Mirrors `WgpuRenderer::supports_dual_source_blending` — only true on
-        // Vulkan adapters that expose the feature (most desktop GPUs and some
-        // newer Adreno/PowerVR drivers). Mali-G68 and similar mobile GPUs
-        // return false here and fall back to grayscale alpha rendering.
-        self.state
-            .borrow()
-            .renderer
-            .as_ref()
-            .is_some_and(|renderer| renderer.supports_dual_source_blending())
+        // Adapter capability is constant for the lifetime of the renderer; cache
+        // it at renderer creation so paint_glyph (called per glyph) doesn't
+        // acquire the renderer mutex on every call.
+        self.state.borrow().subpixel_supported.unwrap_or(false)
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
@@ -888,7 +918,7 @@ impl PlatformWindow for AndroidWindow {
             .borrow()
             .renderer
             .as_ref()
-            .map(|renderer| renderer.gpu_specs())
+            .map(|renderer| renderer.lock().gpu_specs())
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}

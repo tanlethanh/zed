@@ -162,11 +162,10 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiRuntimeController_gpuiRequestFrame(
     app_state::with_platform(|platform| {
         platform.process_pending_tasks();
         platform.process_fling();
-        if platform.has_active_fling() {
-            platform.request_frame_forced();
-        } else {
-            platform.request_frame_for_all_windows();
-        }
+        #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+        platform.process_devtool_taps();
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § fling-no-force
+        platform.request_frame_for_all_windows();
     });
 }
 
@@ -213,7 +212,8 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeSurfaceCreated(
     let height = native_window.height() as u32;
 
     // Step 1: stash the native window (or attach to an existing GPUI window).
-    if let Some(result) = app_state::with_platform(|platform| platform.attach_native_window(native_window))
+    if let Some(result) =
+        app_state::with_platform(|platform| platform.attach_native_window(native_window))
     {
         if let Err(error) = result {
             log::error!("gpui_android: attach_native_window failed: {error:?}");

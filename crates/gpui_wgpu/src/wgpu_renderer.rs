@@ -1,5 +1,7 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
+#[cfg(target_os = "android")]
+use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
     PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
@@ -8,13 +10,19 @@ use gpui::{
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+#[cfg(target_os = "android")]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "android")]
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+#[cfg(target_os = "android")]
+use std::thread::JoinHandle;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq)]
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
@@ -45,7 +53,7 @@ struct SurfaceParams {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq)]
 struct GammaParams {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
@@ -83,6 +91,12 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    // See: docs/GPUI_ANDROID_PERFORMANCE.md § opaque-quads-pipeline
+    // Same vertex/fragment shaders as `quads` but with blending disabled.
+    // Mali HSR can early-cull occluded fragments only when the destination
+    // pipeline has no source-alpha blend.
+    #[cfg(target_os = "android")]
+    quads_opaque: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -120,6 +134,13 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    // See: docs/GPUI_ANDROID_PERFORMANCE.md § bind-group-cache
+    #[cfg(target_os = "android")]
+    instances_bind_group: wgpu::BindGroup,
+    #[cfg(target_os = "android")]
+    texture_bind_groups: FxHashMap<AtlasTextureId, wgpu::BindGroup>,
+    #[cfg(target_os = "android")]
+    path_intermediate_bind_group: Option<wgpu::BindGroup>,
 }
 
 impl WgpuResources {
@@ -128,6 +149,10 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        #[cfg(target_os = "android")]
+        {
+            self.path_intermediate_bind_group = None;
+        }
     }
 }
 
@@ -158,6 +183,19 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    // See: docs/GPUI_ANDROID_PERFORMANCE.md § single-write-buffer
+    #[cfg(target_os = "android")]
+    instance_staging: Vec<u8>,
+    // See: docs/GPUI_ANDROID_PERFORMANCE.md § persistent-globals
+    #[cfg(target_os = "android")]
+    cached_globals: Cell<Option<GlobalParams>>,
+    #[cfg(target_os = "android")]
+    cached_path_globals: Cell<Option<GlobalParams>>,
+    #[cfg(target_os = "android")]
+    cached_gamma: Cell<Option<GammaParams>>,
+    // See: docs/GPUI_ANDROID_PERFORMANCE.md § offload-present
+    #[cfg(target_os = "android")]
+    present_worker: Option<PresentWorker>,
 }
 
 impl WgpuRenderer {
@@ -392,6 +430,12 @@ impl WgpuRenderer {
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
+            // On Android, force FIFO. Mailbox/Immediate fight SurfaceFlinger
+            // and produce erratic frame pacing on Mali tilers. See:
+            // docs/GPUI_ANDROID_PERFORMANCE.md § present-fifo.
+            #[cfg(target_os = "android")]
+            present_mode: wgpu::PresentMode::Fifo,
+            #[cfg(not(target_os = "android"))]
             present_mode: config
                 .preferred_present_mode
                 .filter(|mode| surface_caps.present_modes.contains(mode))
@@ -405,6 +449,8 @@ impl WgpuRenderer {
         surface.configure(&context.device, &surface_config);
 
         let queue = Arc::clone(&context.queue);
+        #[cfg(target_os = "android")]
+        let queue_for_worker = Arc::clone(&queue);
         let dual_source_blending = context.supports_dual_source_blending();
 
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
@@ -503,6 +549,21 @@ impl WgpuRenderer {
             *guard = Some(error.to_string());
         }));
 
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § bind-group-cache
+        #[cfg(target_os = "android")]
+        let instances_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("instances_bind_group_cached"),
+            layout: &bind_group_layouts.instances,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &instance_buffer,
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+        });
+
         let resources = WgpuResources {
             device,
             queue,
@@ -520,6 +581,12 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            #[cfg(target_os = "android")]
+            instances_bind_group,
+            #[cfg(target_os = "android")]
+            texture_bind_groups: FxHashMap::default(),
+            #[cfg(target_os = "android")]
+            path_intermediate_bind_group: None,
         };
 
         Ok(Self {
@@ -545,6 +612,16 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            #[cfg(target_os = "android")]
+            instance_staging: vec![0u8; initial_instance_buffer_capacity as usize],
+            #[cfg(target_os = "android")]
+            cached_globals: Cell::new(None),
+            #[cfg(target_os = "android")]
+            cached_path_globals: Cell::new(None),
+            #[cfg(target_os = "android")]
+            cached_gamma: Cell::new(None),
+            #[cfg(target_os = "android")]
+            present_worker: Some(PresentWorker::spawn(queue_for_worker)),
         })
     }
 
@@ -796,6 +873,24 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § opaque-quads-pipeline
+        #[cfg(target_os = "android")]
+        let quads_opaque = create_pipeline(
+            "quads_opaque",
+            "vs_quad",
+            "fs_quad",
+            &layouts.globals,
+            &layouts.instances,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let shadows = create_pipeline(
             "shadows",
             "vs_shadow",
@@ -936,6 +1031,8 @@ impl WgpuRenderer {
 
         WgpuPipelines {
             quads,
+            #[cfg(target_os = "android")]
+            quads_opaque,
             shadows,
             path_rasterization,
             paths,
@@ -1028,6 +1125,10 @@ impl WgpuRenderer {
                     resources.path_intermediate_view = None;
                     resources.path_msaa_texture = None;
                     resources.path_msaa_view = None;
+                    #[cfg(target_os = "android")]
+                    {
+                        resources.path_intermediate_bind_group = None;
+                    }
                 }
                 return;
             }
@@ -1253,6 +1354,17 @@ impl WgpuRenderer {
             ..globals
         };
 
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § bind-group-cache, § single-write-buffer,
+        // § persistent-globals. On Android, route through a separate draw path
+        // that uses a single staging buffer + cached bind groups to cut
+        // per-frame allocations. The globals/gamma UBO writes are also handled
+        // there so we can skip them when values are unchanged.
+        #[cfg(target_os = "android")]
+        {
+            return self.draw_android_inner(scene, frame, &frame_view, globals, path_globals, gamma_params);
+        }
+
+        #[cfg(not(target_os = "android"))]
         {
             let resources = self.resources();
             resources.queue.write_buffer(
@@ -1272,6 +1384,7 @@ impl WgpuRenderer {
             );
         }
 
+        #[allow(unreachable_code)]
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
@@ -1729,6 +1842,14 @@ impl WgpuRenderer {
             mapped_at_creation: false,
         });
         self.instance_buffer_capacity = new_capacity;
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § bind-group-cache, § single-write-buffer
+        // New instance buffer means cached bind groups reference a dead buffer;
+        // rebuild them and grow the staging buffer to match.
+        #[cfg(target_os = "android")]
+        {
+            self.instance_staging.resize(new_capacity as usize, 0);
+            self.rebuild_bind_group_cache();
+        }
     }
 
     fn write_to_instance_buffer(
@@ -1769,6 +1890,12 @@ impl WgpuRenderer {
         // Drop intermediate textures since they reference the old surface size.
         if let Some(res) = self.resources.as_mut() {
             res.invalidate_intermediate_textures();
+        }
+        #[cfg(target_os = "android")]
+        {
+            self.cached_globals.set(None);
+            self.cached_path_globals.set(None);
+            self.cached_gamma.set(None);
         }
     }
 
@@ -1823,10 +1950,24 @@ impl WgpuRenderer {
 
         self.surface_configured = true;
 
+        #[cfg(target_os = "android")]
+        {
+            self.cached_globals.set(None);
+            self.cached_path_globals.set(None);
+            self.cached_gamma.set(None);
+        }
+
         Ok(())
     }
 
     pub fn destroy(&mut self) {
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § offload-present
+        // Join the present worker before releasing the queue so any in-flight
+        // present completes against a still-valid surface.
+        #[cfg(target_os = "android")]
+        {
+            self.present_worker.take();
+        }
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
         self.resources.take();
@@ -1918,6 +2059,923 @@ impl WgpuRenderer {
 
         log::info!("GPU recovery complete");
         Ok(())
+    }
+}
+
+// See: docs/GPUI_ANDROID_PERFORMANCE.md § bind-group-cache, § single-write-buffer
+//
+// Android-only fast path. The upstream draw loop allocates a fresh
+// `wgpu::BindGroup` per batch and issues one `queue.write_buffer` per batch.
+// On Mali UMA GPUs this exhausts the driver's transient memory pool during
+// scroll. This impl block adds:
+//
+//   * `instance_staging` — single CPU-side staging buffer that accumulates all
+//     batches in a frame, flushed once at end-of-frame via a single
+//     `queue.write_buffer` call.
+//   * `instances_bind_group` — single full-buffer bind group reused for every
+//     batch; per-batch routing happens via `first_instance` offsets.
+//   * `texture_bind_groups` / `path_intermediate_bind_group` — caches keyed
+//     by `AtlasTextureId`, populated up-front each frame so the inner pass
+//     loop only needs `&self`.
+#[cfg(target_os = "android")]
+impl WgpuRenderer {
+    /// Stage instance data into the CPU buffer, aligning to `element_stride`
+    /// so `first_element = offset / element_stride` can be used as
+    /// `first_instance` in `pass.draw(...)`.
+    fn stage_instance_data(
+        staging: &mut [u8],
+        capacity: u64,
+        instance_offset: &mut u64,
+        data: &[u8],
+        element_stride: u64,
+    ) -> Option<u32> {
+        let offset = (*instance_offset).next_multiple_of(element_stride);
+        let size = data.len() as u64;
+        if size == 0 || offset + size > capacity {
+            return None;
+        }
+        let dst = offset as usize;
+        staging[dst..dst + data.len()].copy_from_slice(data);
+        *instance_offset = offset + size;
+        let first_element = (offset / element_stride) as u32;
+        Some(first_element)
+    }
+
+    fn flush_instance_staging(&self, staging: &[u8], bytes_used: u64) {
+        if bytes_used > 0 {
+            let resources = self.resources();
+            resources.queue.write_buffer(
+                &resources.instance_buffer,
+                0,
+                &staging[..bytes_used as usize],
+            );
+        }
+    }
+
+    fn ensure_texture_bind_group(&mut self, texture_id: AtlasTextureId) {
+        // Borrow split: pull out the immutable refs needed by the closure
+        // first, then borrow `texture_bind_groups` mutably.
+        let tex_info = self.atlas.get_texture_info(texture_id);
+        let resources = self.resources_mut();
+        if resources.texture_bind_groups.contains_key(&texture_id) {
+            return;
+        }
+        let bind_group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("texture_bind_group_cached"),
+                layout: &resources.bind_group_layouts.instances_with_texture,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &resources.instance_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&tex_info.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                    },
+                ],
+            });
+        resources.texture_bind_groups.insert(texture_id, bind_group);
+    }
+
+    fn ensure_path_intermediate_bind_group(&mut self) {
+        let resources = self.resources_mut();
+        if resources.path_intermediate_bind_group.is_some() {
+            return;
+        }
+        let Some(ref view) = resources.path_intermediate_view else {
+            return;
+        };
+        let bind_group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("path_intermediate_bind_group_cached"),
+                layout: &resources.bind_group_layouts.instances_with_texture,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &resources.instance_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                    },
+                ],
+            });
+        resources.path_intermediate_bind_group = Some(bind_group);
+    }
+
+    /// Rebuild bind groups that reference the instance buffer after the
+    /// buffer is replaced (e.g. on grow).
+    fn rebuild_bind_group_cache(&mut self) {
+        let resources = self.resources_mut();
+        resources.instances_bind_group =
+            resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("instances_bind_group_cached"),
+                layout: &resources.bind_group_layouts.instances,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &resources.instance_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                }],
+            });
+        resources.path_intermediate_bind_group = None;
+        resources.texture_bind_groups.clear();
+    }
+
+    fn draw_android_inner(
+        &mut self,
+        scene: &Scene,
+        frame: wgpu::SurfaceTexture,
+        frame_view: &wgpu::TextureView,
+        globals: GlobalParams,
+        path_globals: GlobalParams,
+        gamma_params: GammaParams,
+    ) -> bool {
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § persistent-globals
+        // Skip the queue.write_buffer calls when the UBO contents are
+        // unchanged from the previous frame. The values only change on
+        // viewport resize, gamma adjustment, or alpha-mode change.
+        {
+            let resources = self.resources();
+            if self.cached_globals.get() != Some(globals) {
+                resources.queue.write_buffer(
+                    &resources.globals_buffer,
+                    0,
+                    bytemuck::bytes_of(&globals),
+                );
+                self.cached_globals.set(Some(globals));
+            }
+            if self.cached_path_globals.get() != Some(path_globals) {
+                resources.queue.write_buffer(
+                    &resources.globals_buffer,
+                    self.path_globals_offset,
+                    bytemuck::bytes_of(&path_globals),
+                );
+                self.cached_path_globals.set(Some(path_globals));
+            }
+            if self.cached_gamma.get() != Some(gamma_params) {
+                resources.queue.write_buffer(
+                    &resources.globals_buffer,
+                    self.gamma_offset,
+                    bytemuck::bytes_of(&gamma_params),
+                );
+                self.cached_gamma.set(Some(gamma_params));
+            }
+        }
+
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § clear-bottom-quad
+        // Find the lowest-order quad that fully covers the viewport with a
+        // solid opaque colour; we can use its colour as the LoadOp::Clear
+        // value and skip drawing it altogether. Single pass, no allocation.
+        let viewport_w = self.surface_config.width as f32;
+        let viewport_h = self.surface_config.height as f32;
+        let mut clear_color = wgpu::Color::TRANSPARENT;
+        let mut clear_skip_order: Option<gpui::DrawOrder> = None;
+        for q in scene.quads.iter() {
+            if !q.background.is_opaque() {
+                continue;
+            }
+            if q.corner_radii != gpui::Corners::default() {
+                continue;
+            }
+            if q.bounds.origin.x.0 > 0.0 || q.bounds.origin.y.0 > 0.0 {
+                continue;
+            }
+            if q.bounds.size.width.0 < viewport_w || q.bounds.size.height.0 < viewport_h {
+                continue;
+            }
+            let Some(solid) = q.background.as_solid() else {
+                continue;
+            };
+            // Pick the lowest draw order so we skip the bottommost full-cover
+            // opaque quad. Anything underneath would have been masked anyway.
+            if clear_skip_order.map_or(true, |existing| q.order < existing) {
+                let rgba = solid.to_rgb();
+                clear_color = wgpu::Color {
+                    r: rgba.r as f64,
+                    g: rgba.g as f64,
+                    b: rgba.b as f64,
+                    a: rgba.a as f64,
+                };
+                clear_skip_order = Some(q.order);
+            }
+        }
+
+        // Pre-populate bind-group cache for every texture/path-intermediate this
+        // frame references. Done before the render pass so the inner loop only
+        // needs `&self`.
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::MonochromeSprites { texture_id, .. }
+                | PrimitiveBatch::SubpixelSprites { texture_id, .. }
+                | PrimitiveBatch::PolychromeSprites { texture_id, .. } => {
+                    self.ensure_texture_bind_group(texture_id);
+                }
+                PrimitiveBatch::Paths(_) => {
+                    self.ensure_path_intermediate_bind_group();
+                }
+                _ => {}
+            }
+        }
+
+        // Move staging out of `self` so we can borrow it `&mut` independently
+        // of the `&self` borrows in the inner draw helpers. Restored on every
+        // return path below.
+        let mut staging = std::mem::take(&mut self.instance_staging);
+
+        loop {
+            let mut instance_offset: u64 = 0;
+            let mut overflow = false;
+
+            let mut encoder =
+                self.resources()
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("main_encoder_android"),
+                    });
+
+            // See: docs/GPUI_ANDROID_PERFORMANCE.md § once-per-pass-globals
+            // Reset on every begin_render_pass — bind groups don't persist
+            // across passes.
+            let mut globals_bound = false;
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("main_pass_android"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(clear_color),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+
+                for batch in scene.batches() {
+                    let ok = match batch {
+                        PrimitiveBatch::Quads(range) => self.draw_quads_a(
+                            &scene.quads[range],
+                            clear_skip_order,
+                            &mut instance_offset,
+                            &mut staging,
+                            &mut pass,
+                            &mut globals_bound,
+                        ),
+                        PrimitiveBatch::Shadows(range) => self.draw_shadows_a(
+                            &scene.shadows[range],
+                            &mut instance_offset,
+                            &mut staging,
+                            &mut pass,
+                            &mut globals_bound,
+                        ),
+                        PrimitiveBatch::Paths(range) => {
+                            let paths = &scene.paths[range];
+                            if paths.is_empty() {
+                                continue;
+                            }
+
+                            drop(pass);
+
+                            let did_draw = self.draw_paths_to_intermediate_a(
+                                &mut encoder,
+                                paths,
+                                &mut instance_offset,
+                                &mut staging,
+                            );
+
+                            // Bind groups don't carry across passes.
+                            globals_bound = false;
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_android_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            if did_draw {
+                                self.draw_paths_from_intermediate_a(
+                                    paths,
+                                    &mut instance_offset,
+                                    &mut staging,
+                                    &mut pass,
+                                    &mut globals_bound,
+                                )
+                            } else {
+                                false
+                            }
+                        }
+                        PrimitiveBatch::Underlines(range) => self.draw_underlines_a(
+                            &scene.underlines[range],
+                            &mut instance_offset,
+                            &mut staging,
+                            &mut pass,
+                            &mut globals_bound,
+                        ),
+                        PrimitiveBatch::MonochromeSprites { texture_id, range } => self
+                            .draw_monochrome_sprites_a(
+                                &scene.monochrome_sprites[range],
+                                texture_id,
+                                &mut instance_offset,
+                                &mut staging,
+                                &mut pass,
+                                &mut globals_bound,
+                            ),
+                        PrimitiveBatch::SubpixelSprites { texture_id, range } => self
+                            .draw_subpixel_sprites_a(
+                                &scene.subpixel_sprites[range],
+                                texture_id,
+                                &mut instance_offset,
+                                &mut staging,
+                                &mut pass,
+                                &mut globals_bound,
+                            ),
+                        PrimitiveBatch::PolychromeSprites { texture_id, range } => self
+                            .draw_polychrome_sprites_a(
+                                &scene.polychrome_sprites[range],
+                                texture_id,
+                                &mut instance_offset,
+                                &mut staging,
+                                &mut pass,
+                                &mut globals_bound,
+                            ),
+                        PrimitiveBatch::Surfaces(_surfaces) => {
+                            // Surfaces are macOS-only for video playback;
+                            // not implemented for Android.
+                            true
+                        }
+                    };
+                    if !ok {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+
+            if overflow {
+                drop(encoder);
+                if self.instance_buffer_capacity >= self.max_buffer_size {
+                    log::error!(
+                        "instance buffer size grew too large: {}",
+                        self.instance_buffer_capacity
+                    );
+                    self.instance_staging = staging;
+                    frame.present();
+                    return true;
+                }
+                self.grow_instance_buffer();
+                // grow_instance_buffer resized self.instance_staging; we took
+                // staging out before the loop, so resize the local copy to
+                // match.
+                staging.resize(self.instance_buffer_capacity as usize, 0);
+                continue;
+            }
+
+            // Single end-of-frame upload of all batched instance data.
+            self.flush_instance_staging(&staging, instance_offset);
+            self.instance_staging = staging;
+
+            // See: docs/GPUI_ANDROID_PERFORMANCE.md § offload-present
+            // Submit + present on a worker thread so the UI thread can move on
+            // to the next frame. If the worker hasn't drained the previous
+            // job, fall back to inline submit+present — this is documented as
+            // spike-prone but avoids losing the frame entirely.
+            let command_buffer = encoder.finish();
+            let fallback = match self.present_worker.as_ref() {
+                Some(worker) => match worker.try_send(frame, command_buffer) {
+                    Ok(()) => None,
+                    Err(returned) => Some(returned),
+                },
+                None => Some((frame, command_buffer)),
+            };
+            if let Some((frame, command_buffer)) = fallback {
+                let queue = Arc::clone(&self.resources().queue);
+                queue.submit(std::iter::once(command_buffer));
+                frame.present();
+            }
+            return true;
+        }
+    }
+
+    fn draw_quads_a(
+        &self,
+        quads: &[Quad],
+        clear_skip_order: Option<gpui::DrawOrder>,
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § skip-transparent-quads,
+        //      § clear-bottom-quad, § opaque-quads-pipeline
+        // 1) Drop fully transparent quads (no fragment contribution).
+        // 2) Drop the bottom full-cover quad whose colour we already used as
+        //    the clear value.
+        // 3) Group consecutive surviving quads by opacity so each contiguous
+        //    run can use either the blending or REPLACE pipeline.
+        let needs_filter = clear_skip_order.is_some()
+            || quads.iter().any(|q| q.background.is_transparent());
+        let filtered_storage: Vec<Quad>;
+        let surviving: &[Quad] = if needs_filter {
+            filtered_storage = quads
+                .iter()
+                .filter(|q| {
+                    if q.background.is_transparent() {
+                        return false;
+                    }
+                    if Some(q.order) == clear_skip_order {
+                        return false;
+                    }
+                    true
+                })
+                .copied()
+                .collect();
+            &filtered_storage
+        } else {
+            quads
+        };
+
+        if surviving.is_empty() {
+            return true;
+        }
+
+        let resources = self.resources();
+        let mut start = 0;
+        while start < surviving.len() {
+            let head_opaque = quad_is_pipeline_opaque(&surviving[start]);
+            let mut end = start + 1;
+            while end < surviving.len()
+                && quad_is_pipeline_opaque(&surviving[end]) == head_opaque
+            {
+                end += 1;
+            }
+            let pipeline = if head_opaque {
+                &resources.pipelines.quads_opaque
+            } else {
+                &resources.pipelines.quads
+            };
+            let slice = &surviving[start..end];
+            let data = unsafe { Self::instance_bytes(slice) };
+            let ok = self.draw_instances_a::<Quad>(
+                data,
+                slice.len() as u32,
+                pipeline,
+                instance_offset,
+                staging,
+                pass,
+                globals_bound,
+            );
+            if !ok {
+                return false;
+            }
+            start = end;
+        }
+        true
+    }
+
+    fn draw_shadows_a(
+        &self,
+        shadows: &[Shadow],
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        let data = unsafe { Self::instance_bytes(shadows) };
+        self.draw_instances_a::<Shadow>(
+            data,
+            shadows.len() as u32,
+            &self.resources().pipelines.shadows,
+            instance_offset,
+            staging,
+            pass,
+            globals_bound,
+        )
+    }
+
+    fn draw_underlines_a(
+        &self,
+        underlines: &[Underline],
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        let data = unsafe { Self::instance_bytes(underlines) };
+        self.draw_instances_a::<Underline>(
+            data,
+            underlines.len() as u32,
+            &self.resources().pipelines.underlines,
+            instance_offset,
+            staging,
+            pass,
+            globals_bound,
+        )
+    }
+
+    fn draw_monochrome_sprites_a(
+        &self,
+        sprites: &[MonochromeSprite],
+        texture_id: AtlasTextureId,
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        let data = unsafe { Self::instance_bytes(sprites) };
+        self.draw_instances_with_texture_a::<MonochromeSprite>(
+            data,
+            sprites.len() as u32,
+            texture_id,
+            &self.resources().pipelines.mono_sprites,
+            instance_offset,
+            staging,
+            pass,
+            globals_bound,
+        )
+    }
+
+    fn draw_subpixel_sprites_a(
+        &self,
+        sprites: &[SubpixelSprite],
+        texture_id: AtlasTextureId,
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        let data = unsafe { Self::instance_bytes(sprites) };
+        let resources = self.resources();
+        let pipeline = resources
+            .pipelines
+            .subpixel_sprites
+            .as_ref()
+            .unwrap_or(&resources.pipelines.mono_sprites);
+        self.draw_instances_with_texture_a::<SubpixelSprite>(
+            data,
+            sprites.len() as u32,
+            texture_id,
+            pipeline,
+            instance_offset,
+            staging,
+            pass,
+            globals_bound,
+        )
+    }
+
+    fn draw_polychrome_sprites_a(
+        &self,
+        sprites: &[PolychromeSprite],
+        texture_id: AtlasTextureId,
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        let data = unsafe { Self::instance_bytes(sprites) };
+        self.draw_instances_with_texture_a::<PolychromeSprite>(
+            data,
+            sprites.len() as u32,
+            texture_id,
+            &self.resources().pipelines.poly_sprites,
+            instance_offset,
+            staging,
+            pass,
+            globals_bound,
+        )
+    }
+
+    fn draw_instances_a<T>(
+        &self,
+        data: &[u8],
+        instance_count: u32,
+        pipeline: &wgpu::RenderPipeline,
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        if instance_count == 0 {
+            return true;
+        }
+        let stride = std::mem::size_of::<T>() as u64;
+        let Some(first_instance) = Self::stage_instance_data(
+            staging,
+            self.instance_buffer_capacity,
+            instance_offset,
+            data,
+            stride,
+        ) else {
+            return false;
+        };
+        let resources = self.resources();
+        pass.set_pipeline(pipeline);
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § once-per-pass-globals
+        if !*globals_bound {
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            *globals_bound = true;
+        }
+        pass.set_bind_group(1, &resources.instances_bind_group, &[]);
+        pass.draw(0..4, first_instance..first_instance + instance_count);
+        true
+    }
+
+    fn draw_instances_with_texture_a<T>(
+        &self,
+        data: &[u8],
+        instance_count: u32,
+        texture_id: AtlasTextureId,
+        pipeline: &wgpu::RenderPipeline,
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        if instance_count == 0 {
+            return true;
+        }
+        let stride = std::mem::size_of::<T>() as u64;
+        let Some(first_instance) = Self::stage_instance_data(
+            staging,
+            self.instance_buffer_capacity,
+            instance_offset,
+            data,
+            stride,
+        ) else {
+            return false;
+        };
+        let resources = self.resources();
+        let Some(bind_group) = resources.texture_bind_groups.get(&texture_id) else {
+            // Should have been pre-populated by ensure_texture_bind_group.
+            log::error!(
+                "android draw: missing cached texture bind group for {:?}",
+                texture_id
+            );
+            return true;
+        };
+        pass.set_pipeline(pipeline);
+        if !*globals_bound {
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            *globals_bound = true;
+        }
+        pass.set_bind_group(1, bind_group, &[]);
+        pass.draw(0..4, first_instance..first_instance + instance_count);
+        true
+    }
+
+    fn draw_paths_from_intermediate_a(
+        &self,
+        paths: &[Path<ScaledPixels>],
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+        pass: &mut wgpu::RenderPass<'_>,
+        globals_bound: &mut bool,
+    ) -> bool {
+        let first_path = &paths[0];
+        let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
+        {
+            paths
+                .iter()
+                .map(|p| PathSprite {
+                    bounds: p.clipped_bounds(),
+                })
+                .collect()
+        } else {
+            let mut bounds = first_path.clipped_bounds();
+            for path in paths.iter().skip(1) {
+                bounds = bounds.union(&path.clipped_bounds());
+            }
+            vec![PathSprite { bounds }]
+        };
+
+        if sprites.is_empty() {
+            return true;
+        }
+
+        let resources = self.resources();
+        let Some(ref bind_group) = resources.path_intermediate_bind_group else {
+            return true;
+        };
+
+        let sprite_data = unsafe { Self::instance_bytes(&sprites) };
+        let stride = std::mem::size_of::<PathSprite>() as u64;
+        let Some(first_instance) = Self::stage_instance_data(
+            staging,
+            self.instance_buffer_capacity,
+            instance_offset,
+            sprite_data,
+            stride,
+        ) else {
+            return false;
+        };
+        let instance_count = sprites.len() as u32;
+        pass.set_pipeline(&resources.pipelines.paths);
+        if !*globals_bound {
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            *globals_bound = true;
+        }
+        pass.set_bind_group(1, bind_group, &[]);
+        pass.draw(0..4, first_instance..first_instance + instance_count);
+        true
+    }
+
+    fn draw_paths_to_intermediate_a(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        paths: &[Path<ScaledPixels>],
+        instance_offset: &mut u64,
+        staging: &mut [u8],
+    ) -> bool {
+        let mut vertices = Vec::new();
+        for path in paths {
+            let bounds = path.clipped_bounds();
+            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+                xy_position: v.xy_position,
+                st_position: v.st_position,
+                color: path.color,
+                bounds,
+            }));
+        }
+
+        if vertices.is_empty() {
+            return true;
+        }
+
+        let vertex_data = unsafe { Self::instance_bytes(&vertices) };
+        let stride = std::mem::size_of::<PathRasterizationVertex>() as u64;
+        let Some(first_vertex) = Self::stage_instance_data(
+            staging,
+            self.instance_buffer_capacity,
+            instance_offset,
+            vertex_data,
+            stride,
+        ) else {
+            return false;
+        };
+        let vertex_count = vertices.len() as u32;
+
+        let resources = self.resources();
+        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
+            return true;
+        };
+
+        let (target_view, resolve_target) = if let Some(ref msaa_view) = resources.path_msaa_view {
+            (msaa_view, Some(path_intermediate_view))
+        } else {
+            (path_intermediate_view, None)
+        };
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("path_rasterization_pass_android"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+
+            pass.set_pipeline(&resources.pipelines.path_rasterization);
+            pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
+            pass.set_bind_group(1, &resources.instances_bind_group, &[]);
+            pass.draw(first_vertex..first_vertex + vertex_count, 0..1);
+        }
+
+        true
+    }
+}
+
+// See: docs/GPUI_ANDROID_PERFORMANCE.md § opaque-quads-pipeline
+// A quad is safe to route through the no-blend pipeline only when every
+// fragment it emits is fully opaque. Rounded corners and partial borders
+// produce AA edges with alpha < 1, so they stay on the blending pipeline.
+#[cfg(target_os = "android")]
+fn quad_is_pipeline_opaque(q: &Quad) -> bool {
+    if !q.background.is_opaque() {
+        return false;
+    }
+    if q.corner_radii != gpui::Corners::default() {
+        return false;
+    }
+    let borders = &q.border_widths;
+    let has_border = borders.top.0 > 0.0
+        || borders.bottom.0 > 0.0
+        || borders.left.0 > 0.0
+        || borders.right.0 > 0.0;
+    if has_border && q.border_color.a < 1.0 {
+        return false;
+    }
+    true
+}
+
+// See: docs/GPUI_ANDROID_PERFORMANCE.md § offload-present
+//
+// Owns a single worker thread that runs `queue.submit + frame.present()` off
+// the UI thread. The channel has capacity 1; when full, the UI thread falls
+// back to inline submit+present (spike-prone but rare during steady state).
+#[cfg(target_os = "android")]
+struct PresentWorker {
+    sender: Option<SyncSender<PresentJob>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "android")]
+struct PresentJob {
+    frame: wgpu::SurfaceTexture,
+    command_buffer: wgpu::CommandBuffer,
+}
+
+#[cfg(target_os = "android")]
+impl PresentWorker {
+    fn spawn(queue: Arc<wgpu::Queue>) -> Self {
+        let (sender, receiver) = sync_channel::<PresentJob>(1);
+        let handle = std::thread::Builder::new()
+            .name("gpui-present".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    queue.submit(std::iter::once(job.command_buffer));
+                    job.frame.present();
+                }
+            })
+            .expect("failed to spawn gpui-present worker thread");
+        Self {
+            sender: Some(sender),
+            handle: Some(handle),
+        }
+    }
+
+    fn try_send(
+        &self,
+        frame: wgpu::SurfaceTexture,
+        command_buffer: wgpu::CommandBuffer,
+    ) -> Result<(), (wgpu::SurfaceTexture, wgpu::CommandBuffer)> {
+        let sender = match self.sender.as_ref() {
+            Some(s) => s,
+            None => return Err((frame, command_buffer)),
+        };
+        match sender.try_send(PresentJob {
+            frame,
+            command_buffer,
+        }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(job)) => Err((job.frame, job.command_buffer)),
+            Err(TrySendError::Disconnected(job)) => {
+                log::warn!("gpui-present worker disconnected; falling back to inline present");
+                Err((job.frame, job.command_buffer))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for PresentWorker {
+    fn drop(&mut self) {
+        // Drop the sender first so the receive loop exits cleanly.
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            // Block until the worker drains the channel. If a present is
+            // mid-flight, accept the small one-shot stall on shutdown.
+            if let Err(e) = handle.join() {
+                log::warn!("gpui-present worker join failed: {:?}", e);
+            }
+        }
     }
 }
 

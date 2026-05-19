@@ -246,6 +246,20 @@ class GpuiSurfaceView
 
             val pointerIndex = event.actionIndex
             val pointerId = event.getPointerId(pointerIndex)
+
+            // Android batches multiple touchscreen samples (typically 120-240 Hz)
+            // into one MotionEvent (delivered at ~vsync). Native scrollers emit
+            // an event per historical sample so the scroll position tracks the
+            // finger at sub-frame resolution. Without this, scrolling jumps in
+            // coarse steps and feels less smooth than RecyclerView / WebView.
+            if (action == ACTION_MOVE) {
+                val historySize = event.historySize
+                for (h in 0 until historySize) {
+                    val hx = event.getHistoricalX(pointerIndex, h)
+                    val hy = event.getHistoricalY(pointerIndex, h)
+                    nativeTouchEvent(action, hx, hy, pointerId)
+                }
+            }
             val x = event.getX(pointerIndex)
             val y = event.getY(pointerIndex)
             nativeTouchEvent(action, x, y, pointerId)

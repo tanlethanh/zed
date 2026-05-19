@@ -94,6 +94,15 @@ impl AndroidPlatform {
         let text_system_bg = common.text_system.clone();
         std::thread::spawn(move || Self::load_system_fonts(&text_system_bg));
 
+        #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+        {
+            let port: u16 = std::env::var("ZEDRA_DEVTOOL_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9777);
+            super::devtool_server::start(port);
+        }
+
         Self {
             common: RefCell::new(common),
             main_receiver: RefCell::new(main_receiver),
@@ -259,6 +268,56 @@ impl AndroidPlatform {
 
     pub fn request_frame_for_all_windows(&self) {
         self.request_frame_with_options(false);
+    }
+
+    #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+    pub fn process_devtool_taps(&self) {
+        use gpui::{
+            Modifiers, PlatformInput, PointerButton, PointerDownEvent, PointerKind, PointerUpEvent,
+            point, px,
+        };
+        let taps = super::devtool_server::drain_pending_taps();
+        if taps.is_empty() {
+            return;
+        }
+        let windows: Vec<_> = self
+            .windows
+            .borrow()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        let Some(window) = windows.first() else {
+            log::warn!("devtool: tap dropped, no active window");
+            return;
+        };
+        for tap in taps {
+            let position = point(px(tap.x), px(tap.y));
+            window
+                .borrow_mut()
+                .handle_input(PlatformInput::PointerDown(PointerDownEvent {
+                    pointer_id: 999,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
+            window
+                .borrow_mut()
+                .handle_input(PlatformInput::PointerUp(PointerUpEvent {
+                    pointer_id: 999,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
+            log::info!(
+                "devtool: synthetic tap dispatched at ({:.1},{:.1})",
+                tap.x,
+                tap.y
+            );
+        }
     }
 
     pub fn request_frame_forced(&self) {

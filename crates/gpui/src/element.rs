@@ -371,8 +371,9 @@ impl<E: Element> Drawable<E> {
                     GlobalElementId(Arc::from(&*window.element_id_stack))
                 });
 
+                // See: docs/GPUI_ANDROID_PERFORMANCE.md § skip-inspector-in-debug
                 let inspector_id;
-                #[cfg(any(feature = "inspector", debug_assertions))]
+                #[cfg(feature = "inspector")]
                 {
                     inspector_id = self.element.source_location().map(|source| {
                         let path = crate::InspectorElementPath {
@@ -382,7 +383,7 @@ impl<E: Element> Drawable<E> {
                         window.build_inspector_element_id(path)
                     });
                 }
-                #[cfg(not(any(feature = "inspector", debug_assertions)))]
+                #[cfg(not(feature = "inspector"))]
                 {
                     inspector_id = None;
                 }

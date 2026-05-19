@@ -857,6 +857,19 @@ impl Background {
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
         }
     }
+
+    /// Returns whether the background is guaranteed fully opaque
+    /// (every fragment alpha == 1.0). Used by the renderer to route
+    /// quads through a non-blending pipeline for Mali HSR.
+    pub fn is_opaque(&self) -> bool {
+        match self.tag {
+            BackgroundTag::Solid => self.solid.a >= 1.0,
+            BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.a >= 1.0),
+            // Patterns include transparent regions by definition.
+            BackgroundTag::PatternSlash => false,
+            BackgroundTag::Checkerboard => false,
+        }
+    }
 }
 
 impl From<Hsla> for Background {

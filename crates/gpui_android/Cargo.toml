@@ -13,8 +13,8 @@ path = "src/gpui_android.rs"
 
 [features]
 default = []
-# Passthrough that activates the matching experimental optimisation in gpui_wgpu.
-atlas-oldest-first = ["gpui_wgpu/atlas-oldest-first"]
+# In-app HTTP devtool (see crate::devtool_server). Debug-only AI tap harness.
+devtool = ["gpui/devtool"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 gpui.workspace = true
