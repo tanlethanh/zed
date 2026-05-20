@@ -90,6 +90,8 @@ class GpuiSurfaceView
 
         private var velocityTracker: VelocityTracker? = null
         private var keyboardRequested = false
+        private var imeHeight = 0
+        private var keyboardAccessoryHeight = 0
 
         init {
             holder.addCallback(this)
@@ -98,7 +100,8 @@ class GpuiSurfaceView
 
             ViewCompat.setOnApplyWindowInsetsListener(this) { _, insets ->
                 val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-                nativeKeyboardHeightChanged(ime.bottom)
+                imeHeight = ime.bottom
+                pushKeyboardHeight()
 
                 val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
                 nativeSystemInsetsChanged(systemBars.top, systemBars.bottom)
@@ -140,6 +143,18 @@ class GpuiSurfaceView
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
             imm?.restartInput(this)
             imm?.hideSoftInputFromWindow(windowToken, 0)
+        }
+
+        fun setKeyboardAccessoryHeight(height: Int) {
+            keyboardAccessoryHeight = height.coerceAtLeast(0)
+            pushKeyboardHeight()
+        }
+
+        private fun pushKeyboardHeight() {
+            // Host-provided keyboard accessory bars occupy app content above the IME,
+            // so GPUI keyboard avoidance must reserve both regions together.
+            val accessoryHeight = if (imeHeight > 0) keyboardAccessoryHeight else 0
+            nativeKeyboardHeightChanged(imeHeight + accessoryHeight)
         }
 
         override fun onCheckIsTextEditor(): Boolean = keyboardRequested
