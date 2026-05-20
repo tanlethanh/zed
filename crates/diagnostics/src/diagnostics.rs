@@ -667,10 +667,8 @@ impl ProjectDiagnosticsEditor {
                     }
                 }
 
-                let editor_blocks = anchor_ranges
-                    .into_iter()
-                    .zip_eq(result_blocks.into_iter())
-                    .filter_map(|(anchor, block)| {
+                let editor_blocks = anchor_ranges.into_iter().zip_eq(result_blocks).filter_map(
+                    |(anchor, block)| {
                         let block = block?;
                         let editor = this.editor.downgrade();
                         Some(BlockProperties {
@@ -680,7 +678,8 @@ impl ProjectDiagnosticsEditor {
                             render: Arc::new(move |bcx| block.render_block(editor.clone(), bcx)),
                             priority: 1,
                         })
-                    });
+                    },
+                );
 
                 let block_ids = this.editor.update(cx, |editor, cx| {
                     editor.display_map.update(cx, |display_map, cx| {
@@ -1051,47 +1050,41 @@ async fn heuristic_syntactic_expand(
         let node_range = node_start..node_end;
         let row_count = node_end.row - node_start.row + 1;
         let mut ancestor_range = None;
-        cx.background_executor()
-            .await_on_background(async {
-                // Stop if we've exceeded the row count or reached an outline node. Then, find the interval
-                // of node children which contains the query range. For example, this allows just returning
-                // the header of a declaration rather than the entire declaration.
-                if row_count > max_row_count || outline_range == Some(node_range.clone()) {
-                    let mut cursor = node.walk();
-                    let mut included_child_start = None;
-                    let mut included_child_end = None;
-                    let mut previous_end = node_start;
-                    if cursor.goto_first_child() {
-                        loop {
-                            let child_node = cursor.node();
-                            let child_range =
-                                previous_end..Point::from_ts_point(child_node.end_position());
-                            if included_child_start.is_none()
-                                && child_range.contains(&input_range.start)
-                            {
-                                included_child_start = Some(child_range.start);
-                            }
-                            if child_range.contains(&input_range.end) {
-                                included_child_end = Some(child_range.end);
-                            }
-                            previous_end = child_range.end;
-                            if !cursor.goto_next_sibling() {
-                                break;
-                            }
-                        }
+        // Stop if we've exceeded the row count or reached an outline node. Then, find the interval
+        // of node children which contains the query range. For example, this allows just returning
+        // the header of a declaration rather than the entire declaration.
+        if row_count > max_row_count || outline_range == Some(node_range.clone()) {
+            let mut cursor = node.walk();
+            let mut included_child_start = None;
+            let mut included_child_end = None;
+            let mut previous_end = node_start;
+            if cursor.goto_first_child() {
+                loop {
+                    let child_node = cursor.node();
+                    let child_range = previous_end..Point::from_ts_point(child_node.end_position());
+                    if included_child_start.is_none() && child_range.contains(&input_range.start) {
+                        included_child_start = Some(child_range.start);
                     }
-                    let end = included_child_end.unwrap_or(node_range.end);
-                    if let Some(start) = included_child_start {
-                        let row_count = end.row - start.row;
-                        if row_count < max_row_count {
-                            ancestor_range = Some(Some(RangeInclusive::new(start.row, end.row)));
-                            return;
-                        }
+                    if child_range.contains(&input_range.end) {
+                        included_child_end = Some(child_range.end);
                     }
-                    ancestor_range = Some(None);
+                    previous_end = child_range.end;
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
                 }
-            })
-            .await;
+            }
+            let end = included_child_end.unwrap_or(node_range.end);
+            if let Some(start) = included_child_start {
+                let row_count = end.row - start.row;
+                if row_count < max_row_count {
+                    ancestor_range = Some(Some(RangeInclusive::new(start.row, end.row)));
+                }
+            }
+            if ancestor_range.is_none() {
+                ancestor_range = Some(None);
+            }
+        }
         if let Some(node) = ancestor_range {
             return node;
         }
