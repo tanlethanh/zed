@@ -2973,6 +2973,7 @@ impl Interactivity {
                                             for listener in &long_press_listeners {
                                                 listener(&press_event, window, cx);
                                             }
+                                            window.refresh();
                                         })
                                         .ok();
                                     }
