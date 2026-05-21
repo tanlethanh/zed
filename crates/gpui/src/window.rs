@@ -2652,6 +2652,7 @@ impl Window {
                     Box::new(WindowSelectionHandler),
                     false,
                     false,
+                    false,
                     PlatformTextInputTraits::default(),
                 ));
         }
@@ -4376,7 +4377,10 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        if focus_handle.is_focused(self) {
+        // Native-selection handlers must be installed before focus so UIKit can
+        // ask the surface whether a native selection gesture should begin.
+        let handles_native_selection = input_handler.handles_native_selection(self, cx);
+        if focus_handle.is_focused(self) || handles_native_selection {
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
             let text_input_traits = input_handler.text_input_traits(self, cx);
             let uses_manual_focus = self
@@ -4391,6 +4395,7 @@ impl Window {
                     Box::new(input_handler),
                     accepts_text_input,
                     uses_manual_focus,
+                    handles_native_selection,
                     text_input_traits,
                 )));
         }

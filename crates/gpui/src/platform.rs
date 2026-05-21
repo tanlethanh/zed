@@ -1195,6 +1195,7 @@ pub struct PlatformInputHandler {
     handler: Rc<RefCell<Box<dyn InputHandler>>>,
     accepts_text_input: bool,
     uses_manual_focus: bool,
+    handles_native_selection: bool,
     text_input_traits: PlatformTextInputTraits,
 }
 
@@ -1212,6 +1213,7 @@ impl PlatformInputHandler {
         handler: Box<dyn InputHandler>,
         accepts_text_input: bool,
         uses_manual_focus: bool,
+        handles_native_selection: bool,
         text_input_traits: PlatformTextInputTraits,
     ) -> Self {
         Self {
@@ -1219,6 +1221,7 @@ impl PlatformInputHandler {
             handler: Rc::new(RefCell::new(handler)),
             accepts_text_input,
             uses_manual_focus,
+            handles_native_selection,
             text_input_traits,
         }
     }
@@ -1500,6 +1503,11 @@ impl PlatformInputHandler {
     }
 
     #[allow(dead_code)]
+    pub fn query_handles_native_selection(&mut self) -> bool {
+        self.handles_native_selection
+    }
+
+    #[allow(dead_code)]
     pub fn query_text_input_traits(&self) -> PlatformTextInputTraits {
         self.text_input_traits
     }
@@ -1523,6 +1531,20 @@ impl PlatformInputHandler {
                     .set_selected_text_range(range, window, cx);
             })
             .ok();
+    }
+
+    pub fn adjusted_native_selection_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .adjusted_native_selection_range(range, window, cx)
+            })
+            .ok()
+            .flatten()
     }
 
     pub fn selection_action_names(&mut self) -> Vec<String> {
@@ -1908,6 +1930,16 @@ pub trait InputHandler: 'static {
         true
     }
 
+    /// Returns whether this handler currently owns native touch-selection geometry.
+    ///
+    /// This is for surfaces, such as terminals, that need the platform text
+    /// protocol for both keyboard input and an explicitly activated
+    /// output-selection document without going through the window-level
+    /// read-only selection handler.
+    fn handles_native_selection(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+        false
+    }
+
     /// Returns platform-specific text input traits for this handler.
     fn text_input_traits(
         &mut self,
@@ -1937,6 +1969,17 @@ pub trait InputHandler: 'static {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+    }
+
+    /// Returns an adjusted platform-owned selection range before the platform
+    /// caches or draws native selection geometry.
+    fn adjusted_native_selection_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
+        None
     }
 
     /// Returns custom actions for the active platform-owned selection.

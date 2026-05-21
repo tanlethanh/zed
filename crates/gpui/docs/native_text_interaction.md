@@ -94,26 +94,30 @@ whether the handler accepts text input and whether the focused element used
 If the next frame has no input handler, GPUI calls
 `PlatformWindow::clear_input_handler`.
 
-`PlatformInputHandler` carries two policy bits in addition to the callback
+`PlatformInputHandler` carries three policy bits in addition to the callback
 object:
 
 - `accepts_text_input`, from `InputHandler::accepts_text_input`,
 - `uses_manual_focus`, from whether the focused element was registered through
-  `.manual_focus()`.
+  `.manual_focus()`,
+- `handles_native_selection`, from `InputHandler::handles_native_selection`.
 
 Normal editable handlers auto-request the soft keyboard when newly focused.
 Manual-focus handlers still receive text input, but they do not auto-show the
 keyboard. They must call `Window::show_soft_keyboard()` when they want a
 keyboard session.
 
-On iOS, input handlers use `TEXT_INTERACTION_EDITABLE` only when the handler
-accepts text input, does not use manual focus, and the view is first responder.
-This mode routes keyboard and IME callbacks to the input handler but does not
-install UIKit's editable `UITextInteraction`, does not answer touch-selection
-geometry, and suppresses UIKit's edit menu. When editable text is desired but
-the view is not first responder, iOS falls back to `TEXT_INTERACTION_NONEDITABLE`
-if a selection handler exists. This keeps read-only selection available without
-showing an editable caret.
+On iOS, input handlers use `TEXT_INTERACTION_EDITABLE` when the handler accepts
+text input and the view is first responder. This mode routes keyboard and IME
+callbacks to the input handler. Normal editable handlers suppress UIKit's native
+touch selection and edit menu, because GPUI text fields still own their own
+selection model. A handler that explicitly returns `handles_native_selection()`
+can opt into native range, text, rect, copy, and custom selection-action queries
+while staying in editable mode.
+
+When editable text is desired but the view is not first responder, iOS falls
+back to `TEXT_INTERACTION_NONEDITABLE` if a selection handler exists. This keeps
+read-only selection available without showing an editable caret.
 
 `keyboard_session_requested` is still needed on iOS to preserve an explicit
 keyboard request until the input handler arrives. It is cleared when an
@@ -122,7 +126,24 @@ active.
 
 Terminal-like views that own focus manually should use `.manual_focus()` on the
 focus-tracked element. They can still provide a normal input handler for PTY
-keyboard input, but keyboard presentation is explicit. If terminal content
-later supports read-only native selection, it should register terminal text as
-a `SelectionArea` document and keep PTY keyboard input in the separate
-input-handler path.
+keyboard input, but keyboard presentation is explicit. Terminal content should
+not route the painted grid through the read-only `SelectionArea` path, because
+ordinary text hits would then compete with tap-to-focus keyboard behavior.
+Instead, a terminal input handler can explicitly report
+`handles_native_selection()` for its terminal surface. iOS then asks that same
+handler whether a native text interaction point hits terminal output. GPUI must
+not suppress the window touch stream from that hit test alone. Terminal
+input-native selection is a long-press path; normal taps stay with GPUI keyboard
+activation, and double tap should not start terminal selection. The native path
+owns range, text, rect, copy, and custom selection-action callbacks once the
+long press begins. Blank-cell paste should be implemented by the app as a
+separate native edit menu, not by broadening GPUI text-selection policy.
+Ordinary terminal taps should keep their existing focus/keyboard toggle policy:
+unfocused taps focus and request the keyboard, focused taps with a hidden
+keyboard request it again, and focused taps with a visible keyboard hide it and
+clear focus. The output document remains read-only from the handler's
+perspective: keyboard, IME, and dictation mutations must clear or ignore output
+selection and continue through the terminal input path rather than replacing
+terminal output. If a touch only dismisses an active native output selection,
+iOS consumes that touch stream so it does not also trigger the terminal's normal
+tap policy.

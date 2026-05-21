@@ -13,7 +13,10 @@ use super::{
     display::IosDisplay,
     events::*,
     text_input,
-    text_input::{create_text_position, create_text_range, get_position_index, get_range_indices},
+    text_input::{
+        create_text_position, create_text_range, get_position_index, get_range_indices,
+        set_range_indices,
+    },
 };
 use crate::metal_renderer;
 use anyhow::Result;
@@ -48,6 +51,7 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 const GPUI_VIEW_IVAR: &str = "gpui_view";
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
@@ -56,6 +60,13 @@ const FLING_THRESHOLD: f32 = 50.0;
 const TEXT_INTERACTION_NONE: i8 = -1;
 const TEXT_INTERACTION_NONEDITABLE: i8 = 0;
 const TEXT_INTERACTION_EDITABLE: i8 = 1;
+// GPUI still owns the editable surface's long-press action. UIKit separately
+// asks whether UITextInteraction may begin, so keep editable native selection
+// gated to a matured single-touch press instead of ordinary taps or double taps.
+const EDITABLE_NATIVE_SELECTION_LONG_PRESS_MIN_DURATION: Duration = Duration::from_millis(350);
+// UIKit handle touches often begin just outside the rects returned by GPUI.
+// Keep those touches in the native-selection path instead of clearing selection.
+const NATIVE_SELECTION_HANDLE_HIT_SLOP: f32 = 24.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditMenuActionPolicy {
@@ -64,14 +75,28 @@ enum EditMenuActionPolicy {
     DelegateToSystem,
 }
 
-fn edit_menu_action_policy(interaction_mode: i8, is_copy_action: bool) -> EditMenuActionPolicy {
-    if interaction_mode == TEXT_INTERACTION_NONEDITABLE && is_copy_action {
+fn edit_menu_action_policy(
+    interaction_mode: i8,
+    input_native_selection_enabled: bool,
+    is_copy_action: bool,
+) -> EditMenuActionPolicy {
+    if handles_native_touch_selection(interaction_mode, input_native_selection_enabled)
+        && is_copy_action
+    {
         EditMenuActionPolicy::CopySelection
-    } else if interaction_mode == TEXT_INTERACTION_EDITABLE {
+    } else if interaction_mode == TEXT_INTERACTION_EDITABLE && !input_native_selection_enabled {
         EditMenuActionPolicy::DisableNativeMenu
     } else {
         EditMenuActionPolicy::DelegateToSystem
     }
+}
+
+fn should_consume_touch_for_selection_dismissal(
+    had_selection: bool,
+    hit_text: bool,
+    hit_selection_area: bool,
+) -> bool {
+    had_selection && !hit_text && !hit_selection_area
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +117,7 @@ fn text_input_refresh_plan(
     has_input_handler: bool,
     has_selection_handler: bool,
     input_accepts_text_input: bool,
+    input_native_selection_enabled: bool,
     _input_uses_manual_focus: bool,
     keyboard_session_requested: bool,
     software_keyboard_visible: bool,
@@ -125,6 +151,9 @@ fn text_input_refresh_plan(
         } else {
             TextInputResponderAction::None
         }
+    } else if target_interaction_mode == TEXT_INTERACTION_EDITABLE && input_native_selection_enabled
+    {
+        TextInputResponderAction::None
     } else {
         TextInputResponderAction::ResignActiveResponder
     };
@@ -138,16 +167,17 @@ fn text_input_refresh_plan(
 
 /// Chooses the active text callback route for the current responder state.
 ///
-/// Editable mode currently routes keyboard and IME callbacks to the input handler
-/// without enabling UIKit's native touch selection UI. Noneditable mode is used
-/// for read-only native selection.
+/// Editable mode routes keyboard and IME callbacks to the input handler. An
+/// input handler can also opt into native touch selection while staying editable.
 fn active_text_interaction_mode_for_state(
     target_interaction_mode: i8,
     has_selection_handler: bool,
+    input_native_selection_enabled: bool,
     is_first_responder: bool,
 ) -> i8 {
     match target_interaction_mode {
         TEXT_INTERACTION_EDITABLE if is_first_responder => TEXT_INTERACTION_EDITABLE,
+        TEXT_INTERACTION_EDITABLE if input_native_selection_enabled => TEXT_INTERACTION_EDITABLE,
         TEXT_INTERACTION_EDITABLE if has_selection_handler => TEXT_INTERACTION_NONEDITABLE,
         TEXT_INTERACTION_EDITABLE => TEXT_INTERACTION_NONE,
         TEXT_INTERACTION_NONEDITABLE => TEXT_INTERACTION_NONEDITABLE,
@@ -176,17 +206,29 @@ fn should_use_system_keyboard(
         && (has_input_handler || has_callback_input_handler)
 }
 
-fn handles_native_touch_selection(interaction_mode: i8) -> bool {
+fn handles_native_touch_selection(
+    interaction_mode: i8,
+    input_native_selection_enabled: bool,
+) -> bool {
     interaction_mode == TEXT_INTERACTION_NONEDITABLE
+        || (interaction_mode == TEXT_INTERACTION_EDITABLE && input_native_selection_enabled)
 }
 
-fn should_report_text_input_range_geometry(interaction_mode: i8) -> bool {
+fn should_report_text_input_range_geometry(
+    interaction_mode: i8,
+    input_native_selection_enabled: bool,
+) -> bool {
     interaction_mode == TEXT_INTERACTION_EDITABLE
-        || handles_native_touch_selection(interaction_mode)
+        || handles_native_touch_selection(interaction_mode, input_native_selection_enabled)
 }
 
-fn should_begin_text_interaction(interaction_mode: i8, hit_selectable_text: bool) -> bool {
-    handles_native_touch_selection(interaction_mode) && hit_selectable_text
+fn should_begin_text_interaction(
+    interaction_mode: i8,
+    input_native_selection_enabled: bool,
+    hit_selectable_text: bool,
+) -> bool {
+    handles_native_touch_selection(interaction_mode, input_native_selection_enabled)
+        && hit_selectable_text
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -194,6 +236,23 @@ struct SelectionGeometry {
     range: Range<usize>,
     bounds: Option<Bounds<Pixels>>,
     rects: Vec<Bounds<Pixels>>,
+}
+
+fn selection_geometry_contains_interaction_point(
+    geometry: &SelectionGeometry,
+    point: Point<Pixels>,
+) -> bool {
+    // UIKit selection handles can begin outside the text rects we report.
+    // Treat nearby touches as selection interaction so handle drags are not cleared.
+    let slop = px(NATIVE_SELECTION_HANDLE_HIT_SLOP);
+    geometry
+        .bounds
+        .as_ref()
+        .is_some_and(|bounds| bounds.dilate(slop).contains(&point))
+        || geometry
+            .rects
+            .iter()
+            .any(|rect| rect.dilate(slop).contains(&point))
 }
 
 struct TouchFling {
@@ -559,8 +618,26 @@ fn active_text_interaction_mode(view: &Object) -> i8 {
     }
 }
 
+fn view_input_native_selection_enabled(view: &Object) -> bool {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return false;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window.input_native_selection_enabled.get()
+    }
+}
+
+fn view_handles_native_touch_selection(view: &Object) -> bool {
+    handles_native_touch_selection(
+        active_text_interaction_mode(view),
+        view_input_native_selection_enabled(view),
+    )
+}
+
 fn selection_action_presentations(view: &Object) -> Vec<(String, Option<String>)> {
-    if active_text_interaction_mode(view) != TEXT_INTERACTION_NONEDITABLE {
+    if !view_handles_native_touch_selection(view) {
         return Vec::new();
     }
     with_input_handler(view, |handler| {
@@ -584,10 +661,10 @@ fn perform_selection_menu_action(view: *mut Object, action_index: usize) {
     }
     let _ = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
         let view = &*view;
-        if active_text_interaction_mode(view) != TEXT_INTERACTION_NONEDITABLE {
+        if !view_handles_native_touch_selection(view) {
             return;
         }
-        with_input_handler(view, |handler| {
+        let _ = with_input_handler(view, |handler| {
             handler.perform_selection_action(action_index);
         });
     }));
@@ -646,6 +723,55 @@ fn text_input_document_utf16_len(view: &Object) -> Option<usize> {
 
 fn text_input_has_text(document_utf16_len: Option<usize>) -> bool {
     document_utf16_len.is_some_and(|len| len > 0)
+}
+
+fn adjusted_native_selection_range_for_view(
+    view: &Object,
+    range: Range<usize>,
+    native_touch_selection: bool,
+) -> Range<usize> {
+    if !native_touch_selection {
+        return range;
+    }
+
+    with_input_handler(view, |handler| {
+        handler.adjusted_native_selection_range(range.clone())
+    })
+    .flatten()
+    .unwrap_or(range)
+}
+
+fn cached_active_selection_range_for_view(view: &Object) -> Option<Range<usize>> {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return None;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window
+            .last_selection_geometry
+            .borrow()
+            .as_ref()
+            .map(|geometry| geometry.range.clone())
+    }
+}
+
+fn effective_native_selection_range_for_view(
+    view: &Object,
+    range: Range<usize>,
+    native_touch_selection: bool,
+) -> Range<usize> {
+    let adjusted_range =
+        adjusted_native_selection_range_for_view(view, range.clone(), native_touch_selection);
+    // UIKit may request rects for the collapsed anchor after it already moved
+    // selectedTextRange to a non-empty native selection. Keep drawing that range.
+    if native_touch_selection
+        && adjusted_range.is_empty()
+        && let Some(cached_range) = cached_active_selection_range_for_view(view)
+    {
+        return cached_range;
+    }
+    adjusted_range
 }
 
 fn has_active_selection_geometry(view: &Object) -> bool {
@@ -1107,16 +1233,42 @@ fn register_metal_view_class() -> &'static Class {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let interaction_mode = active_text_interaction_mode(this);
                 let point = Point::new(px(point.x as f32), px(point.y as f32));
-                let hit_selectable_text = unsafe {
+                unsafe {
                     let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
                     if window_ptr.is_null() {
                         false
                     } else {
                         let window = &*(window_ptr as *const IosWindow);
-                        window.point_hits_selectable_text(point)
+                        let input_native_selection_enabled =
+                            window.input_native_selection_enabled.get();
+                        let input_native_tap_count = window.last_touch_tap_count.get();
+                        let input_native_long_press =
+                            window.primary_touch_began_at.borrow().as_ref().is_some_and(
+                                |began_at| {
+                                    began_at.elapsed()
+                                        >= EDITABLE_NATIVE_SELECTION_LONG_PRESS_MIN_DURATION
+                                },
+                            );
+                        let hit_selectable_text = if input_native_selection_enabled {
+                            if input_native_tap_count != 1 || !input_native_long_press {
+                                false
+                            } else {
+                                with_input_handler(this, |handler| {
+                                    handler.character_index_for_point(point)
+                                })
+                                .flatten()
+                                .is_some()
+                            }
+                        } else {
+                            window.point_hits_selectable_text(point)
+                        };
+                        should_begin_text_interaction(
+                            interaction_mode,
+                            input_native_selection_enabled,
+                            hit_selectable_text,
+                        )
                     }
-                };
-                should_begin_text_interaction(interaction_mode, hit_selectable_text)
+                }
             }))
             .unwrap_or(false);
 
@@ -1337,10 +1489,33 @@ fn register_metal_view_class() -> &'static Class {
         extern "C" fn set_selected_text_range(this: &mut Object, _sel: Sel, range: *mut Object) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 let interaction_mode = active_text_interaction_mode(this);
-                if !should_report_text_input_range_geometry(interaction_mode) {
+                let input_native_selection_enabled = view_input_native_selection_enabled(this);
+                let report_geometry = should_report_text_input_range_geometry(
+                    interaction_mode,
+                    input_native_selection_enabled,
+                );
+                if !report_geometry {
                     return;
                 }
                 if let Some((start, end)) = get_range_indices(range) {
+                    let requested_range = start..end;
+                    let native_touch_selection = handles_native_touch_selection(
+                        interaction_mode,
+                        input_native_selection_enabled,
+                    );
+                    let adjusted_range = adjusted_native_selection_range_for_view(
+                        this,
+                        requested_range.clone(),
+                        native_touch_selection,
+                    );
+                    if adjusted_range != requested_range {
+                        let adjusted_native_range = adjusted_range.clone();
+                        let _ = set_range_indices(
+                            range,
+                            adjusted_native_range.start,
+                            adjusted_native_range.end,
+                        );
+                    }
                     // Critical: UIKit can move the caret inside an active IME
                     // composition. Ignoring this for editable inputs leaves the
                     // native tokenizer and GPUI shadow document out of sync.
@@ -1348,18 +1523,19 @@ fn register_metal_view_class() -> &'static Class {
                         this,
                         TextInputMutationSource::TextInputSystem,
                         || {
+                            let adjusted_range = adjusted_range.clone();
                             let _ = with_input_handler(this, |handler| {
-                                handler.set_selected_text_range(start..end);
+                                handler.set_selected_text_range(adjusted_range);
                             });
                         },
                     );
-                    if handles_native_touch_selection(interaction_mode) {
+                    if native_touch_selection {
                         unsafe {
                             let window_ptr: *mut std::ffi::c_void =
                                 *this.get_ivar(GPUI_WINDOW_IVAR);
                             if !window_ptr.is_null() {
                                 let window = &*(window_ptr as *const IosWindow);
-                                window.cache_active_selection_range(start..end);
+                                window.cache_active_selection_range(adjusted_range);
                             }
                         }
                     }
@@ -1377,7 +1553,8 @@ fn register_metal_view_class() -> &'static Class {
                         return None;
                     }
                     let mut adj = None;
-                    let text = handler.text_for_range(selection.range, &mut adj)?;
+                    let selection_range = selection.range.clone();
+                    let text = handler.text_for_range(selection_range.clone(), &mut adj)?;
                     unsafe {
                         use std::ffi::CString;
                         if let Ok(cstr) = CString::new(text) {
@@ -1461,8 +1638,14 @@ fn register_metal_view_class() -> &'static Class {
             action: Sel,
             sender: *mut Object,
         ) -> BOOL {
-            match edit_menu_action_policy(active_text_interaction_mode(this), action == sel!(copy:))
-            {
+            let interaction_mode = active_text_interaction_mode(this);
+            let input_native_selection_enabled = view_input_native_selection_enabled(this);
+            let policy = edit_menu_action_policy(
+                interaction_mode,
+                input_native_selection_enabled,
+                action == sel!(copy:),
+            );
+            let result = match policy {
                 EditMenuActionPolicy::CopySelection => {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
                         let has_selection = with_input_handler(this, |handler| {
@@ -1481,7 +1664,8 @@ fn register_metal_view_class() -> &'static Class {
                     msg_send![super(this, superclass), canPerformAction: action withSender: sender]
                 },
                 EditMenuActionPolicy::DisableNativeMenu => NO,
-            }
+            };
+            result
         }
 
         // UITextInput - markedTextRange (returns nil when no marked text)
@@ -1629,7 +1813,7 @@ fn register_metal_view_class() -> &'static Class {
             range: *mut Object,
             text: *mut Object,
         ) -> BOOL {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let range = get_range_indices(range).map(|(start, end)| start..end);
                 let text_str = ns_string_to_rust_string(text).unwrap_or_default();
                 let should_change = with_input_handler(this, |handler| {
@@ -2165,16 +2349,32 @@ fn register_metal_view_class() -> &'static Class {
                 // IME candidate UI needs firstRectForRange even when GPUI draws
                 // its own editable caret and selection handles.
                 let interaction_mode = active_text_interaction_mode(this);
-                if !should_report_text_input_range_geometry(interaction_mode) {
+                let input_native_selection_enabled = view_input_native_selection_enabled(this);
+                let report_geometry = should_report_text_input_range_geometry(
+                    interaction_mode,
+                    input_native_selection_enabled,
+                );
+                if !report_geometry {
                     return empty_rect;
                 }
                 let Some((start, end)) = get_range_indices(range) else {
                     return default_rect;
                 };
+                let requested_range = start..end;
+                let native_touch_selection = handles_native_touch_selection(
+                    interaction_mode,
+                    input_native_selection_enabled,
+                );
+                let effective_range = effective_native_selection_range_for_view(
+                    this,
+                    requested_range.clone(),
+                    native_touch_selection,
+                );
 
-                let bounds =
-                    with_input_handler(this, |handler| handler.bounds_for_range(start..end))
-                        .flatten();
+                let bounds = with_input_handler(this, |handler| {
+                    handler.bounds_for_range(effective_range.clone())
+                })
+                .flatten();
 
                 match bounds {
                     Some(b) => IOSCGRect::new(
@@ -2198,21 +2398,52 @@ fn register_metal_view_class() -> &'static Class {
             range: *mut Object,
         ) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
-                if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                let interaction_mode = active_text_interaction_mode(this);
+                let input_native_selection_enabled = view_input_native_selection_enabled(this);
+                let native_touch_selection = handles_native_touch_selection(
+                    interaction_mode,
+                    input_native_selection_enabled,
+                );
+                if !native_touch_selection {
                     return msg_send![class!(NSArray), array];
                 }
                 let Some((start, end)) = get_range_indices(range) else {
                     return msg_send![class!(NSArray), array];
                 };
-                if start == end {
+                let requested_range = start..end;
+                let effective_range = effective_native_selection_range_for_view(
+                    this,
+                    requested_range.clone(),
+                    native_touch_selection,
+                );
+                if effective_range.is_empty() {
                     return msg_send![class!(NSArray), array];
                 }
 
-                let rects = with_input_handler(this, |handler| handler.rects_for_range(start..end))
-                    .unwrap_or_default();
+                let rects = with_input_handler(this, |handler| {
+                    handler.rects_for_range(effective_range.clone())
+                })
+                .unwrap_or_default();
 
                 if rects.is_empty() {
                     return msg_send![class!(NSArray), array];
+                }
+
+                if native_touch_selection {
+                    let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
+                    if !window_ptr.is_null() {
+                        let window = &*(window_ptr as *const IosWindow);
+                        // UIKit asks for rects before later handle touches arrive.
+                        // Cache them so the GPUI touch bridge does not clear selection first.
+                        window.cache_active_selection_geometry(SelectionGeometry {
+                            range: effective_range.clone(),
+                            bounds: with_input_handler(this, |handler| {
+                                handler.bounds_for_range(effective_range.clone())
+                            })
+                            .flatten(),
+                            rects: rects.iter().cloned().collect(),
+                        });
+                    }
                 }
 
                 let array: *mut Object = msg_send![class!(NSMutableArray), array];
@@ -2246,7 +2477,7 @@ fn register_metal_view_class() -> &'static Class {
             point: IOSCGPoint,
         ) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+                if !view_handles_native_touch_selection(this) {
                     return ptr::null_mut();
                 }
                 let point = Point::new(px(point.x as f32), px(point.y as f32));
@@ -2302,7 +2533,7 @@ fn register_metal_view_class() -> &'static Class {
             _sel: Sel,
             point: IOSCGPoint,
         ) -> *mut Object {
-            if !handles_native_touch_selection(active_text_interaction_mode(this)) {
+            if !view_handles_native_touch_selection(this) {
                 return std::ptr::null_mut();
             }
             let pos = closest_position_to_point(this, _sel, point);
@@ -2674,7 +2905,6 @@ fn register_metal_view_class() -> &'static Class {
                 interaction_should_begin
                     as extern "C" fn(&Object, Sel, *mut Object, IOSCGPoint) -> BOOL,
             );
-
             // UIResponder - copy action and capability query for selection copy menu.
             decl.add_method(
                 sel!(copy:),
@@ -2861,6 +3091,10 @@ pub(crate) struct IosWindow {
     input_accepts_text_input: Cell<bool>,
     /// Whether the active input handler belongs to a manual-focus surface.
     input_uses_manual_focus: Cell<bool>,
+    /// Cached policy bit from the active input handler. UIKit callbacks use
+    /// this to distinguish normal editable input from editable surfaces that
+    /// expose their own native selection geometry.
+    input_native_selection_enabled: Cell<bool>,
     /// Cached text input traits for the active editable handler.
     input_text_input_traits: Cell<PlatformTextInputTraits>,
     /// Whether UIKit should keep the software keyboard up for the active input handler.
@@ -2872,9 +3106,10 @@ pub(crate) struct IosWindow {
     noneditable_text_interaction: *mut Object,
     /// GPUI's desired interaction mode from the current input/selection handlers.
     target_text_interaction_mode: Cell<i8>,
-    /// The active route for UIKit text callbacks; editable mode does not currently
-    /// install UIKit's editable selection interaction on `view`.
+    /// The active route for UIKit text callbacks.
     active_text_interaction_mode: Cell<i8>,
+    /// Last UIKit tap count observed for the primary touch.
+    last_touch_tap_count: Cell<usize>,
     selectable_text_hit_regions: RefCell<SmallVec<[SelectableTextHitRegion; 8]>>,
     last_selection_geometry: RefCell<Option<SelectionGeometry>>,
     /// Callback for frame requests
@@ -2914,6 +3149,7 @@ pub(crate) struct IosWindow {
     touch_velocity_x: Cell<f32>,
     touch_velocity_y: Cell<f32>,
     touch_last_time: RefCell<Option<std::time::Instant>>,
+    primary_touch_began_at: RefCell<Option<std::time::Instant>>,
     /// Active fling state after finger lift
     fling: RefCell<Option<TouchFling>>,
     /// Position where the primary touch began (used as scroll event origin so
@@ -2922,6 +3158,9 @@ pub(crate) struct IosWindow {
     /// True once a pointer handler claims the active touch stream and suppresses
     /// the platform's synthetic scroll events for that stream.
     touch_scroll_suppressed: Cell<bool>,
+    /// True when this touch stream only dismissed native text selection. The
+    /// same touch must not continue into GPUI press/scroll handling.
+    touch_selection_dismissal_suppressed: Cell<bool>,
     /// Timestamp of the last dispatched Moved event (UITouch.timestamp, seconds since boot).
     /// Used to skip duplicate Moved callbacks that UIKit fires for the same touch sample.
     last_move_ts: Cell<f64>,
@@ -3038,6 +3277,7 @@ impl IosWindow {
                 callback_selection_handler: RefCell::new(None),
                 input_accepts_text_input: Cell::new(false),
                 input_uses_manual_focus: Cell::new(false),
+                input_native_selection_enabled: Cell::new(false),
                 input_text_input_traits: Cell::new(PlatformTextInputTraits::default()),
                 keyboard_session_requested: Cell::new(false),
                 input_delegate: Cell::new(ptr::null_mut()),
@@ -3045,6 +3285,7 @@ impl IosWindow {
                 noneditable_text_interaction,
                 target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
                 active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                last_touch_tap_count: Cell::new(0),
                 selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
@@ -3065,9 +3306,11 @@ impl IosWindow {
                 touch_velocity_x: Cell::new(0.0),
                 touch_velocity_y: Cell::new(0.0),
                 touch_last_time: RefCell::new(None),
+                primary_touch_began_at: RefCell::new(None),
                 fling: RefCell::new(None),
                 touch_down_position: Cell::new(Point::default()),
                 touch_scroll_suppressed: Cell::new(false),
+                touch_selection_dismissal_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
             };
 
@@ -3176,6 +3419,7 @@ impl IosWindow {
                 callback_selection_handler: RefCell::new(None),
                 input_accepts_text_input: Cell::new(false),
                 input_uses_manual_focus: Cell::new(false),
+                input_native_selection_enabled: Cell::new(false),
                 input_text_input_traits: Cell::new(PlatformTextInputTraits::default()),
                 keyboard_session_requested: Cell::new(false),
                 input_delegate: Cell::new(ptr::null_mut()),
@@ -3183,6 +3427,7 @@ impl IosWindow {
                 noneditable_text_interaction,
                 target_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
                 active_text_interaction_mode: Cell::new(TEXT_INTERACTION_NONE),
+                last_touch_tap_count: Cell::new(0),
                 selectable_text_hit_regions: RefCell::new(SmallVec::new()),
                 last_selection_geometry: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
@@ -3203,9 +3448,11 @@ impl IosWindow {
                 touch_velocity_x: Cell::new(0.0),
                 touch_velocity_y: Cell::new(0.0),
                 touch_last_time: RefCell::new(None),
+                primary_touch_began_at: RefCell::new(None),
                 fling: RefCell::new(None),
                 touch_down_position: Cell::new(Point::default()),
                 touch_scroll_suppressed: Cell::new(false),
+                touch_selection_dismissal_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
             })
         }
@@ -3285,14 +3532,16 @@ impl IosWindow {
     /// Applies the active text mode without changing GPUI's desired mode.
     ///
     /// Editable input installs UIKit's text interaction for keyboard, IME, and
-    /// dictation plumbing, while the delegate still blocks native touch selection
-    /// for current input handlers.
+    /// dictation plumbing. The delegate only allows touch selection when the
+    /// active input handler explicitly opts into native selection geometry.
     fn install_text_interaction_mode(&self, mode: i8) {
         let previous_mode = self.active_text_interaction_mode.get();
         if previous_mode == mode {
             return;
         }
-        if previous_mode == TEXT_INTERACTION_NONEDITABLE {
+        if previous_mode == TEXT_INTERACTION_NONEDITABLE
+            || previous_mode == TEXT_INTERACTION_EDITABLE
+        {
             self.last_selection_geometry.borrow_mut().take();
         }
 
@@ -3326,10 +3575,12 @@ impl IosWindow {
     fn sync_text_interaction_for_current_responder_state(&self) {
         let target_interaction_mode = self.target_text_interaction_mode.get();
         let has_selection_handler = self.selection_handler.borrow().is_some();
+        let input_native_selection_enabled = self.input_native_selection_enabled.get();
         let is_first_responder = self.active_first_responder_view().is_some();
         let active_mode = active_text_interaction_mode_for_state(
             target_interaction_mode,
             has_selection_handler,
+            input_native_selection_enabled,
             is_first_responder,
         );
         self.install_text_interaction_mode(active_mode);
@@ -3355,6 +3606,7 @@ impl IosWindow {
         let has_input_handler = self.input_handler.borrow().is_some();
         let has_selection_handler = self.selection_handler.borrow().is_some();
         let input_accepts_text_input = self.input_accepts_text_input.get();
+        let input_native_selection_enabled = self.input_native_selection_enabled.get();
         let input_uses_manual_focus = self.input_uses_manual_focus.get();
         let keyboard_session_requested = self.keyboard_session_requested.get();
         let software_keyboard_visible = self.is_software_keyboard_visible();
@@ -3363,6 +3615,7 @@ impl IosWindow {
             has_input_handler,
             has_selection_handler,
             input_accepts_text_input,
+            input_native_selection_enabled,
             input_uses_manual_focus,
             keyboard_session_requested,
             software_keyboard_visible,
@@ -3387,7 +3640,15 @@ impl IosWindow {
     }
 
     fn refresh_selection_geometry(&self) {
-        if self.active_text_interaction_mode.get() != TEXT_INTERACTION_NONEDITABLE {
+        if !handles_native_touch_selection(
+            self.active_text_interaction_mode.get(),
+            self.input_native_selection_enabled.get(),
+        ) {
+            let cleared = self.last_selection_geometry.borrow_mut().take().is_some();
+            if cleared {
+                let view = unsafe { &*self.view };
+                notify_text_and_selection_change(view, || {});
+            }
             return;
         }
 
@@ -3443,6 +3704,19 @@ impl IosWindow {
         });
     }
 
+    fn cache_active_selection_geometry(&self, geometry: SelectionGeometry) {
+        if geometry.range.is_empty() {
+            self.last_selection_geometry.borrow_mut().take();
+            return;
+        }
+
+        let mut last_selection_geometry = self.last_selection_geometry.borrow_mut();
+        if last_selection_geometry.as_ref() == Some(&geometry) {
+            return;
+        }
+        *last_selection_geometry = Some(geometry);
+    }
+
     fn point_hits_selectable_text(&self, point: Point<Pixels>) -> bool {
         self.selectable_text_hit_regions
             .borrow()
@@ -3455,6 +3729,13 @@ impl IosWindow {
             .borrow()
             .iter()
             .any(|region| region.contains_selection_area(point))
+    }
+
+    fn point_hits_active_selection_geometry(&self, point: Point<Pixels>) -> bool {
+        self.last_selection_geometry
+            .borrow()
+            .as_ref()
+            .is_some_and(|geometry| selection_geometry_contains_interaction_point(geometry, point))
     }
 
     fn clear_active_text_selection(&self, clear_handler: bool) {
@@ -3494,27 +3775,43 @@ impl IosWindow {
                     // First finger down — register as primary and start tracking.
                     self.primary_touch_ptr.set(touch_ptr);
                     self.touch_down_position.set(position);
-                    self.touch_pressed.set(true);
                     self.touch_velocity_x.set(0.0);
                     self.touch_velocity_y.set(0.0);
                     self.last_move_ts.set(0.0);
+                    let tap_count: usize = unsafe { msg_send![touch, tapCount] };
+                    self.last_touch_tap_count.set(tap_count);
                     self.touch_scroll_suppressed.set(false);
-                    *self.touch_last_time.borrow_mut() = Some(std::time::Instant::now());
+                    self.touch_selection_dismissal_suppressed.set(false);
+                    let now = std::time::Instant::now();
+                    *self.touch_last_time.borrow_mut() = Some(now);
+                    *self.primary_touch_began_at.borrow_mut() = Some(now);
                     *self.fling.borrow_mut() = None;
                     let had_selection = self.last_selection_geometry.borrow().is_some();
                     let hit_text = self.point_hits_selectable_text(position);
-                    let hit_selection_area = self.point_hits_selectable_area(position);
-                    if had_selection && !hit_text && !hit_selection_area {
+                    let hit_registered_selection_area = self.point_hits_selectable_area(position);
+                    let hit_active_selection_area =
+                        self.point_hits_active_selection_geometry(position);
+                    let hit_selection_area =
+                        hit_registered_selection_area || hit_active_selection_area;
+                    self.touch_pressed.set(true);
+                    if should_consume_touch_for_selection_dismissal(
+                        had_selection,
+                        hit_text,
+                        hit_selection_area,
+                    ) {
                         self.clear_active_text_selection(true);
-                    }
-                    if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                        self.touch_selection_dismissal_suppressed.set(true);
+                        None
+                    } else if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
                         callback(touch_began_to_pointer_down(
                             position,
                             touch_ptr as u64,
                             modifiers,
                         ));
+                        None
+                    } else {
+                        None
                     }
-                    None
                 } else {
                     // Secondary finger down — cancel fling/velocity to prevent
                     // cross-contamination with the primary finger's scroll state.
@@ -3526,6 +3823,9 @@ impl IosWindow {
             }
             UITouchPhase::Moved => {
                 if touch_ptr != self.primary_touch_ptr.get() {
+                    return;
+                }
+                if self.touch_selection_dismissal_suppressed.get() {
                     return;
                 }
                 // Skip duplicate Moved callbacks: UIKit sometimes delivers the same touch
@@ -3581,7 +3881,13 @@ impl IosWindow {
                     return;
                 }
                 self.primary_touch_ptr.set(0);
+                self.primary_touch_began_at.borrow_mut().take();
                 self.touch_pressed.set(false);
+                let selection_dismissal = self.touch_selection_dismissal_suppressed.replace(false);
+                if selection_dismissal {
+                    self.touch_scroll_suppressed.set(false);
+                    return;
+                }
                 let pointer_result =
                     if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
                         if phase == UITouchPhase::Cancelled {
@@ -3756,6 +4062,9 @@ impl IosWindow {
         let responder = self.input_responder_view();
         let _: BOOL = unsafe { msg_send![responder, becomeFirstResponder] };
         self.sync_text_interaction_for_current_responder_state();
+        // Selection-only sessions use an empty inputView. Reload after the
+        // responder exists so UIKit asks again with the keyboard request active.
+        self.reload_text_input_views_if_first_responder();
     }
 
     /// Hide the software keyboard
@@ -4034,6 +4343,7 @@ impl PlatformWindow for IosWindow {
         let mut input_handler = input_handler;
         let accepts_text_input = input_handler.query_accepts_text_input();
         let uses_manual_focus = input_handler.query_uses_manual_focus();
+        let native_selection_enabled = input_handler.query_handles_native_selection();
         let text_input_traits = input_handler.query_text_input_traits();
         let should_auto_request_keyboard = should_auto_request_soft_keyboard(
             accepts_text_input,
@@ -4045,6 +4355,8 @@ impl PlatformWindow for IosWindow {
         *self.input_handler.borrow_mut() = Some(input_handler);
         self.input_accepts_text_input.set(accepts_text_input);
         self.input_uses_manual_focus.set(uses_manual_focus);
+        self.input_native_selection_enabled
+            .set(native_selection_enabled);
         let previous_text_input_traits = self.input_text_input_traits.replace(text_input_traits);
         if previous_text_input_traits != text_input_traits {
             self.reload_text_input_views_if_first_responder();
@@ -4064,6 +4376,7 @@ impl PlatformWindow for IosWindow {
         let had_callback_input_handler = self.callback_input_handler.borrow_mut().take().is_some();
         self.input_accepts_text_input.set(false);
         self.input_uses_manual_focus.set(false);
+        self.input_native_selection_enabled.set(false);
         let previous_text_input_traits = self
             .input_text_input_traits
             .replace(PlatformTextInputTraits::default());
@@ -4106,6 +4419,7 @@ impl PlatformWindow for IosWindow {
 
     fn show_soft_keyboard(&self) {
         self.keyboard_session_requested.set(true);
+        self.reload_text_input_views_if_first_responder();
         self.refresh_text_input_state();
     }
 
@@ -4306,59 +4620,127 @@ mod tests {
     #[test]
     fn editable_context_rewrite_reports_text_input_range_geometry() {
         assert!(should_report_text_input_range_geometry(
-            TEXT_INTERACTION_EDITABLE
+            TEXT_INTERACTION_EDITABLE,
+            false
         ));
     }
 
     #[test]
     fn editable_edit_menu_actions_are_disabled_for_current_inputs() {
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true),
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false, true),
             EditMenuActionPolicy::DisableNativeMenu
         );
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false),
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false, false),
             EditMenuActionPolicy::DisableNativeMenu
+        );
+    }
+
+    #[test]
+    fn editable_native_selection_copy_uses_selection_policy() {
+        assert_eq!(
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true, true),
+            EditMenuActionPolicy::CopySelection
+        );
+        assert_eq!(
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true, false),
+            EditMenuActionPolicy::DelegateToSystem
         );
     }
 
     #[test]
     fn noneditable_copy_uses_selection_policy_but_other_actions_delegate() {
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_NONEDITABLE, true),
+            edit_menu_action_policy(TEXT_INTERACTION_NONEDITABLE, false, true),
             EditMenuActionPolicy::CopySelection
         );
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_NONEDITABLE, false),
+            edit_menu_action_policy(TEXT_INTERACTION_NONEDITABLE, false, false),
             EditMenuActionPolicy::DelegateToSystem
         );
     }
 
     #[test]
+    fn outside_selection_touch_is_consumed_only_for_dismissal() {
+        assert!(should_consume_touch_for_selection_dismissal(
+            true, false, false
+        ));
+        assert!(!should_consume_touch_for_selection_dismissal(
+            true, true, false
+        ));
+        assert!(!should_consume_touch_for_selection_dismissal(
+            true, false, true
+        ));
+        assert!(!should_consume_touch_for_selection_dismissal(
+            false, false, false
+        ));
+    }
+
+    #[test]
     fn native_touch_selection_is_disabled_without_text_interaction() {
-        assert!(!handles_native_touch_selection(TEXT_INTERACTION_NONE));
+        assert!(!handles_native_touch_selection(
+            TEXT_INTERACTION_NONE,
+            false
+        ));
     }
 
     #[test]
     fn native_touch_selection_is_enabled_for_read_only_selection() {
-        assert!(handles_native_touch_selection(TEXT_INTERACTION_NONEDITABLE));
+        assert!(handles_native_touch_selection(
+            TEXT_INTERACTION_NONEDITABLE,
+            false
+        ));
     }
 
     #[test]
     fn native_touch_selection_is_disabled_for_current_input_handlers() {
-        assert!(!handles_native_touch_selection(TEXT_INTERACTION_EDITABLE));
+        assert!(!handles_native_touch_selection(
+            TEXT_INTERACTION_EDITABLE,
+            false
+        ));
+    }
+
+    #[test]
+    fn native_touch_selection_can_be_enabled_for_editable_handlers() {
+        assert!(handles_native_touch_selection(
+            TEXT_INTERACTION_EDITABLE,
+            true
+        ));
+    }
+
+    #[test]
+    fn active_selection_geometry_hit_test_includes_handle_slop() {
+        let rect = Bounds::new(Point::new(px(218.1), px(363.7)), size(px(57.6), px(16.0)));
+        let geometry = SelectionGeometry {
+            range: 471..479,
+            bounds: Some(rect),
+            rects: vec![rect],
+        };
+
+        assert!(selection_geometry_contains_interaction_point(
+            &geometry,
+            Point::new(px(224.7), px(361.0))
+        ));
+        assert!(!selection_geometry_contains_interaction_point(
+            &geometry,
+            Point::new(px(24.0), px(361.0))
+        ));
     }
 
     #[test]
     fn editable_input_still_reports_ime_range_geometry() {
         assert!(should_report_text_input_range_geometry(
-            TEXT_INTERACTION_EDITABLE
+            TEXT_INTERACTION_EDITABLE,
+            false
         ));
         assert!(should_report_text_input_range_geometry(
-            TEXT_INTERACTION_NONEDITABLE
+            TEXT_INTERACTION_NONEDITABLE,
+            false
         ));
         assert!(!should_report_text_input_range_geometry(
-            TEXT_INTERACTION_NONE
+            TEXT_INTERACTION_NONE,
+            false
         ));
     }
 
@@ -4426,25 +4808,37 @@ mod tests {
     }
 
     #[test]
-    fn text_interaction_begin_requires_read_only_selection_hit() {
+    fn text_interaction_begin_requires_native_selection_hit() {
         assert!(should_begin_text_interaction(
             TEXT_INTERACTION_NONEDITABLE,
+            false,
             true
         ));
         assert!(!should_begin_text_interaction(
             TEXT_INTERACTION_NONEDITABLE,
+            false,
             false
         ));
         assert!(!should_begin_text_interaction(
             TEXT_INTERACTION_EDITABLE,
+            false,
             true
         ));
-        assert!(!should_begin_text_interaction(TEXT_INTERACTION_NONE, true));
+        assert!(should_begin_text_interaction(
+            TEXT_INTERACTION_EDITABLE,
+            true,
+            true
+        ));
+        assert!(!should_begin_text_interaction(
+            TEXT_INTERACTION_NONE,
+            true,
+            true
+        ));
     }
 
     #[test]
     fn explicit_keyboard_request_survives_until_input_handler_arrives() {
-        let plan = text_input_refresh_plan(false, false, false, false, true, false);
+        let plan = text_input_refresh_plan(false, false, false, false, false, true, false);
 
         assert!(plan.keyboard_session_requested);
         assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
@@ -4453,7 +4847,7 @@ mod tests {
 
     #[test]
     fn stale_keyboard_request_resigns_when_handler_is_cleared() {
-        let plan = text_input_refresh_plan(false, false, false, false, false, true);
+        let plan = text_input_refresh_plan(false, false, false, false, false, false, true);
 
         assert!(!plan.keyboard_session_requested);
         assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
@@ -4492,8 +4886,38 @@ mod tests {
     }
 
     #[test]
+    fn input_owned_native_selection_stays_editable_without_keyboard_request() {
+        let plan = text_input_refresh_plan(true, false, true, true, true, false, false);
+
+        assert!(!plan.keyboard_session_requested);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_EDITABLE);
+        assert_eq!(plan.responder_action, TextInputResponderAction::None);
+    }
+
+    #[test]
+    fn keyboard_request_shows_for_input_owned_native_selection() {
+        let plan = text_input_refresh_plan(true, false, true, true, true, true, false);
+
+        assert!(plan.keyboard_session_requested);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_EDITABLE);
+        assert_eq!(
+            plan.responder_action,
+            TextInputResponderAction::ShowKeyboard
+        );
+    }
+
+    #[test]
+    fn keyboard_request_does_not_reopen_for_visible_input_owned_native_selection() {
+        let plan = text_input_refresh_plan(true, false, true, true, true, true, true);
+
+        assert!(plan.keyboard_session_requested);
+        assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_EDITABLE);
+        assert_eq!(plan.responder_action, TextInputResponderAction::None);
+    }
+
+    #[test]
     fn explicit_keyboard_request_shows_when_manual_focus_handler_arrives() {
-        let plan = text_input_refresh_plan(true, false, true, true, true, false);
+        let plan = text_input_refresh_plan(true, false, true, false, true, true, false);
 
         assert!(plan.keyboard_session_requested);
         assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_EDITABLE);
@@ -4505,7 +4929,7 @@ mod tests {
 
     #[test]
     fn explicit_keyboard_request_does_not_reopen_when_keyboard_is_visible() {
-        let plan = text_input_refresh_plan(true, false, true, true, true, true);
+        let plan = text_input_refresh_plan(true, false, true, false, true, true, true);
 
         assert!(plan.keyboard_session_requested);
         assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_EDITABLE);
@@ -4514,7 +4938,7 @@ mod tests {
 
     #[test]
     fn keyboard_request_clears_when_non_text_handler_arrives() {
-        let plan = text_input_refresh_plan(true, false, false, false, true, false);
+        let plan = text_input_refresh_plan(true, false, false, false, false, true, false);
 
         assert!(!plan.keyboard_session_requested);
         assert_eq!(plan.target_interaction_mode, TEXT_INTERACTION_NONE);
@@ -4527,27 +4951,40 @@ mod tests {
     #[test]
     fn editable_mode_routes_input_only_while_first_responder() {
         assert_eq!(
-            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, true),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, false, true),
             TEXT_INTERACTION_EDITABLE
         );
         assert_eq!(
-            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, false),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, true, false, false),
             TEXT_INTERACTION_NONEDITABLE
         );
         assert_eq!(
-            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, false, false),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, false, false, false),
             TEXT_INTERACTION_NONE
+        );
+    }
+
+    #[test]
+    fn editable_native_selection_remains_installed_outside_first_responder() {
+        assert_eq!(
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_EDITABLE, false, true, false),
+            TEXT_INTERACTION_EDITABLE
         );
     }
 
     #[test]
     fn noneditable_interaction_remains_installed_outside_first_responder() {
         assert_eq!(
-            active_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, false),
+            active_text_interaction_mode_for_state(
+                TEXT_INTERACTION_NONEDITABLE,
+                true,
+                false,
+                false
+            ),
             TEXT_INTERACTION_NONEDITABLE
         );
         assert_eq!(
-            active_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, true),
+            active_text_interaction_mode_for_state(TEXT_INTERACTION_NONEDITABLE, true, false, true),
             TEXT_INTERACTION_NONEDITABLE
         );
     }
