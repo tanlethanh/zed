@@ -517,6 +517,83 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
     return background_color;
 }
 
+fn gradient_color_v(
+    tag: u32,
+    color_space: u32,
+    angle_or_pattern: f32,
+    stop0_percentage: f32,
+    stop1_percentage: f32,
+    position: vec2<f32>,
+    bounds_origin: vec2<f32>,
+    bounds_size: vec2<f32>,
+    solid_color: vec4<f32>,
+    color0: vec4<f32>,
+    color1: vec4<f32>,
+) -> vec4<f32> {
+    var background_color = vec4<f32>(0.0);
+    switch (tag) {
+        default: {
+            return solid_color;
+        }
+        case 1u: {
+            let radians = (angle_or_pattern % 360.0 - 90.0) * M_PI_F / 180.0;
+            var direction = vec2<f32>(cos(radians), sin(radians));
+            if (bounds_size.x > bounds_size.y) {
+                direction.y *= bounds_size.y / bounds_size.x;
+            } else {
+                direction.x *= bounds_size.x / bounds_size.y;
+            }
+            let half_size = bounds_size / 2.0;
+            let center = bounds_origin + half_size;
+            let center_to_point = position - center;
+            var t = dot(center_to_point, direction) / length(direction);
+            if (abs(direction.x) > abs(direction.y)) {
+                t = (t + half_size.x) / bounds_size.x;
+            } else {
+                t = (t + half_size.y) / bounds_size.y;
+            }
+            t = (t - stop0_percentage) / (stop1_percentage - stop0_percentage);
+            t = clamp(t, 0.0, 1.0);
+            switch (color_space) {
+                default: {
+                    background_color = srgba_to_linear(mix(color0, color1, t));
+                }
+                case 1u: {
+                    let oklab_color = mix(color0, color1, t);
+                    background_color = oklab_to_linear_srgb(oklab_color);
+                }
+            }
+        }
+        case 2u: {
+            let pattern_width = (angle_or_pattern / 65535.0f) / 255.0f;
+            let pattern_interval = (angle_or_pattern % 65535.0f) / 255.0f;
+            let pattern_height = pattern_width + pattern_interval;
+            let stripe_angle = M_PI_F / 4.0;
+            let pattern_period = pattern_height * sin(stripe_angle);
+            let rotation = mat2x2<f32>(
+                cos(stripe_angle), -sin(stripe_angle),
+                sin(stripe_angle), cos(stripe_angle)
+            );
+            let relative_position = position - bounds_origin;
+            let rotated_point = rotation * relative_position;
+            let pattern = rotated_point.x % pattern_period;
+            let distance = min(pattern, pattern_period - pattern) - pattern_period * (pattern_width / pattern_height) / 2.0f;
+            background_color = solid_color;
+            background_color.a *= saturate(0.5 - distance);
+        }
+        case 3u: {
+            let size = angle_or_pattern;
+            let relative_position = position - bounds_origin;
+            let x_index = floor(relative_position.x / size);
+            let y_index = floor(relative_position.y / size);
+            let should_be_colored = (x_index + y_index) % 2.0;
+            background_color = solid_color;
+            background_color.a *= saturate(should_be_colored);
+        }
+    }
+    return background_color;
+}
+
 // --- quads --- //
 
 struct Quad {
@@ -540,6 +617,15 @@ struct QuadVarying {
     @location(3) @interpolate(flat) background_solid: vec4<f32>,
     @location(4) @interpolate(flat) background_color0: vec4<f32>,
     @location(5) @interpolate(flat) background_color1: vec4<f32>,
+    // Mali Valhall storage-buffer reads in fragment shaders are DRAM-backed
+    // and per-fragment, making `b_quads[input.quad_id]` a major bottleneck.
+    // These flat varyings hand the FS everything it needs from the Quad so
+    // the FS never has to touch the storage buffer.
+    @location(6) @interpolate(flat) v_bounds: vec4<f32>,
+    @location(7) @interpolate(flat) v_corner_radii: vec4<f32>,
+    @location(8) @interpolate(flat) v_border_widths: vec4<f32>,
+    @location(9) @interpolate(flat) v_bg_meta: vec4<f32>,
+    @location(10) @interpolate(flat) v_bg_stops: vec4<f32>,
 }
 
 @vertex
@@ -563,6 +649,31 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.v_bounds = vec4<f32>(quad.bounds.origin, quad.bounds.size);
+    out.v_corner_radii = vec4<f32>(
+        quad.corner_radii.top_left,
+        quad.corner_radii.top_right,
+        quad.corner_radii.bottom_left,
+        quad.corner_radii.bottom_right,
+    );
+    out.v_border_widths = vec4<f32>(
+        quad.border_widths.top,
+        quad.border_widths.right,
+        quad.border_widths.bottom,
+        quad.border_widths.left,
+    );
+    out.v_bg_meta = vec4<f32>(
+        f32(quad.background.tag),
+        f32(quad.background.color_space),
+        quad.background.gradient_angle_or_pattern_height,
+        f32(quad.border_style),
+    );
+    out.v_bg_stops = vec4<f32>(
+        quad.background.colors[0].percentage,
+        quad.background.colors[1].percentage,
+        0.0,
+        0.0,
+    );
     return out;
 }
 
@@ -573,28 +684,59 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let quad = b_quads[input.quad_id];
+    // Read quad fields from flat varyings instead of `b_quads[input.quad_id]`.
+    // Per-fragment storage-buffer reads are DRAM-backed on Mali Valhall.
+    let quad_bounds = Bounds(input.v_bounds.xy, input.v_bounds.zw);
+    let quad_corner_radii = Corners(
+        input.v_corner_radii.x,
+        input.v_corner_radii.y,
+        input.v_corner_radii.w,
+        input.v_corner_radii.z,
+    );
+    let quad_border_widths = Edges(
+        input.v_border_widths.x,
+        input.v_border_widths.y,
+        input.v_border_widths.z,
+        input.v_border_widths.w,
+    );
+    let quad_bg_tag = u32(input.v_bg_meta.x);
+    let quad_bg_color_space = u32(input.v_bg_meta.y);
+    let quad_bg_angle = input.v_bg_meta.z;
+    let quad_border_style = u32(input.v_bg_meta.w);
+    let quad_bg_stop0 = input.v_bg_stops.x;
+    let quad_bg_stop1 = input.v_bg_stops.y;
 
-    let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
-        input.background_solid, input.background_color0, input.background_color1);
+    let background_color = gradient_color_v(
+        quad_bg_tag,
+        quad_bg_color_space,
+        quad_bg_angle,
+        quad_bg_stop0,
+        quad_bg_stop1,
+        input.position.xy,
+        quad_bounds.origin,
+        quad_bounds.size,
+        input.background_solid,
+        input.background_color0,
+        input.background_color1,
+    );
 
-    let unrounded = quad.corner_radii.top_left == 0.0 &&
-        quad.corner_radii.bottom_left == 0.0 &&
-        quad.corner_radii.top_right == 0.0 &&
-        quad.corner_radii.bottom_right == 0.0;
+    let unrounded = quad_corner_radii.top_left == 0.0 &&
+        quad_corner_radii.bottom_left == 0.0 &&
+        quad_corner_radii.top_right == 0.0 &&
+        quad_corner_radii.bottom_right == 0.0;
 
     // Fast path when the quad is not rounded and doesn't have any border
-    if (quad.border_widths.top == 0.0 &&
-            quad.border_widths.left == 0.0 &&
-            quad.border_widths.right == 0.0 &&
-            quad.border_widths.bottom == 0.0 &&
+    if (quad_border_widths.top == 0.0 &&
+            quad_border_widths.left == 0.0 &&
+            quad_border_widths.right == 0.0 &&
+            quad_border_widths.bottom == 0.0 &&
             unrounded) {
         return blend_color(background_color, 1.0);
     }
 
-    let size = quad.bounds.size;
+    let size = quad_bounds.size;
     let half_size = size / 2.0;
-    let point = input.position.xy - quad.bounds.origin;
+    let point = input.position.xy - quad_bounds.origin;
     let center_to_point = point - half_size;
 
     // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -602,17 +744,17 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     let antialias_threshold = 0.5;
 
     // Radius of the nearest corner
-    let corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+    let corner_radius = pick_corner_radius(center_to_point, quad_corner_radii);
 
     // Width of the nearest borders
     let border = vec2<f32>(
         select(
-            quad.border_widths.right,
-            quad.border_widths.left,
+            quad_border_widths.right,
+            quad_border_widths.left,
             center_to_point.x < 0.0),
         select(
-            quad.border_widths.bottom,
-            quad.border_widths.top,
+            quad_border_widths.bottom,
+            quad_border_widths.top,
             center_to_point.y < 0.0));
 
     // 0-width borders are reduced so that `inner_sdf >= antialias_threshold`.
@@ -694,7 +836,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         var border_color = input.border_color;
 
         // Dashed border logic when border_style == 1
-        if (quad.border_style == 1) {
+        if (quad_border_style == 1) {
             // Position along the perimeter in "dash space", where each dash
             // period has length 1
             var t = 0.0;
@@ -736,12 +878,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 // this does not fix single dashed borders at the corners
                 let dashed_border = vec2<f32>(
                         max(
-                            quad.border_widths.bottom,
-                            quad.border_widths.top,
+                            quad_border_widths.bottom,
+                            quad_border_widths.top,
                         ),
                         max(
-                            quad.border_widths.right,
-                            quad.border_widths.left,
+                            quad_border_widths.right,
+                            quad_border_widths.left,
                         )
                    );
 
@@ -753,15 +895,15 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 // When corners are rounded, the dashes are laid out clockwise
                 // around the whole perimeter.
 
-                let r_tr = quad.corner_radii.top_right;
-                let r_br = quad.corner_radii.bottom_right;
-                let r_bl = quad.corner_radii.bottom_left;
-                let r_tl = quad.corner_radii.top_left;
+                let r_tr = quad_corner_radii.top_right;
+                let r_br = quad_corner_radii.bottom_right;
+                let r_bl = quad_corner_radii.bottom_left;
+                let r_tl = quad_corner_radii.top_left;
 
-                let w_t = quad.border_widths.top;
-                let w_r = quad.border_widths.right;
-                let w_b = quad.border_widths.bottom;
-                let w_l = quad.border_widths.left;
+                let w_t = quad_border_widths.top;
+                let w_r = quad_border_widths.right;
+                let w_b = quad_border_widths.bottom;
+                let w_l = quad_border_widths.left;
 
                 // Straight side dash velocities
                 let dv_t = select(dv_numerator / w_t, 0.0, w_t <= 0.0);

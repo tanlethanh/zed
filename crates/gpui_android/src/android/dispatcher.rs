@@ -36,10 +36,6 @@ impl AndroidDispatcher {
                     .name(format!("Worker-{i}"))
                     .spawn(move || {
                         for runnable in receiver.iter() {
-                            if runnable.metadata().is_closed() {
-                                continue;
-                            }
-
                             let start = Instant::now();
 
                             let location = runnable.metadata().location;
@@ -75,9 +71,6 @@ impl AndroidDispatcher {
                     std::thread::sleep(timer.duration);
 
                     let runnable = timer.runnable;
-                    if runnable.metadata().is_closed() {
-                        continue;
-                    }
 
                     let start = Instant::now();
                     let location = runnable.metadata().location;

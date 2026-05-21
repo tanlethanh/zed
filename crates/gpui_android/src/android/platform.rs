@@ -7,56 +7,21 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
-use jni::{JavaVM, objects::GlobalRef};
-use ndk::looper::ThreadLooper;
+use jni::{JNIEnv, JavaVM, objects::GlobalRef};
 
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DispatchEventResult,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, Modifiers, OwnedMenu,
-    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformInput, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Point, PointerButton,
-    PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent, PointerUpEvent,
-    RequestFrameOptions, RunnableVariant, ScrollDelta, ScrollWheelEvent, Task, ThermalState,
-    TouchPhase, WindowAppearance, WindowParams, point, px,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, RequestFrameOptions, RunnableVariant, Task, ThermalState,
+    WindowAppearance, WindowParams,
 };
-use gpui_wgpu::WgpuContext;
+use gpui_wgpu::GpuContext;
 
 use super::dispatcher::{AndroidDispatcher, AndroidQueueReceiver};
 use super::keyboard::AndroidKeyboardLayout;
 use super::text_system::CosmicTextSystem;
-use super::window::{AndroidWindow, AndroidWindowState};
-
-pub const DOUBLE_CLICK_DISTANCE: gpui::Pixels = px(5.0);
-
-const TAP_SLOP: f32 = 4.0;
-const FLING_THRESHOLD: f32 = 50.0;
-
-struct FlingState {
-    velocity_x: f32,
-    velocity_y: f32,
-    last_time: std::time::Instant,
-    position: Point<Pixels>,
-}
-
-struct TouchState {
-    last_position: Option<(f32, f32)>,
-    down_position: Option<(f32, f32)>,
-    is_drag: bool,
-    suppress_scroll: bool,
-    fling: Option<FlingState>,
-}
-
-impl TouchState {
-    fn new() -> Self {
-        Self {
-            last_position: None,
-            down_position: None,
-            is_drag: false,
-            suppress_scroll: false,
-            fling: None,
-        }
-    }
-}
+use super::window::{AndroidWindow, AndroidWindowRole, AndroidWindowState};
 
 #[derive(Default)]
 pub(crate) struct PlatformHandlers {
@@ -109,12 +74,13 @@ impl AndroidCommon {
 pub struct AndroidPlatform {
     common: RefCell<AndroidCommon>,
     main_receiver: RefCell<AndroidQueueReceiver<RunnableVariant>>,
-    jvm: Arc<JavaVM>,
-    activity: Arc<Mutex<GlobalRef>>,
-    wgpu_context: RefCell<Option<Arc<WgpuContext>>>,
+    wgpu_context: GpuContext,
+    next_window_role: Cell<AndroidWindowRole>,
     windows: RefCell<Vec<RcWeak<RefCell<AndroidWindowState>>>>,
+    pending_root_native_window: RefCell<Option<ndk::native_window::NativeWindow>>,
+    pending_sheet_native_window: RefCell<Option<ndk::native_window::NativeWindow>>,
+    app_active: Cell<bool>,
     display_scale: Cell<f32>,
-    touch_state: RefCell<TouchState>,
 }
 
 impl AndroidPlatform {
@@ -128,15 +94,25 @@ impl AndroidPlatform {
         let text_system_bg = common.text_system.clone();
         std::thread::spawn(move || Self::load_system_fonts(&text_system_bg));
 
+        #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+        {
+            let port: u16 = std::env::var("ZEDRA_DEVTOOL_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9777);
+            super::devtool_server::start(port);
+        }
+
         Self {
             common: RefCell::new(common),
             main_receiver: RefCell::new(main_receiver),
-            jvm,
-            activity,
-            wgpu_context: RefCell::new(None),
+            wgpu_context: Rc::new(RefCell::new(None)),
+            next_window_role: Cell::new(AndroidWindowRole::Root),
             windows: RefCell::new(Vec::new()),
+            pending_root_native_window: RefCell::new(None),
+            pending_sheet_native_window: RefCell::new(None),
+            app_active: Cell::new(true),
             display_scale: Cell::new(3.0),
-            touch_state: RefCell::new(TouchState::new()),
         }
     }
 
@@ -148,37 +124,102 @@ impl AndroidPlatform {
         &self,
         native_window: ndk::native_window::NativeWindow,
     ) -> Result<()> {
-        let windows = self.windows.borrow();
-        let window = windows
-            .last()
-            .and_then(|w| w.upgrade())
-            .ok_or_else(|| anyhow!("No windows available to attach surface"))?;
+        self.attach_native_window_for_role(AndroidWindowRole::Root, native_window)
+    }
 
-        let wgpu_context = self.ensure_wgpu_context()?;
-        window
-            .borrow_mut()
-            .handle_surface_created(native_window, &wgpu_context)
+    pub fn attach_sheet_native_window(
+        &self,
+        native_window: ndk::native_window::NativeWindow,
+    ) -> Result<()> {
+        self.attach_native_window_for_role(AndroidWindowRole::EmbeddedSheet, native_window)
     }
 
     pub fn detach_native_window(&self) {
-        if let Some(window) = self.windows.borrow().last().and_then(|w| w.upgrade()) {
+        self.detach_native_window_for_role(AndroidWindowRole::Root);
+    }
+
+    pub fn detach_sheet_native_window(&self) {
+        self.detach_native_window_for_role(AndroidWindowRole::EmbeddedSheet);
+    }
+
+    pub fn handle_surface_resize(&self, width: u32, height: u32) -> Result<()> {
+        self.handle_surface_resize_for_role(AndroidWindowRole::Root, width, height)
+    }
+
+    pub fn handle_sheet_surface_resize(&self, width: u32, height: u32) -> Result<()> {
+        self.handle_surface_resize_for_role(AndroidWindowRole::EmbeddedSheet, width, height)
+    }
+
+    pub fn prepare_embedded_window(&self) {
+        self.next_window_role.set(AndroidWindowRole::EmbeddedSheet);
+    }
+
+    pub fn set_app_active(&self, active: bool) {
+        self.app_active.set(active);
+
+        let windows = self
+            .windows
+            .borrow()
+            .iter()
+            .filter_map(|window| window.upgrade())
+            .collect::<Vec<_>>();
+
+        for window in windows {
+            let mut callback = {
+                let mut window = window.borrow_mut();
+                if window.set_active(active) {
+                    window.take_active_status_change_callback()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(callback) = callback.as_mut() {
+                callback(active);
+            }
+
+            if let Some(callback) = callback {
+                window
+                    .borrow_mut()
+                    .restore_active_status_change_callback(callback);
+            }
+        }
+
+        self.windows.borrow_mut().retain(|w| w.strong_count() > 0);
+    }
+
+    fn attach_native_window_for_role(
+        &self,
+        role: AndroidWindowRole,
+        native_window: ndk::native_window::NativeWindow,
+    ) -> Result<()> {
+        let Some(window) = self.window_for_role(role) else {
+            self.store_pending_native_window(role, native_window);
+            return Ok(());
+        };
+
+        window
+            .borrow_mut()
+            .handle_surface_created(native_window, self.wgpu_context.clone())
+    }
+
+    fn detach_native_window_for_role(&self, role: AndroidWindowRole) {
+        if let Some(window) = self.window_for_role(role) {
             window.borrow_mut().handle_surface_destroyed();
         }
     }
 
-    pub fn handle_surface_resize(&self, width: u32, height: u32) -> Result<()> {
-        let windows = self.windows.borrow();
-        let window = windows
-            .last()
-            .and_then(|w| w.upgrade())
-            .ok_or_else(|| anyhow!("No windows available for surface resize"))?;
+    fn handle_surface_resize_for_role(
+        &self,
+        role: AndroidWindowRole,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let window = self
+            .window_for_role(role)
+            .ok_or_else(|| anyhow!("No {:?} window available for surface resize", role))?;
 
-        let wgpu_context = self.ensure_wgpu_context()?;
-
-        let resize_info =
-            window
-                .borrow_mut()
-                .handle_surface_changed(width, height, &wgpu_context)?;
+        let resize_info = window.borrow_mut().handle_surface_changed(width, height)?;
         if let Some((size, scale)) = resize_info {
             let mut callback = window.borrow_mut().take_resize_callback();
             if let Some(ref mut cb) = callback {
@@ -189,8 +230,94 @@ impl AndroidPlatform {
         Ok(())
     }
 
+    fn window_for_role(&self, role: AndroidWindowRole) -> Option<Rc<RefCell<AndroidWindowState>>> {
+        self.windows
+            .borrow()
+            .iter()
+            .rev()
+            .filter_map(|window| window.upgrade())
+            .find(|window| window.borrow().role() == role)
+    }
+
+    fn store_pending_native_window(
+        &self,
+        role: AndroidWindowRole,
+        native_window: ndk::native_window::NativeWindow,
+    ) {
+        match role {
+            AndroidWindowRole::Root => {
+                *self.pending_root_native_window.borrow_mut() = Some(native_window);
+            }
+            AndroidWindowRole::EmbeddedSheet => {
+                *self.pending_sheet_native_window.borrow_mut() = Some(native_window);
+            }
+        }
+    }
+
+    fn take_pending_native_window(
+        &self,
+        role: AndroidWindowRole,
+    ) -> Option<ndk::native_window::NativeWindow> {
+        match role {
+            AndroidWindowRole::Root => self.pending_root_native_window.borrow_mut().take(),
+            AndroidWindowRole::EmbeddedSheet => {
+                self.pending_sheet_native_window.borrow_mut().take()
+            }
+        }
+    }
+
     pub fn request_frame_for_all_windows(&self) {
         self.request_frame_with_options(false);
+    }
+
+    #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+    pub fn process_devtool_taps(&self) {
+        use gpui::{
+            Modifiers, PlatformInput, PointerButton, PointerDownEvent, PointerKind, PointerUpEvent,
+            point, px,
+        };
+        let taps = super::devtool_server::drain_pending_taps();
+        if taps.is_empty() {
+            return;
+        }
+        let windows: Vec<_> = self
+            .windows
+            .borrow()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        let Some(window) = windows.first() else {
+            log::warn!("devtool: tap dropped, no active window");
+            return;
+        };
+        for tap in taps {
+            let position = point(px(tap.x), px(tap.y));
+            window
+                .borrow_mut()
+                .handle_input(PlatformInput::PointerDown(PointerDownEvent {
+                    pointer_id: 999,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
+            window
+                .borrow_mut()
+                .handle_input(PlatformInput::PointerUp(PointerUpEvent {
+                    pointer_id: 999,
+                    kind: PointerKind::Touch,
+                    is_primary: true,
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                }));
+            log::info!(
+                "devtool: synthetic tap dispatched at ({:.1},{:.1})",
+                tap.x,
+                tap.y
+            );
+        }
     }
 
     pub fn request_frame_forced(&self) {
@@ -224,11 +351,15 @@ impl AndroidPlatform {
     }
 
     pub fn dispatch_input(&self, input: PlatformInput) -> DispatchEventResult {
-        let window = {
-            let windows = self.windows.borrow();
-            windows.last().and_then(|w| w.upgrade())
-        };
+        self.dispatch_input_for_role(AndroidWindowRole::Root, input)
+    }
 
+    fn dispatch_input_for_role(
+        &self,
+        role: AndroidWindowRole,
+        input: PlatformInput,
+    ) -> DispatchEventResult {
+        let window = self.window_for_role(role);
         let Some(window) = window else {
             return DispatchEventResult::default();
         };
@@ -246,237 +377,132 @@ impl AndroidPlatform {
     pub fn process_pending_tasks(&self) {
         let mut main_receiver = self.main_receiver.borrow_mut();
         while let Some(runnable) = main_receiver.try_recv() {
-            if !runnable.metadata().is_closed() {
-                runnable.run();
-            }
+            runnable.run();
         }
     }
 
-    /// Handle a raw Android touch event (ACTION_DOWN/MOVE/UP/CANCEL).
-    ///
-    /// Converts physical pixel coordinates to logical pixels, performs tap vs drag
-    /// detection, and dispatches GPUI `PlatformInput` events. All drags become
-    /// `ScrollWheelEvent` so GPUI scroll handlers receive them uniformly — the
-    /// same model as iOS UIKit pan gestures.
+    /// Handle a raw Android touch event for the root surface.
     pub fn handle_touch(&self, action: i32, x: f32, y: f32) {
-        let scale = self.display_scale.get();
-        let logical_x = x / scale;
-        let logical_y = y / scale;
-        let position = point(px(logical_x), px(logical_y));
+        self.handle_touch_for_role(AndroidWindowRole::Root, action, x, y);
+    }
 
-        match action {
-            0 => {
-                // ACTION_DOWN
-                let mut state = self.touch_state.borrow_mut();
-                state.fling = None;
-                state.down_position = Some((logical_x, logical_y));
-                state.last_position = Some((logical_x, logical_y));
-                state.is_drag = false;
-                state.suppress_scroll = false;
-                self.dispatch_input(PlatformInput::PointerDown(PointerDownEvent {
-                    pointer_id: 1,
-                    kind: PointerKind::Touch,
-                    is_primary: true,
-                    button: PointerButton::Primary,
-                    position,
-                    modifiers: Modifiers::default(),
-                }));
-            }
-            1 => {
-                // ACTION_UP
-                let (is_drag, suppress_scroll) = {
-                    let mut state = self.touch_state.borrow_mut();
-                    let is_drag = state.is_drag;
-                    let suppress_scroll = state.suppress_scroll;
-                    state.last_position = None;
-                    state.down_position = None;
-                    state.is_drag = false;
-                    (is_drag, suppress_scroll)
-                };
-                if !is_drag || suppress_scroll {
-                    // Discard any fling: Java forwards velocity unconditionally, but
-                    // tap classification happens here. A fling after a tap would cause
-                    // spurious scrolling.
-                    self.touch_state.borrow_mut().fling = None;
-                } else {
-                    self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                        position,
-                        delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
-                        modifiers: Modifiers::default(),
-                        touch_phase: TouchPhase::Ended,
-                    }));
-                }
-                self.dispatch_input(PlatformInput::PointerUp(PointerUpEvent {
-                    pointer_id: 1,
-                    kind: PointerKind::Touch,
-                    is_primary: true,
-                    button: PointerButton::Primary,
-                    position,
-                    modifiers: Modifiers::default(),
-                }));
-            }
-            2 => {
-                // ACTION_MOVE
-                let (scroll_delta, should_scroll) = {
-                    let mut state = self.touch_state.borrow_mut();
-                    if !state.is_drag {
-                        if let Some((down_x, down_y)) = state.down_position {
-                            let dx = logical_x - down_x;
-                            let dy = logical_y - down_y;
-                            if (dx * dx + dy * dy).sqrt() > TAP_SLOP {
-                                state.is_drag = true;
-                            }
-                        }
-                    }
-                    if state.is_drag {
-                        let delta = state
-                            .last_position
-                            .map(|(last_x, last_y)| (logical_x - last_x, logical_y - last_y));
-                        state.last_position = Some((logical_x, logical_y));
-                        (delta, true)
-                    } else {
-                        state.last_position = Some((logical_x, logical_y));
-                        (None, false)
-                    }
-                };
-                let pointer_result =
-                    self.dispatch_input(PlatformInput::PointerMove(PointerMoveEvent {
-                        pointer_id: 1,
-                        kind: PointerKind::Touch,
-                        is_primary: true,
-                        pressed_button: Some(PointerButton::Primary),
-                        position,
-                        modifiers: Modifiers::default(),
-                    }));
-                if pointer_result.default_prevented {
-                    self.touch_state.borrow_mut().suppress_scroll = true;
-                }
-                if should_scroll {
-                    if let Some((dx, dy)) = scroll_delta {
-                        if !self.touch_state.borrow().suppress_scroll {
-                            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                                position,
-                                delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
-                                modifiers: Modifiers::default(),
-                                touch_phase: TouchPhase::Moved,
-                            }));
-                        }
-                    }
-                }
-            }
-            3 => {
-                // ACTION_CANCEL
-                let mut state = self.touch_state.borrow_mut();
-                state.last_position = None;
-                state.down_position = None;
-                state.is_drag = false;
-                state.suppress_scroll = false;
-                self.dispatch_input(PlatformInput::PointerCancel(PointerCancelEvent {
-                    pointer_id: 1,
-                    kind: PointerKind::Touch,
-                    is_primary: true,
-                    position,
-                    modifiers: Modifiers::default(),
-                }));
-            }
-            _ => {}
+    /// Handle a raw Android touch event for an embedded sheet surface.
+    pub fn handle_sheet_touch(&self, action: i32, x: f32, y: f32) {
+        self.handle_touch_for_role(AndroidWindowRole::EmbeddedSheet, action, x, y);
+    }
+
+    fn handle_touch_for_role(&self, role: AndroidWindowRole, action: i32, x: f32, y: f32) {
+        if let Some(window) = self.window_for_role(role) {
+            window.borrow_mut().handle_touch(action, x, y);
         }
     }
 
     /// Handle a fling gesture (velocity in physical pixels/second from Android VelocityTracker).
     pub fn handle_fling(&self, velocity_x: f32, velocity_y: f32) {
-        let scale = self.display_scale.get();
-        let vx = velocity_x / scale;
-        let vy = velocity_y / scale;
+        self.handle_fling_for_role(AndroidWindowRole::Root, velocity_x, velocity_y);
+    }
 
-        let mut state = self.touch_state.borrow_mut();
-        if state.suppress_scroll {
-            state.fling = None;
-            return;
-        }
-        let position = state
-            .last_position
-            .map(|(x, y)| point(px(x), px(y)))
-            .unwrap_or_default();
+    /// Handle a fling gesture for an embedded sheet surface.
+    pub fn handle_sheet_fling(&self, velocity_x: f32, velocity_y: f32) {
+        self.handle_fling_for_role(AndroidWindowRole::EmbeddedSheet, velocity_x, velocity_y);
+    }
 
-        if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
-            state.fling = Some(FlingState {
-                velocity_x: vx,
-                velocity_y: vy,
-                last_time: std::time::Instant::now(),
-                position,
-            });
+    fn handle_fling_for_role(&self, role: AndroidWindowRole, velocity_x: f32, velocity_y: f32) {
+        if let Some(window) = self.window_for_role(role) {
+            window.borrow_mut().handle_fling(velocity_x, velocity_y);
         }
     }
 
     /// Returns true if a fling animation is currently active.
     pub fn has_active_fling(&self) -> bool {
-        self.touch_state.borrow().fling.is_some()
+        self.windows
+            .borrow()
+            .iter()
+            .filter_map(|window| window.upgrade())
+            .any(|window| window.borrow().has_active_fling())
     }
 
-    /// Advance fling one frame — apply friction and dispatch scroll events.
+    /// Advance fling one frame for every Android window.
     pub fn process_fling(&self) {
-        let fling_data = {
-            let state = self.touch_state.borrow();
-            state
-                .fling
-                .as_ref()
-                .map(|f| (f.velocity_x, f.velocity_y, f.last_time, f.position))
-        };
-        let Some((vx, vy, last_time, position)) = fling_data else {
-            return;
-        };
-
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(last_time).as_secs_f32();
-        let friction = 0.95_f32.powf(dt * 60.0);
-        let new_vx = vx * friction;
-        let new_vy = vy * friction;
-
-        if new_vx.abs() < FLING_THRESHOLD && new_vy.abs() < FLING_THRESHOLD {
-            self.touch_state.borrow_mut().fling = None;
-            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                position,
-                delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
-                modifiers: Modifiers::default(),
-                touch_phase: TouchPhase::Ended,
-            }));
-            return;
+        let windows = self
+            .windows
+            .borrow()
+            .iter()
+            .filter_map(|window| window.upgrade())
+            .collect::<Vec<_>>();
+        for window in windows {
+            window.borrow_mut().process_fling();
         }
-
-        {
-            let mut state = self.touch_state.borrow_mut();
-            if let Some(ref mut f) = state.fling {
-                f.velocity_x = new_vx;
-                f.velocity_y = new_vy;
-                f.last_time = now;
-            }
-        }
-
-        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position,
-            delta: ScrollDelta::Pixels(point(px(new_vx * dt), px(new_vy * dt))),
-            modifiers: Modifiers::default(),
-            touch_phase: TouchPhase::Moved,
-        }));
     }
 
     fn with_common<R>(&self, f: impl FnOnce(&mut AndroidCommon) -> R) -> R {
         f(&mut self.common.borrow_mut())
     }
 
-    fn ensure_wgpu_context(&self) -> Result<Arc<WgpuContext>> {
-        let mut wgpu_context = self.wgpu_context.borrow_mut();
-        if let Some(ref ctx) = *wgpu_context {
-            return Ok(ctx.clone());
+    fn with_jni_env(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut JNIEnv<'_>) -> jni::errors::Result<()>,
+    ) {
+        let jvm = self.with_common(|common| common.jvm.clone());
+        let mut env = match jvm.get_env() {
+            Ok(env) => env,
+            Err(_) => match jvm.attach_current_thread_as_daemon() {
+                Ok(env) => env,
+                Err(error) => {
+                    log::error!("gpui_android: {operation} failed to attach thread: {error:?}");
+                    return;
+                }
+            },
+        };
+
+        if let Err(error) = f(&mut env) {
+            log::error!("gpui_android: {operation} failed: {error:?}");
         }
+        if env.exception_check().unwrap_or(false) {
+            env.exception_describe().ok();
+            env.exception_clear().ok();
+        }
+    }
 
-        let ctx =
-            WgpuContext::new().map_err(|e| anyhow!("Failed to create WgpuContext: {:?}", e))?;
+    fn call_runtime_controller_static(&self, operation: &'static str, method: &'static str) {
+        self.with_jni_env(operation, |env| {
+            let class = env.find_class("dev/zed/gpui/GpuiRuntimeController")?;
+            env.call_static_method(class, method, "()V", &[])?;
+            Ok(())
+        });
+    }
 
-        let ctx = Arc::new(ctx);
-        *wgpu_context = Some(ctx.clone());
-        Ok(ctx)
+    pub(crate) fn request_soft_keyboard(&self) {
+        self.call_runtime_controller_static("request_soft_keyboard", "requestSoftKeyboard");
+    }
+
+    pub(crate) fn hide_soft_keyboard(&self) {
+        self.call_runtime_controller_static("hide_soft_keyboard", "hideSoftKeyboard");
+    }
+
+    pub fn insert_text(&self, text: &str) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().insert_text(text))
+    }
+
+    pub fn delete_backward(&self, count: usize) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().delete_backward(count))
+    }
+
+    pub fn set_composing_text(&self, text: &str, new_cursor_position: i32) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| {
+                window
+                    .borrow_mut()
+                    .set_composing_text(text, new_cursor_position)
+            })
+    }
+
+    pub fn finish_composing_text(&self) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().finish_composing_text())
     }
 
     fn load_essential_fonts(text_system: &Arc<dyn PlatformTextSystem>) {
@@ -486,6 +512,8 @@ impl AndroidPlatform {
             "/system/fonts/DroidSans-Bold.ttf",
             "/system/fonts/DroidSansMono.ttf",
             "/system/fonts/MiSansC_3.005.ttf",
+            "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf",
+            "/system/fonts/NotoSansSymbols2-Regular.ttf",
             "/system/fonts/NotoColorEmoji.ttf",
         ];
 
@@ -547,38 +575,11 @@ impl Platform for AndroidPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
-        on_finish_launching();
-
-        if let Some(looper) = ThreadLooper::for_thread() {
-            loop {
-                if self.with_common(|common| common.quit_requested) {
-                    break;
-                }
-
-                match looper.poll_once_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(_) => {
-                        self.process_pending_tasks();
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-            }
-        } else {
-            loop {
-                if self.with_common(|common| common.quit_requested) {
-                    break;
-                }
-
-                self.process_pending_tasks();
-                std::thread::sleep(std::time::Duration::from_millis(16));
-            }
-        }
-
-        let quit = self.with_common(|common| common.callbacks.quit.take());
-        if let Some(mut fun) = quit {
-            fun();
-        }
+        // Mirrors `IosPlatform::run`: defer the callback until Kotlin invokes
+        // `gpui_android_did_finish_launching`. The Choreographer-driven frame
+        // loop drives `process_pending_tasks` per frame from the FFI layer; no
+        // looper poll is needed here.
+        super::app_state::set_finish_launching_callback(on_finish_launching);
     }
 
     fn quit(&self) {
@@ -618,17 +619,16 @@ impl Platform for AndroidPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let wgpu_context = self.ensure_wgpu_context()?;
         let scale = self.display_scale.get();
+        let role = self.next_window_role.replace(AndroidWindowRole::Root);
 
-        let window = AndroidWindow::new(
-            handle,
-            options.bounds,
-            scale,
-            self.jvm.clone(),
-            self.activity.clone(),
-            &wgpu_context,
-        )?;
+        let window = AndroidWindow::new(handle, role, options.bounds, scale, self.app_active.get());
+
+        if let Some(native_window) = self.take_pending_native_window(role) {
+            // GPUI draws once before `open_window` returns. Android must bind
+            // the WGPU atlas here so text glyph painting cannot hit an empty atlas.
+            window.handle_surface_created(native_window, self.wgpu_context.clone())?;
+        }
 
         self.windows.borrow_mut().push(Rc::downgrade(&window.state));
         Ok(Box::new(window))
@@ -726,6 +726,12 @@ impl Platform for AndroidPlatform {
     }
 
     fn set_cursor_style(&self, _style: CursorStyle) {}
+
+    fn hide_cursor_until_mouse_moves(&self) {}
+
+    fn is_cursor_visible(&self) -> bool {
+        true
+    }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
         true

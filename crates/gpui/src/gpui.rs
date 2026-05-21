@@ -27,6 +27,8 @@ mod geometry;
 mod global;
 mod input;
 mod inspector;
+#[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+pub mod devtool;
 mod interactive;
 mod key_dispatch;
 mod keymap;

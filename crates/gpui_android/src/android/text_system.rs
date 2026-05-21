@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
-    Attrs, AttrsList, Family, Font as CosmicTextFont, FontFeatures as CosmicFontFeatures,
+    Attrs, AttrsList, Fallback, Family, Font as CosmicTextFont, FontFeatures as CosmicFontFeatures,
     FontSystem, ShapeBuffer, ShapeLine,
 };
 use gpui::{
@@ -17,8 +17,9 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, sync::Arc};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
-    zeno::{Format, Transform, Vector},
+    zeno::{Format, Vector},
 };
+use unicode_script::Script;
 
 pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 
@@ -48,9 +49,48 @@ struct LoadedFont {
     is_known_emoji_font: bool,
 }
 
+struct AndroidFontFallback;
+
+impl Fallback for AndroidFontFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        &[
+            "Roboto",
+            "Droid Sans",
+            "DroidSans",
+            "Noto Sans",
+            "Noto Sans Mono",
+            "Droid Sans Mono",
+            "DroidSansMono",
+            "Noto Sans Symbols",
+            "Noto Sans Symbols2",
+            "Noto Sans Symbols 2",
+            "Noto Color Emoji",
+            "NotoColorEmoji",
+        ]
+    }
+
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        &[]
+    }
+
+    fn script_fallback(&self, _script: Script, _locale: &str) -> &[&'static str] {
+        &[]
+    }
+}
+
 impl CosmicTextSystem {
     pub(crate) fn new() -> Self {
-        let font_system = FontSystem::new();
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.set_sans_serif_family("Roboto");
+        db.set_monospace_family("Droid Sans Mono");
+        db.set_serif_family("Noto Serif");
+        // Android hits cosmic-text's generic empty fallback by default, so keep
+        // platform fallbacks explicit like iOS does through CoreText cascade.
+        let font_system = FontSystem::new_with_locale_and_db_and_fallback(
+            "en-US".to_string(),
+            db,
+            AndroidFontFallback,
+        );
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
             scratch: ShapeBuffer::default(),
@@ -402,17 +442,25 @@ impl CosmicTextSystemState {
     ) -> Result<swash::scale::image::Image> {
         let loaded_font = &self.loaded_fonts[params.font_id.0];
         let font_ref = loaded_font.font.as_swash();
-        let pixel_size = f32::from(params.font_size);
+        // Rasterize at device-pixel size — hinting decisions (stem snapping,
+        // edge AA) must happen at the same resolution the glyph is sampled at
+        // on screen. Building the scaler at logical size and then applying a
+        // scale_factor transform makes swash hint for the wrong grid and
+        // produces visibly soft strokes when scaled up to the device. iOS gets
+        // away with the equivalent pattern because CoreText is aware of the
+        // CGContext scale, but swash treats `transform` as a post-hint affine
+        // and the hint quality is lost.
+        let device_pixel_size = f32::from(params.font_size) * params.scale_factor;
 
         let subpixel_offset = Vector::new(
-            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor,
-            params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
+            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32,
+            params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32,
         );
 
         let mut scaler = self
             .swash_scale_context
             .builder(font_ref)
-            .size(pixel_size)
+            .size(device_pixel_size)
             .hint(true)
             .build();
 
@@ -427,14 +475,6 @@ impl CosmicTextSystemState {
         };
 
         let mut renderer = Render::new(sources);
-        renderer.transform(Some(Transform {
-            xx: params.scale_factor,
-            xy: 0.0,
-            yx: 0.0,
-            yy: params.scale_factor,
-            x: 0.0,
-            y: 0.0,
-        }));
 
         if params.subpixel_rendering {
             renderer

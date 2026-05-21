@@ -42,6 +42,21 @@ pub struct FontId(pub usize);
 pub struct FontFamilyId(pub usize);
 
 /// Number of subpixel glyph variants along the X axis.
+///
+/// Each variant is a separate atlas tile + swash rasterization. With value 4,
+/// the same character at different fractional X positions (different code
+/// tokens on different lines) requires up to 4 distinct rasterizations.
+/// During fast scroll this drives `paint_glyph` into the swash inline path
+/// 10-30 times per spike frame on Android (~1 ms each).
+///
+/// Setting to 1 means glyphs snap to integer pixel X positions: one cached
+/// rasterization per (font, glyph, size) regardless of position. Trade-off
+/// is slightly less precise letter spacing.
+// See: docs/GPUI_ANDROID_PERFORMANCE.md § integer-x-glyphs
+#[cfg(target_os = "android")]
+pub const SUBPIXEL_VARIANTS_X: u8 = 1;
+/// Number of subpixel glyph variants along the X axis.
+#[cfg(not(target_os = "android"))]
 pub const SUBPIXEL_VARIANTS_X: u8 = 4;
 
 /// Number of subpixel glyph variants along the Y axis.

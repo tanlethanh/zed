@@ -162,11 +162,25 @@ impl WgpuAtlasState {
         {
             let textures = &mut self.storage[texture_kind];
 
-            if let Some(tile) = textures
+            // See: docs/GPUI_ANDROID_PERFORMANCE.md § atlas-oldest-first
+            #[cfg(target_os = "android")]
+            let tile = if texture_kind == AtlasTextureKind::Monochrome {
+                textures
+                    .iter_mut()
+                    .find_map(|texture| texture.allocate(size))
+            } else {
+                textures
+                    .iter_mut()
+                    .rev()
+                    .find_map(|texture| texture.allocate(size))
+            };
+            #[cfg(not(target_os = "android"))]
+            let tile = textures
                 .iter_mut()
                 .rev()
-                .find_map(|texture| texture.allocate(size))
-            {
+                .find_map(|texture| texture.allocate(size));
+
+            if let Some(tile) = tile {
                 return Some(tile);
             }
         }
@@ -184,13 +198,31 @@ impl WgpuAtlasState {
             width: DevicePixels(1024),
             height: DevicePixels(1024),
         };
+        // See: docs/GPUI_ANDROID_PERFORMANCE.md § atlas-oldest-first
+        #[cfg(target_os = "android")]
+        const ANDROID_MONOCHROME_ATLAS_SIZE: Size<DevicePixels> = Size {
+            width: DevicePixels(2048),
+            height: DevicePixels(2048),
+        };
         let max_texture_size = self.max_texture_size as i32;
         let max_atlas_size = Size {
             width: DevicePixels(max_texture_size),
             height: DevicePixels(max_texture_size),
         };
 
-        let size = min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE);
+        #[cfg(target_os = "android")]
+        let default_size = if kind == AtlasTextureKind::Monochrome {
+            ANDROID_MONOCHROME_ATLAS_SIZE
+        } else {
+            DEFAULT_ATLAS_SIZE
+        };
+        #[cfg(not(target_os = "android"))]
+        let default_size = {
+            let _ = kind;
+            DEFAULT_ATLAS_SIZE
+        };
+
+        let size = min_size.min(&max_atlas_size).max(&default_size);
         let format = match kind {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
             AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,

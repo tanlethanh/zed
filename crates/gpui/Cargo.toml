@@ -39,6 +39,9 @@ screen-capture = [
 ]
 windows-manifest = ["dep:embed-resource"]
 input-latency-histogram = ["dep:hdrhistogram"]
+# In-app HTTP devtool: exposes interactive hitboxes by `ElementId` path and
+# accepts synthetic taps. Debug-build opt-in for AI-driven UI scripting.
+devtool = []
 
 [lib]
 path = "src/gpui.rs"

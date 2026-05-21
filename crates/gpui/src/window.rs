@@ -1233,6 +1233,7 @@ impl InputLatencyTracker {
     }
 }
 
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DrawPhase {
     None,
@@ -1467,9 +1468,11 @@ impl Window {
                         .log_err();
                 }
 
-                // Keep presenting if input was recently arriving at a high rate (>= 60fps).
-                // Once high-rate input is detected, we sustain presentation for 1 second
-                // to prevent display underclocking during active input.
+                // See: docs/GPUI_ANDROID_PERFORMANCE.md § skip-high-rate-present
+                #[cfg(target_os = "android")]
+                let needs_present =
+                    request_frame_options.require_presentation || needs_present.get();
+                #[cfg(not(target_os = "android"))]
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
@@ -1478,11 +1481,6 @@ impl Window {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
-                                if request_frame_options.force_render {
-                                    // Bypass cached view reuse so we don't replay stale
-                                    // atlas tile references after a GPU device recovery.
-                                    window.refresh();
-                                }
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
                                 arena_clear_needed.clear();
@@ -2519,9 +2517,8 @@ impl Window {
         }
     }
 
-    /// Call to prevent the default action of an event. This is used by widgets to
-    /// claim platform-level behavior such as default focus transfer or synthetic
-    /// touch scrolling.
+    /// Call to prevent the default action of an event. Currently only used to prevent
+    /// parent elements from becoming focused on mouse down.
     pub fn prevent_default(&mut self) {
         self.default_prevented = true;
     }
@@ -2746,6 +2743,7 @@ impl Window {
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
+
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -2796,6 +2794,7 @@ impl Window {
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
+
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
@@ -2815,6 +2814,19 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static DEVTOOL_FRAME_ID: AtomicU64 = AtomicU64::new(0);
+            let id = DEVTOOL_FRAME_ID.fetch_add(1, Ordering::Relaxed);
+            crate::devtool::publish(
+                id,
+                &self.next_frame.hitboxes,
+                &self.next_frame.inspector_hitboxes,
+            );
+        }
+
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
@@ -5684,7 +5696,8 @@ impl Window {
         cx: &App,
     ) {
         self.invalidator.debug_assert_paint_or_prepaint();
-        if !self.is_inspector_picking(cx) {
+        let devtool_active = cfg!(feature = "devtool");
+        if !devtool_active && !self.is_inspector_picking(cx) {
             return;
         }
         if let Some(inspector_id) = inspector_id {
