@@ -3,6 +3,8 @@ package dev.zed.gpui
 import android.content.Context
 import android.graphics.Rect
 import android.os.Build
+import android.text.Editable
+import android.text.Selection
 import android.text.InputType
 import android.util.AttributeSet
 import android.util.Log
@@ -13,6 +15,8 @@ import android.view.SurfaceView
 import android.view.VelocityTracker
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.ExtractedText
+import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import androidx.core.view.ViewCompat
@@ -163,30 +167,64 @@ class GpuiSurfaceView
             outAttrs.inputType = InputType.TYPE_CLASS_TEXT
             outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_NONE
 
-            return object : BaseInputConnection(this, false) {
+            return object : BaseInputConnection(this, true) {
+                private val editable = Editable.Factory.getInstance().newEditable("")
+                private var activeComposingText: String? = null
+
+                override fun getEditable(): Editable = editable
+
                 override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                    nativeImeSetComposingText(text?.toString().orEmpty(), newCursorPosition)
-                    return true
+                    val composingText = text?.toString().orEmpty()
+                    activeComposingText = composingText.takeIf { it.isNotEmpty() }
+                    val handled = super.setComposingText(text, newCursorPosition)
+                    nativeImeSetComposingText(composingText, newCursorPosition)
+                    return handled
                 }
 
                 override fun finishComposingText(): Boolean {
+                    // Some Android IMEs finalize QWERTY composition through finishComposingText
+                    // without a follow-up commitText. Commit the marked text before clearing it.
+                    activeComposingText?.let { composingText ->
+                        if (composingText.isNotEmpty()) {
+                            nativeImeInput(composingText)
+                        }
+                    }
+                    activeComposingText = null
+                    val handled = super.finishComposingText()
                     nativeImeFinishComposingText()
-                    return true
+                    return handled
                 }
 
                 override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
                     val s = text?.toString().orEmpty()
+                    activeComposingText = null
+                    val handled = super.commitText(text, newCursorPosition)
                     if (s.isNotEmpty()) {
                         nativeImeInput(s)
                     }
-                    return true
+                    return handled
                 }
 
                 override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                    activeComposingText = null
+                    val handled = super.deleteSurroundingText(beforeLength, afterLength)
                     repeat(beforeLength.coerceAtLeast(0)) {
                         nativeKeyEvent(KEY_ACTION_DOWN, KeyEvent.KEYCODE_DEL, 0)
                     }
-                    return true
+                    return handled
+                }
+
+                override fun getExtractedText(
+                    request: ExtractedTextRequest?,
+                    flags: Int,
+                ): ExtractedText {
+                    val extractedText = ExtractedText()
+                    extractedText.text = editable.toString()
+                    extractedText.partialStartOffset = -1
+                    extractedText.partialEndOffset = -1
+                    extractedText.selectionStart = Selection.getSelectionStart(editable).coerceAtLeast(0)
+                    extractedText.selectionEnd = Selection.getSelectionEnd(editable).coerceAtLeast(0)
+                    return extractedText
                 }
 
                 override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
@@ -194,6 +232,7 @@ class GpuiSurfaceView
 
                 override fun sendKeyEvent(event: KeyEvent): Boolean {
                     if (event.action == KeyEvent.ACTION_DOWN) {
+                        activeComposingText = null
                         nativeKeyEvent(KEY_ACTION_DOWN, event.keyCode, event.unicodeChar)
                     }
                     return true
