@@ -8,6 +8,7 @@ import android.util.AttributeSet
 import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.VelocityTracker
@@ -80,6 +81,13 @@ class GpuiSurfaceView
                 velocityY: Float,
             )
 
+            @JvmStatic private external fun nativePinchEvent(
+                phase: Int,
+                focusX: Float,
+                focusY: Float,
+                scaleFactor: Float,
+            )
+
             @JvmStatic private external fun nativeKeyboardHeightChanged(height: Int)
 
             @JvmStatic private external fun nativeSystemInsetsChanged(
@@ -92,6 +100,41 @@ class GpuiSurfaceView
         private var keyboardRequested = false
         private var imeHeight = 0
         private var keyboardAccessoryHeight = 0
+
+        private val scaleDetector =
+            ScaleGestureDetector(
+                context,
+                object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                    override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                        nativePinchEvent(
+                            ACTION_DOWN,
+                            detector.focusX,
+                            detector.focusY,
+                            detector.scaleFactor,
+                        )
+                        return true
+                    }
+
+                    override fun onScale(detector: ScaleGestureDetector): Boolean {
+                        nativePinchEvent(
+                            ACTION_MOVE,
+                            detector.focusX,
+                            detector.focusY,
+                            detector.scaleFactor,
+                        )
+                        return true
+                    }
+
+                    override fun onScaleEnd(detector: ScaleGestureDetector) {
+                        nativePinchEvent(
+                            ACTION_UP,
+                            detector.focusX,
+                            detector.focusY,
+                            detector.scaleFactor,
+                        )
+                    }
+                },
+            )
 
         init {
             holder.addCallback(this)
@@ -226,6 +269,11 @@ class GpuiSurfaceView
         // ----- Input -----
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
+            // Run the scale detector first so its callbacks are dispatched
+            // before any single-finger pan/scroll forwarding below. The native
+            // side suppresses scroll while a pinch is in progress.
+            scaleDetector.onTouchEvent(event)
+
             val action =
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
