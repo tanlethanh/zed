@@ -22,6 +22,26 @@ pub struct CompositorGpuHint {
     pub device_id: u32,
 }
 
+// Decouple wgpu instance flags from the cargo debug profile.
+//
+// `InstanceFlags::default()` calls `from_build_config()`, which auto-enables
+// `DEBUG | VALIDATION` whenever `debug_assertions` is on. That enables
+// `VK_EXT_debug_utils` in the Vulkan backend and triggers calls like
+// `vkSetDebugUtilsObjectNameEXT`. Some drivers (e.g. Adreno on Android)
+// return a null function pointer for that entry, which causes ash to panic
+// during normal rendering. Result: debug builds crash where release builds
+// run fine, on the same device.
+//
+// Make validation an explicit opt-in via env var so debug and release behave
+// the same at the graphics layer.
+pub fn instance_flags() -> wgpu::InstanceFlags {
+    if std::env::var("ZEDRA_WGPU_VALIDATION").is_ok() {
+        wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG
+    } else {
+        wgpu::InstanceFlags::empty()
+    }
+}
+
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
@@ -103,7 +123,7 @@ impl WgpuContext {
     pub async fn new_web() -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
-            flags: wgpu::InstanceFlags::default(),
+            flags: instance_flags(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: None,
@@ -195,7 +215,7 @@ impl WgpuContext {
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            flags: wgpu::InstanceFlags::default(),
+            flags: instance_flags(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: Some(display),
