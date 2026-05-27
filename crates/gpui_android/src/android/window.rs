@@ -51,6 +51,10 @@ struct TouchState {
     is_drag: bool,
     suppress_scroll: bool,
     fling: Option<FlingState>,
+    /// True while ScaleGestureDetector reports a pinch in progress. Suppresses
+    /// pan/scroll generation from single-finger MOVE events so the gesture is
+    /// driven purely by the pinch handler.
+    pinch_in_progress: bool,
 }
 
 impl TouchState {
@@ -61,6 +65,7 @@ impl TouchState {
             is_drag: false,
             suppress_scroll: false,
             fling: None,
+            pinch_in_progress: false,
         }
     }
 }
@@ -576,7 +581,9 @@ impl AndroidWindowState {
                 }
                 if should_scroll {
                     if let Some((dx, dy)) = scroll_delta {
-                        if !self.touch_state.suppress_scroll {
+                        if !self.touch_state.suppress_scroll
+                            && !self.touch_state.pinch_in_progress
+                        {
                             self.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                                 position,
                                 delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
@@ -632,6 +639,43 @@ impl AndroidWindowState {
 
     pub fn has_active_fling(&self) -> bool {
         self.touch_state.fling.is_some()
+    }
+
+    /// Dispatch a ScaleGestureDetector callback as a GPUI `PinchEvent`.
+    /// `phase` matches Android `MotionEvent` ACTION_* constants reused as a
+    /// transport (DOWN=Began, MOVE=Changed, UP=Ended, CANCEL=Ended). Java
+    /// reports cumulative `scale_factor` per onScale call; the delta passed to
+    /// the platform input is the incremental ratio for that call.
+    pub fn handle_pinch(&mut self, phase: i32, focus_x: f32, focus_y: f32, scale_factor: f32) {
+        let logical_x = focus_x / self.scale;
+        let logical_y = focus_y / self.scale;
+        let position = point(px(logical_x), px(logical_y));
+
+        let touch_phase = match phase {
+            ACTION_DOWN => {
+                self.touch_state.pinch_in_progress = true;
+                self.touch_state.fling = None;
+                TouchPhase::Started
+            }
+            ACTION_MOVE => TouchPhase::Moved,
+            ACTION_UP | ACTION_CANCEL => {
+                self.touch_state.pinch_in_progress = false;
+                TouchPhase::Ended
+            }
+            _ => return,
+        };
+
+        let delta = match touch_phase {
+            TouchPhase::Moved => scale_factor - 1.0,
+            _ => 0.0,
+        };
+
+        self.handle_input(gpui::PlatformInput::Pinch(gpui::PinchEvent {
+            position,
+            delta,
+            modifiers: Modifiers::default(),
+            phase: touch_phase,
+        }));
     }
 
     pub fn process_fling(&mut self) {
