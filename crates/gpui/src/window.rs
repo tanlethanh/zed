@@ -14,8 +14,9 @@ use crate::{
     PromptButton, PromptLevel, Quad, ReadOnlySelectionSnapshot, RegisteredSelectionArea,
     RegisteredTextSelectionFragment, Render, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SelectableTextHitRegion, SelectionArea,
-    SelectionState, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScreenTransform, SelectableTextHitRegion,
+    SelectionArea, SelectionState, Shadow, SharedString, Size, StrikethroughStyle, Style,
+    SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
     TaffyLayoutEngine, Task, TextRenderingMode, TextSelectionFragment, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
@@ -1054,6 +1055,12 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    /// Composed paint-space transforms pushed by [`Window::with_paint_transform`].
+    /// Stored as the current accumulated transform so paint and hitbox emission
+    /// pay one lookup, not a fold over the stack. The stack itself only carries
+    /// the prior accumulated value so push/pop can restore it.
+    pub(crate) paint_transform_stack: Vec<ScreenTransform>,
+    pub(crate) current_paint_transform: ScreenTransform,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -1669,6 +1676,8 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            paint_transform_stack: Vec::new(),
+            current_paint_transform: ScreenTransform::identity(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3306,6 +3315,13 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
+            // Mask bounds are subtree-local; bring them into screen space so
+            // they intersect correctly with primitives and outer masks already
+            // stored in screen space.
+            let transform = self.current_paint_transform;
+            let mask = ContentMask {
+                bounds: transform.apply_bounds(mask.bounds),
+            };
             let mask = mask.intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
@@ -3346,6 +3362,51 @@ impl Window {
         let result = f(self);
         self.element_offset_stack.pop();
         result
+    }
+
+    /// Push a screen-space affine transform that applies to every primitive
+    /// and hitbox emitted inside `f`. Used to implement canvas-style pinch
+    /// zoom on a subtree without reflowing its layout: the subtree is laid out
+    /// at its natural size, then its emitted geometry is scaled/translated
+    /// into screen space at paint and hit-test time. Transforms compose with
+    /// any enclosing `with_paint_transform`.
+    ///
+    /// May be called during either prepaint or paint. Hitboxes inserted
+    /// during prepaint use the transform that was active when this method was
+    /// called.
+    pub fn with_paint_transform<R>(
+        &mut self,
+        transform: ScreenTransform,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        if transform.is_identity() {
+            return f(self);
+        }
+        let prior = self.current_paint_transform;
+        self.paint_transform_stack.push(prior);
+        self.current_paint_transform = ScreenTransform::compose(prior, transform);
+        let result = f(self);
+        self.current_paint_transform = self
+            .paint_transform_stack
+            .pop()
+            .unwrap_or_else(ScreenTransform::identity);
+        result
+    }
+
+    /// The currently-active paint-space transform composed across all
+    /// enclosing `with_paint_transform` calls. Identity outside any such call.
+    pub fn current_paint_transform(&self) -> ScreenTransform {
+        self.current_paint_transform
+    }
+
+    /// The effective scale_factor for primitive rasterization inside the
+    /// current paint-transform subtree. Use this in place of `scale_factor()`
+    /// when keying glyph atlas entries or sizing stroke-snapped quantities so
+    /// that zoomed-in text and corners stay sharp at the on-screen pixel
+    /// size.
+    pub fn paint_scale_factor(&self) -> f32 {
+        self.scale_factor * self.current_paint_transform.scale
     }
 
     pub(crate) fn with_element_opacity<R>(
@@ -3700,6 +3761,9 @@ impl Window {
     pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint();
 
+        // Bounds are subtree-local; bring into screen space before intersecting
+        // with the screen-space content mask.
+        let bounds = self.current_paint_transform.apply_bounds(bounds);
         let content_mask = self.content_mask();
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
@@ -3728,17 +3792,18 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let paint_scale = self.paint_scale_factor();
+        let transform = self.current_paint_transform;
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         for shadow in shadows {
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
-                blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(shadow_bounds),
+                blur_radius: shadow.blur_radius.scale(paint_scale),
+                bounds: self.cover_bounds(transform.apply_bounds(shadow_bounds)),
                 content_mask,
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: corner_radii.scale(paint_scale),
                 color: shadow.color.opacity(opacity),
             });
         }
@@ -3757,15 +3822,23 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let opacity = self.element_opacity();
-        let snapped_bounds = self.snap_bounds(quad.bounds);
-        let snapped_border_widths = self.snap_border_widths(quad.border_widths);
+        let transform = self.current_paint_transform;
+        let bounds = transform.apply_bounds(quad.bounds);
+        let snapped_bounds = self.snap_bounds(bounds);
+        let border_widths = if transform.scale == 1.0 {
+            quad.border_widths
+        } else {
+            quad.border_widths.map(|w| *w * transform.scale)
+        };
+        let snapped_border_widths = self.snap_border_widths(border_widths);
+        let paint_scale = self.paint_scale_factor();
         self.next_frame.scene.insert_primitive(Quad {
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
             border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(self.scale_factor()),
+            corner_radii: quad.corner_radii.scale(paint_scale),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
         });
@@ -3777,6 +3850,10 @@ impl Window {
     pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Background>) {
         self.invalidator.debug_assert_paint();
 
+        // TODO: apply `current_paint_transform` to each PathVertex when a
+        // subtree-scale wrapper is active. Paths are used for decorative
+        // shapes (wavy underlines, etc.); they are rare on the editor surface
+        // so the initial zoom slice leaves them untransformed.
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
@@ -3799,16 +3876,19 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        let transform = self.current_paint_transform;
         let scale_factor = self.scale_factor();
-        let thickness = self.snap_stroke(style.thickness);
+        let thickness = self.snap_stroke(style.thickness * transform.scale);
         let height = if style.wavy {
             ScaledPixels(thickness.0 * 3.)
         } else {
             thickness
         };
+        let origin = transform.apply_point(origin);
+        let scaled_width = width * transform.scale;
         let bounds = Bounds {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
-            size: size(self.snap_stroke(width), height),
+            size: size(self.snap_stroke(scaled_width), height),
         };
         let element_opacity = self.element_opacity();
 
@@ -3834,11 +3914,15 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        let transform = self.current_paint_transform;
         let scale_factor = self.scale_factor();
-        let height = style.thickness;
+        let scaled_thickness = style.thickness * transform.scale;
+        let height = scaled_thickness;
+        let origin = transform.apply_point(origin);
+        let scaled_width = width * transform.scale;
         let bounds = Bounds {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
-            size: size(self.snap_stroke(width), self.snap_stroke(height)),
+            size: size(self.snap_stroke(scaled_width), self.snap_stroke(height)),
         };
         let opacity = self.element_opacity();
 
@@ -3847,7 +3931,7 @@ impl Window {
             pad: 0,
             bounds,
             content_mask: self.snapped_content_mask(),
-            thickness: self.snap_stroke(style.thickness),
+            thickness: self.snap_stroke(scaled_thickness),
             color: style.color.unwrap_or_default().opacity(opacity),
             wavy: 0,
         });
@@ -3872,8 +3956,12 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let transform = self.current_paint_transform;
+        let origin = transform.apply_point(origin);
+        // Key the atlas tile by the paint-effective scale_factor so glyphs are
+        // rasterized at the on-screen pixel size and stay sharp under zoom.
+        let scale_factor = self.paint_scale_factor();
+        let glyph_origin = origin.scale(self.scale_factor());
 
         let quantized_origin = Point::new(
             round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
@@ -3975,8 +4063,10 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let transform = self.current_paint_transform;
+        let origin = transform.apply_point(origin);
+        let scale_factor = self.paint_scale_factor();
+        let glyph_origin = origin.scale(self.scale_factor());
         let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0)));
         let params = RenderGlyphParams {
             font_id,
@@ -4035,7 +4125,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let bounds = self.snap_bounds(bounds);
+        let bounds = self.snap_bounds(self.current_paint_transform.apply_bounds(bounds));
 
         let params = RenderSvgParams {
             path,
@@ -4099,7 +4189,7 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let bounds = self.snap_bounds(bounds);
+        let bounds = self.snap_bounds(self.current_paint_transform.apply_bounds(bounds));
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
@@ -4143,7 +4233,7 @@ impl Window {
 
         self.invalidator.debug_assert_paint();
 
-        let bounds = self.snap_bounds(bounds);
+        let bounds = self.snap_bounds(self.current_paint_transform.apply_bounds(bounds));
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
@@ -4275,6 +4365,16 @@ impl Window {
     ) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
+        // Hitboxes live in screen space alongside emitted primitives, so the
+        // dispatch tree can hit-test pointer events without inverse-transforming
+        // for every hitbox.
+        let transform = self.current_paint_transform;
+        let bounds = transform.apply_bounds(bounds);
+        let hit_slop = if transform.scale == 1.0 {
+            hit_slop
+        } else {
+            hit_slop.map(|e| *e * transform.scale)
+        };
         let content_mask = self.content_mask();
         let id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
