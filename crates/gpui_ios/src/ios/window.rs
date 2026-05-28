@@ -4269,6 +4269,14 @@ impl IosWindow {
     }
 }
 
+impl IosWindow {
+    /// Public hook so embedders can force UIKit to re-query the responder's
+    /// `inputView` / `inputAccessoryView` after swapping the keyboard view.
+    pub fn reload_input_views(&self) {
+        self.reload_text_input_views_if_first_responder();
+    }
+}
+
 impl Drop for IosWindow {
     fn drop(&mut self) {
         unsafe {
@@ -4441,12 +4449,6 @@ impl PlatformWindow for IosWindow {
         self.keyboard_session_requested.set(true);
         self.reload_text_input_views_if_first_responder();
         self.refresh_text_input_state();
-    }
-
-    /// Public hook so embedders can force UIKit to re-query the responder's
-    /// `inputView` / `inputAccessoryView` after swapping the keyboard view.
-    pub fn reload_input_views(&self) {
-        self.reload_text_input_views_if_first_responder();
     }
 
     fn hide_soft_keyboard(&self) {
