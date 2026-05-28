@@ -413,6 +413,15 @@ impl AndroidPlatform {
         }
     }
 
+    /// Handle a ScaleGestureDetector callback for the root surface.
+    pub fn handle_pinch(&self, phase: i32, focus_x: f32, focus_y: f32, scale_factor: f32) {
+        if let Some(window) = self.window_for_role(AndroidWindowRole::Root) {
+            window
+                .borrow_mut()
+                .handle_pinch(phase, focus_x, focus_y, scale_factor);
+        }
+    }
+
     /// Returns true if a fling animation is currently active.
     pub fn has_active_fling(&self) -> bool {
         self.windows

@@ -29,8 +29,8 @@ use gpui::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformTextAutocapitalization, PlatformTextInputTrait, PlatformTextInputTraits,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
-    ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, WindowAppearance,
+    PinchEvent, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene,
+    ScrollDelta, ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, px,
     should_auto_request_soft_keyboard, size,
 };
@@ -1109,6 +1109,17 @@ fn register_metal_view_class() -> &'static Class {
             event: *mut Object,
         ) {
             handle_touches(this, touches, event);
+        }
+
+        extern "C" fn handle_pinch(this: &mut Object, _sel: Sel, recognizer: *mut Object) {
+            unsafe {
+                let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
+                if window_ptr.is_null() {
+                    return;
+                }
+                let window = &*(window_ptr as *const IosWindow);
+                window.handle_pinch(recognizer);
+            }
         }
 
         extern "C" fn can_become_first_responder(this: &Object, _sel: Sel) -> bool {
@@ -2589,6 +2600,10 @@ fn register_metal_view_class() -> &'static Class {
                 sel!(touchesCancelled:withEvent:),
                 touches_cancelled as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
             );
+            decl.add_method(
+                sel!(handlePinch:),
+                handle_pinch as extern "C" fn(&mut Object, Sel, *mut Object),
+            );
 
             // Add keyboard handling methods
             decl.add_method(
@@ -2948,6 +2963,25 @@ fn software_keyboard_visible() -> bool {
 }
 
 /// Handle touch events from the GPUIMetalView
+/// Attach a UIPinchGestureRecognizer to the GPUI Metal view. The recognizer
+/// must not cancel touch delivery, so single-finger scroll and selection still
+/// work while the second finger drives the zoom gesture.
+fn attach_pinch_recognizer(view: *mut Object) {
+    unsafe {
+        let recognizer: *mut Object = msg_send![class!(UIPinchGestureRecognizer), alloc];
+        let recognizer: *mut Object = msg_send![
+            recognizer,
+            initWithTarget: view
+            action: sel!(handlePinch:)
+        ];
+        let _: () = msg_send![recognizer, setCancelsTouchesInView: NO];
+        let _: () = msg_send![recognizer, setDelaysTouchesBegan: NO];
+        let _: () = msg_send![recognizer, setDelaysTouchesEnded: NO];
+        let _: () = msg_send![view, addGestureRecognizer: recognizer];
+        let _: () = msg_send![recognizer, release];
+    }
+}
+
 fn handle_touches(view: &mut Object, touches: *mut Object, event: *mut Object) {
     unsafe {
         // Get the window pointer from the view's ivar
@@ -3164,6 +3198,9 @@ pub(crate) struct IosWindow {
     /// Timestamp of the last dispatched Moved event (UITouch.timestamp, seconds since boot).
     /// Used to skip duplicate Moved callbacks that UIKit fires for the same touch sample.
     last_move_ts: Cell<f64>,
+    /// Cumulative UIPinchGestureRecognizer.scale at the last Changed callback.
+    /// Reset to 1.0 on Began and Ended; used to compute incremental zoom delta.
+    last_pinch_scale: Cell<f32>,
 }
 
 // Required for raw_window_handle
@@ -3227,6 +3264,7 @@ impl IosWindow {
             // Enable user interaction on the Metal view for touch handling
             let _: () = msg_send![view, setUserInteractionEnabled: YES];
             let _: () = msg_send![view, setMultipleTouchEnabled: YES];
+            attach_pinch_recognizer(view);
 
             let editable_text_interaction: *mut Object =
                 msg_send![class!(UITextInteraction), textInteractionForMode: 0_i64];
@@ -3312,6 +3350,7 @@ impl IosWindow {
                 touch_scroll_suppressed: Cell::new(false),
                 touch_selection_dismissal_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
+                last_pinch_scale: Cell::new(1.0),
             };
 
             Ok(ios_window)
@@ -3373,6 +3412,7 @@ impl IosWindow {
             let _: () = msg_send![layer, setDrawableSize: drawable_size];
             let _: () = msg_send![view, setUserInteractionEnabled: YES];
             let _: () = msg_send![view, setMultipleTouchEnabled: YES];
+            attach_pinch_recognizer(view);
             let editable_text_interaction: *mut Object =
                 msg_send![class!(UITextInteraction), textInteractionForMode: 0_i64];
             let editable_text_interaction: *mut Object =
@@ -3454,6 +3494,7 @@ impl IosWindow {
                 touch_scroll_suppressed: Cell::new(false),
                 touch_selection_dismissal_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
+                last_pinch_scale: Cell::new(1.0),
             })
         }
     }
@@ -3984,6 +4025,61 @@ impl IosWindow {
                 modifiers: Modifiers::default(),
                 touch_phase: TouchPhase::Moved,
             }));
+        }
+    }
+
+    /// Dispatch a UIPinchGestureRecognizer callback as a GPUI `PinchEvent`.
+    /// UIKit reports cumulative `scale` per gesture; we convert to an incremental
+    /// delta against the prior callback so listeners receive a per-event ratio.
+    pub fn handle_pinch(&self, recognizer: *mut Object) {
+        if recognizer.is_null() {
+            return;
+        }
+        unsafe {
+            let state: i64 = msg_send![recognizer, state];
+            let scale: CGFloat = msg_send![recognizer, scale];
+            let location: IOSCGPoint = msg_send![recognizer, locationInView: self.view];
+            let position = Point::new(px(location.x as f32), px(location.y as f32));
+            self.mouse_position.set(position);
+
+            let phase = match state {
+                // UIGestureRecognizerStateBegan
+                1 => {
+                    self.last_pinch_scale.set(1.0);
+                    self.touch_scroll_suppressed.set(true);
+                    *self.fling.borrow_mut() = None;
+                    TouchPhase::Started
+                }
+                // UIGestureRecognizerStateChanged
+                2 => TouchPhase::Moved,
+                // UIGestureRecognizerStateEnded | StateCancelled | StateFailed
+                3 | 4 | 5 => TouchPhase::Ended,
+                _ => return,
+            };
+
+            let delta = if phase == TouchPhase::Moved {
+                let prev = self.last_pinch_scale.get().max(0.0001);
+                let current = scale as f32;
+                self.last_pinch_scale.set(current);
+                current / prev - 1.0
+            } else {
+                0.0
+            };
+
+            if phase == TouchPhase::Ended {
+                self.last_pinch_scale.set(1.0);
+                let _: () = msg_send![recognizer, setScale: 1.0_f64 as CGFloat];
+                self.touch_scroll_suppressed.set(false);
+            }
+
+            if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                callback(PlatformInput::Pinch(PinchEvent {
+                    position,
+                    delta,
+                    modifiers: self.modifiers.get(),
+                    phase,
+                }));
+            }
         }
     }
 

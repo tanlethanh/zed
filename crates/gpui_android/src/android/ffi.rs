@@ -295,6 +295,20 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeFlingEvent(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativePinchEvent(
+    _env: JNIEnv,
+    _class: JClass,
+    phase: jint,
+    focus_x: jfloat,
+    focus_y: jfloat,
+    scale_factor: jfloat,
+) {
+    app_state::with_platform(|platform| {
+        platform.handle_pinch(phase, focus_x, focus_y, scale_factor)
+    });
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeKeyEvent(
     _env: JNIEnv,
     _class: JClass,
