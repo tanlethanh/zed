@@ -354,6 +354,12 @@ static KEYBOARD_ACCESSORY_VIEW: std::sync::atomic::AtomicUsize =
 static EMPTY_KEYBOARD_INPUT_VIEW: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Optional custom UIView returned from `inputView` when set. Replaces the
+/// system software keyboard, similar to a numeric keypad in Calculator.app.
+/// Set from Obj-C via `gpui_ios_set_keyboard_input_view`.
+static KEYBOARD_INPUT_VIEW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Whether the iOS software keyboard is currently visible (set via keyboard notifications).
 /// `inputAccessoryView` returns nil when this is false, preventing the toolbar from
 /// appearing without a software keyboard (e.g. on simulator with hardware keyboard).
@@ -1158,11 +1164,14 @@ fn register_metal_view_class() -> &'static Class {
         // selection still needs first-responder status for copy/selection UI, so
         // give it an empty custom input view instead of the software keyboard.
         extern "C" fn input_view(this: &Object, _sel: Sel) -> *mut Object {
-            if text_input_uses_system_keyboard_for_gpui(this) {
-                ptr::null_mut()
-            } else {
-                empty_keyboard_input_view()
+            if !text_input_uses_system_keyboard_for_gpui(this) {
+                return empty_keyboard_input_view();
             }
+            let custom = KEYBOARD_INPUT_VIEW.load(std::sync::atomic::Ordering::Relaxed);
+            if custom != 0 {
+                return custom as *mut Object;
+            }
+            ptr::null_mut()
         }
 
         // UITextInputTraits - keyboard type (default)
@@ -2934,6 +2943,17 @@ pub(super) fn set_keyboard_accessory_view(view_ptr: *mut c_void) {
     KEYBOARD_ACCESSORY_VIEW.store(view_ptr as usize, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Store an optional UIView to use as `inputView` on GPUIMetalView. When
+/// non-null, UIKit displays this view in place of the system software keyboard.
+/// Pass null to restore the system keyboard.
+///
+/// Called from `gpui_ios_set_keyboard_input_view` in ffi.rs. Callers should
+/// trigger `reloadInputViews` on the first responder afterwards so the swap
+/// takes effect immediately.
+pub(super) fn set_keyboard_input_view(view_ptr: *mut c_void) {
+    KEYBOARD_INPUT_VIEW.store(view_ptr as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Track whether the iOS software keyboard is visible.
 ///
 /// Called from ObjC keyboard notifications (`keyboardWillShow` / `keyboardWillHide`).
@@ -4421,6 +4441,12 @@ impl PlatformWindow for IosWindow {
         self.keyboard_session_requested.set(true);
         self.reload_text_input_views_if_first_responder();
         self.refresh_text_input_state();
+    }
+
+    /// Public hook so embedders can force UIKit to re-query the responder's
+    /// `inputView` / `inputAccessoryView` after swapping the keyboard view.
+    pub fn reload_input_views(&self) {
+        self.reload_text_input_views_if_first_responder();
     }
 
     fn hide_soft_keyboard(&self) {

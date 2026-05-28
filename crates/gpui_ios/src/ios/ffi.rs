@@ -461,6 +461,31 @@ pub extern "C" fn gpui_ios_set_keyboard_accessory_view(view_ptr: *mut c_void) {
     super::window::set_keyboard_accessory_view(view_ptr);
 }
 
+/// Install a custom UIView in place of the software keyboard.
+///
+/// While set, GPUIMetalView returns this view from `inputView`, so UIKit shows
+/// it instead of the system keyboard (analogous to a numeric keypad). Pass null
+/// to restore the system keyboard. Callers should follow up with
+/// `gpui_ios_reload_input_views` so UIKit picks up the change immediately.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_set_keyboard_input_view(view_ptr: *mut c_void) {
+    super::window::set_keyboard_input_view(view_ptr);
+}
+
+/// Re-query `inputView` / `inputAccessoryView` on the current first responder.
+///
+/// Call after `gpui_ios_set_keyboard_input_view` (or any other change that
+/// affects which keyboard UIKit should display) so the swap takes effect
+/// without waiting for the user to refocus the field.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_reload_input_views(window_ptr: *mut c_void) {
+    if window_ptr.is_null() {
+        return;
+    }
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.reload_input_views();
+}
+
 /// Track whether the iOS software keyboard is currently visible.
 ///
 /// Called from ObjC keyboard notifications (keyboardWillShow / keyboardWillHide).
