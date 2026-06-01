@@ -5,7 +5,7 @@
 //! the GPUI application lifecycle.
 
 use gpui::*;
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
 /// Global storage for the GPUI application state.
@@ -459,6 +459,22 @@ pub extern "C" fn gpui_ios_show_keyboard(window_ptr: *mut c_void) {
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_set_keyboard_accessory_view(view_ptr: *mut c_void) {
     super::window::set_keyboard_accessory_view(view_ptr);
+}
+
+/// Dispatch an action from the app-provided keyboard accessory view to the active input handler.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_handle_keyboard_accessory_action(
+    window_ptr: *mut c_void,
+    action: *const c_char,
+) -> bool {
+    if window_ptr.is_null() || action.is_null() {
+        return false;
+    }
+    let Ok(action) = (unsafe { CStr::from_ptr(action) }).to_str() else {
+        return false;
+    };
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.handle_keyboard_accessory_action(action)
 }
 
 /// Track whether the iOS software keyboard is currently visible.

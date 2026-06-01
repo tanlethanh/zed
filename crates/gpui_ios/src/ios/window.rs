@@ -32,7 +32,7 @@ use gpui::{
     PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
     ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, px,
-    should_auto_request_soft_keyboard, size,
+    should_auto_request_soft_keyboard, should_show_keyboard_accessory, size,
 };
 use objc::{
     Encode, Encoding, class,
@@ -204,6 +204,21 @@ fn should_use_system_keyboard(
     keyboard_session_requested
         && input_accepts_text_input
         && (has_input_handler || has_callback_input_handler)
+}
+
+fn should_use_keyboard_accessory(
+    has_input_handler: bool,
+    has_callback_input_handler: bool,
+    input_accepts_text_input: bool,
+    keyboard_session_requested: bool,
+    keyboard_accessory_enabled: bool,
+) -> bool {
+    (has_input_handler || has_callback_input_handler)
+        && should_show_keyboard_accessory(
+            input_accepts_text_input,
+            keyboard_session_requested,
+            keyboard_accessory_enabled,
+        )
 }
 
 fn handles_native_touch_selection(
@@ -812,6 +827,23 @@ fn text_input_uses_system_keyboard_for_gpui(view: &Object) -> bool {
     }
 }
 
+fn text_input_uses_keyboard_accessory_for_gpui(view: &Object) -> bool {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return false;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        should_use_keyboard_accessory(
+            window.input_handler.borrow().is_some(),
+            window.callback_input_handler.borrow().is_some(),
+            window.input_accepts_text_input.get(),
+            window.keyboard_session_requested.get(),
+            window.input_keyboard_accessory_enabled.get(),
+        )
+    }
+}
+
 fn active_text_input_traits_for_gpui(view: &Object) -> PlatformTextInputTraits {
     unsafe {
         let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
@@ -1143,11 +1175,10 @@ fn register_metal_view_class() -> &'static Class {
             }
         }
 
-        // Return the view shown above the software keyboard (set via gpui_ios_set_keyboard_accessory_view).
-        // Selection-only first responder sessions must not expose the keyboard
-        // accessory, or UIKit treats the read-only selection as a keyboard session.
+        // Return the view shown above the software keyboard only for input handlers
+        // that explicitly opt into the app-provided accessory.
         extern "C" fn input_accessory_view(this: &Object, _sel: Sel) -> *mut Object {
-            if !text_input_uses_system_keyboard_for_gpui(this) {
+            if !text_input_uses_keyboard_accessory_for_gpui(this) {
                 return ptr::null_mut();
             }
             let ptr = KEYBOARD_ACCESSORY_VIEW.load(std::sync::atomic::Ordering::Relaxed);
@@ -3095,6 +3126,9 @@ pub(crate) struct IosWindow {
     /// this to distinguish normal editable input from editable surfaces that
     /// expose their own native selection geometry.
     input_native_selection_enabled: Cell<bool>,
+    /// Cached policy bit from the active editable handler. When true, UIKit may
+    /// expose the app-provided inputAccessoryView for this keyboard session.
+    input_keyboard_accessory_enabled: Cell<bool>,
     /// Cached text input traits for the active editable handler.
     input_text_input_traits: Cell<PlatformTextInputTraits>,
     /// Whether UIKit should keep the software keyboard up for the active input handler.
@@ -3278,6 +3312,7 @@ impl IosWindow {
                 input_accepts_text_input: Cell::new(false),
                 input_uses_manual_focus: Cell::new(false),
                 input_native_selection_enabled: Cell::new(false),
+                input_keyboard_accessory_enabled: Cell::new(false),
                 input_text_input_traits: Cell::new(PlatformTextInputTraits::default()),
                 keyboard_session_requested: Cell::new(false),
                 input_delegate: Cell::new(ptr::null_mut()),
@@ -3420,6 +3455,7 @@ impl IosWindow {
                 input_accepts_text_input: Cell::new(false),
                 input_uses_manual_focus: Cell::new(false),
                 input_native_selection_enabled: Cell::new(false),
+                input_keyboard_accessory_enabled: Cell::new(false),
                 input_text_input_traits: Cell::new(PlatformTextInputTraits::default()),
                 keyboard_session_requested: Cell::new(false),
                 input_delegate: Cell::new(ptr::null_mut()),
@@ -4150,6 +4186,26 @@ impl IosWindow {
         }
     }
 
+    pub fn handle_keyboard_accessory_action(&self, action: &str) -> bool {
+        if !should_use_keyboard_accessory(
+            self.input_handler.borrow().is_some(),
+            self.callback_input_handler.borrow().is_some(),
+            self.input_accepts_text_input.get(),
+            self.keyboard_session_requested.get(),
+            self.input_keyboard_accessory_enabled.get(),
+        ) {
+            return false;
+        }
+
+        unsafe {
+            let view = &*(self.view as *const Object);
+            with_input_handler(view, |handler| {
+                handler.handle_keyboard_accessory_action(action)
+            })
+            .unwrap_or(false)
+        }
+    }
+
     /// Handle arrow key navigation directly via the input handler.
     /// Returns true if the key was handled, false otherwise.
     fn handle_arrow_key(&self, key: &str, _shift: bool) -> bool {
@@ -4344,6 +4400,7 @@ impl PlatformWindow for IosWindow {
         let accepts_text_input = input_handler.query_accepts_text_input();
         let uses_manual_focus = input_handler.query_uses_manual_focus();
         let native_selection_enabled = input_handler.query_handles_native_selection();
+        let keyboard_accessory_enabled = input_handler.query_keyboard_accessory();
         let text_input_traits = input_handler.query_text_input_traits();
         let should_auto_request_keyboard = should_auto_request_soft_keyboard(
             accepts_text_input,
@@ -4357,8 +4414,13 @@ impl PlatformWindow for IosWindow {
         self.input_uses_manual_focus.set(uses_manual_focus);
         self.input_native_selection_enabled
             .set(native_selection_enabled);
+        let previous_keyboard_accessory_enabled = self
+            .input_keyboard_accessory_enabled
+            .replace(keyboard_accessory_enabled);
         let previous_text_input_traits = self.input_text_input_traits.replace(text_input_traits);
-        if previous_text_input_traits != text_input_traits {
+        if previous_text_input_traits != text_input_traits
+            || previous_keyboard_accessory_enabled != keyboard_accessory_enabled
+        {
             self.reload_text_input_views_if_first_responder();
         }
         if should_auto_request_keyboard {
@@ -4377,10 +4439,14 @@ impl PlatformWindow for IosWindow {
         self.input_accepts_text_input.set(false);
         self.input_uses_manual_focus.set(false);
         self.input_native_selection_enabled.set(false);
+        let previous_keyboard_accessory_enabled =
+            self.input_keyboard_accessory_enabled.replace(false);
         let previous_text_input_traits = self
             .input_text_input_traits
             .replace(PlatformTextInputTraits::default());
-        if previous_text_input_traits != PlatformTextInputTraits::default() {
+        if previous_text_input_traits != PlatformTextInputTraits::default()
+            || previous_keyboard_accessory_enabled
+        {
             self.reload_text_input_views_if_first_responder();
         }
         if should_clear_keyboard_request_when_clearing_input_handler(
@@ -4430,6 +4496,16 @@ impl PlatformWindow for IosWindow {
 
     fn is_soft_keyboard_visible(&self) -> bool {
         self.is_software_keyboard_visible()
+    }
+
+    fn has_active_keyboard_accessory(&self) -> bool {
+        should_use_keyboard_accessory(
+            self.input_handler.borrow().is_some(),
+            self.callback_input_handler.borrow().is_some(),
+            self.input_accepts_text_input.get(),
+            self.keyboard_session_requested.get(),
+            self.input_keyboard_accessory_enabled.get(),
+        )
     }
 
     fn prompt(
@@ -4883,6 +4959,24 @@ mod tests {
         assert!(!should_use_system_keyboard(false, false, true, true));
         assert!(!should_use_system_keyboard(true, false, false, true));
         assert!(!should_use_system_keyboard(true, false, true, false));
+    }
+
+    #[test]
+    fn keyboard_accessory_requires_active_text_input_and_opt_in() {
+        assert!(should_use_keyboard_accessory(true, false, true, true, true));
+        assert!(should_use_keyboard_accessory(false, true, true, true, true));
+        assert!(!should_use_keyboard_accessory(
+            false, false, true, true, true
+        ));
+        assert!(!should_use_keyboard_accessory(
+            true, false, false, true, true
+        ));
+        assert!(!should_use_keyboard_accessory(
+            true, false, true, false, true
+        ));
+        assert!(!should_use_keyboard_accessory(
+            true, false, true, true, false
+        ));
     }
 
     #[test]

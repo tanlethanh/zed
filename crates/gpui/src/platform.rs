@@ -670,6 +670,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn is_soft_keyboard_visible(&self) -> bool {
         false
     }
+    fn has_active_keyboard_accessory(&self) -> bool {
+        false
+    }
     fn prompt(
         &self,
         level: PromptLevel,
@@ -781,6 +784,15 @@ pub fn should_auto_request_soft_keyboard(
     had_input_handler: bool,
 ) -> bool {
     accepts_text_input && !uses_manual_focus && !had_input_handler
+}
+
+/// Returns whether the active input handler should expose the platform keyboard accessory view.
+pub fn should_show_keyboard_accessory(
+    accepts_text_input: bool,
+    keyboard_session_requested: bool,
+    keyboard_accessory: bool,
+) -> bool {
+    accepts_text_input && keyboard_session_requested && keyboard_accessory
 }
 
 /// A renderer for headless windows that can produce real rendered output.
@@ -1196,6 +1208,7 @@ pub struct PlatformInputHandler {
     accepts_text_input: bool,
     uses_manual_focus: bool,
     handles_native_selection: bool,
+    keyboard_accessory: bool,
     text_input_traits: PlatformTextInputTraits,
 }
 
@@ -1214,6 +1227,7 @@ impl PlatformInputHandler {
         accepts_text_input: bool,
         uses_manual_focus: bool,
         handles_native_selection: bool,
+        keyboard_accessory: bool,
         text_input_traits: PlatformTextInputTraits,
     ) -> Self {
         Self {
@@ -1222,6 +1236,7 @@ impl PlatformInputHandler {
             accepts_text_input,
             uses_manual_focus,
             handles_native_selection,
+            keyboard_accessory,
             text_input_traits,
         }
     }
@@ -1508,8 +1523,24 @@ impl PlatformInputHandler {
     }
 
     #[allow(dead_code)]
+    pub fn query_keyboard_accessory(&self) -> bool {
+        self.keyboard_accessory
+    }
+
+    #[allow(dead_code)]
     pub fn query_text_input_traits(&self) -> PlatformTextInputTraits {
         self.text_input_traits
+    }
+
+    #[allow(dead_code)]
+    pub fn handle_keyboard_accessory_action(&mut self, action: &str) -> bool {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .handle_keyboard_accessory_action(action, window, cx)
+            })
+            .unwrap_or(false)
     }
 
     #[allow(dead_code)]
@@ -1937,6 +1968,22 @@ pub trait InputHandler: 'static {
     /// output-selection document without going through the window-level
     /// read-only selection handler.
     fn handles_native_selection(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+        false
+    }
+
+    /// Returns whether this handler wants the platform keyboard accessory view
+    /// while it owns the software keyboard session.
+    fn keyboard_accessory(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+        false
+    }
+
+    /// Handles an action emitted by the current platform keyboard accessory view.
+    fn handle_keyboard_accessory_action(
+        &mut self,
+        _action: &str,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> bool {
         false
     }
 
@@ -2833,7 +2880,7 @@ impl From<String> for ClipboardString {
 mod keyboard_tests {
     use super::{
         PlatformTextAutocapitalization, PlatformTextInputTrait, PlatformTextInputTraits,
-        should_auto_request_soft_keyboard,
+        should_auto_request_soft_keyboard, should_show_keyboard_accessory,
     };
 
     fn assert_mutating_traits_disabled(traits: PlatformTextInputTraits) {
@@ -2865,6 +2912,14 @@ mod keyboard_tests {
     #[test]
     fn non_text_input_never_auto_requests_keyboard() {
         assert!(!should_auto_request_soft_keyboard(false, false, false));
+    }
+
+    #[test]
+    fn keyboard_accessory_requires_text_input_keyboard_session_and_opt_in() {
+        assert!(should_show_keyboard_accessory(true, true, true));
+        assert!(!should_show_keyboard_accessory(false, true, true));
+        assert!(!should_show_keyboard_accessory(true, false, true));
+        assert!(!should_show_keyboard_accessory(true, true, false));
     }
 
     #[test]

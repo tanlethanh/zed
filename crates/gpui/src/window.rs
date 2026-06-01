@@ -2653,6 +2653,7 @@ impl Window {
                     false,
                     false,
                     false,
+                    false,
                     PlatformTextInputTraits::default(),
                 ));
         }
@@ -4383,6 +4384,7 @@ impl Window {
         if focus_handle.is_focused(self) || handles_native_selection {
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
             let text_input_traits = input_handler.text_input_traits(self, cx);
+            let keyboard_accessory = input_handler.keyboard_accessory(self, cx);
             let uses_manual_focus = self
                 .next_frame
                 .manual_focus_handles
@@ -4396,6 +4398,7 @@ impl Window {
                     accepts_text_input,
                     uses_manual_focus,
                     handles_native_selection,
+                    keyboard_accessory,
                     text_input_traits,
                 )));
         }
@@ -5270,6 +5273,11 @@ impl Window {
     /// Returns whether the soft keyboard is visible for the current window.
     pub fn is_soft_keyboard_visible(&self) -> bool {
         self.platform_window.is_soft_keyboard_visible()
+    }
+
+    /// Returns whether the active platform text input owns a keyboard accessory.
+    pub fn has_active_keyboard_accessory(&self) -> bool {
+        self.platform_window.has_active_keyboard_accessory()
     }
 
     /// Toggle full screen status on the current window at the platform level.

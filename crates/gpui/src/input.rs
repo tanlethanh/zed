@@ -158,6 +158,21 @@ pub trait EntityInputHandler: 'static + Sized {
     ) -> PlatformTextInputTraits {
         PlatformTextInputTraits::default()
     }
+
+    /// See [`InputHandler::keyboard_accessory`] for details
+    fn keyboard_accessory(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        false
+    }
+
+    /// See [`InputHandler::handle_keyboard_accessory_action`] for details
+    fn handle_keyboard_accessory_action(
+        &mut self,
+        _action: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        false
+    }
 }
 
 /// The canonical implementation of [`crate::PlatformInputHandler`]. Call [`Window::handle_input`]
@@ -347,6 +362,22 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
     fn text_input_traits(&mut self, window: &mut Window, cx: &mut App) -> PlatformTextInputTraits {
         self.view
             .update(cx, |view, cx| view.text_input_traits(window, cx))
+    }
+
+    fn keyboard_accessory(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.view
+            .update(cx, |view, cx| view.keyboard_accessory(window, cx))
+    }
+
+    fn handle_keyboard_accessory_action(
+        &mut self,
+        action: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        self.view.update(cx, |view, cx| {
+            view.handle_keyboard_accessory_action(action, window, cx)
+        })
     }
 
     fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, cx: &mut App) -> bool {
