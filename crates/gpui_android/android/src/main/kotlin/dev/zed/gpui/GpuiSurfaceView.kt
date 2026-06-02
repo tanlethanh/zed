@@ -6,6 +6,8 @@ import android.os.Build
 import android.text.InputType
 import android.util.AttributeSet
 import android.util.Log
+import android.view.GestureDetector
+import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -80,6 +82,8 @@ class GpuiSurfaceView
                 velocityY: Float,
             )
 
+            @JvmStatic private external fun nativeLongPressEvent(x: Float, y: Float)
+
             @JvmStatic private external fun nativeKeyboardHeightChanged(height: Int)
 
             @JvmStatic private external fun nativeSystemInsetsChanged(
@@ -92,6 +96,17 @@ class GpuiSurfaceView
         private var keyboardRequested = false
         private var imeHeight = 0
         private var keyboardAccessoryHeight = 0
+
+        private val gestureDetector =
+            GestureDetector(
+                context,
+                object : GestureDetector.SimpleOnGestureListener() {
+                    override fun onLongPress(e: MotionEvent) {
+                        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        nativeLongPressEvent(e.x, e.y)
+                    }
+                },
+            )
 
         init {
             holder.addCallback(this)
@@ -226,6 +241,7 @@ class GpuiSurfaceView
         // ----- Input -----
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
+            gestureDetector.onTouchEvent(event)
             val action =
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {

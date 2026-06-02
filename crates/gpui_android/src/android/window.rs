@@ -13,14 +13,16 @@ use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, HasDisplayHandle, HasWindowHandle,
     RawDisplayHandle, RawWindowHandle,
 };
+use smallvec::SmallVec;
 
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent,
     PointerUpEvent, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
-    ScrollWheelEvent, Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, point, px, should_auto_request_soft_keyboard,
+    ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, point, px,
+    should_auto_request_soft_keyboard,
 };
 use gpui_wgpu::{GpuContext, WgpuAtlas, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -51,6 +53,10 @@ struct TouchState {
     is_drag: bool,
     suppress_scroll: bool,
     fling: Option<FlingState>,
+    /// Set after a long-press fires, cleared on pointer-up/cancel.
+    long_press_active: bool,
+    /// UTF-16 anchor index established when the long-press fires.
+    long_press_anchor_utf16: Option<usize>,
 }
 
 impl TouchState {
@@ -61,6 +67,8 @@ impl TouchState {
             is_drag: false,
             suppress_scroll: false,
             fling: None,
+            long_press_active: false,
+            long_press_anchor_utf16: None,
         }
     }
 }
@@ -165,6 +173,8 @@ pub struct AndroidWindowState {
     scale: f32,
     touch_state: TouchState,
     input_handler: Option<PlatformInputHandler>,
+    selection_handler: Option<PlatformInputHandler>,
+    selection_hit_regions: SmallVec<[SelectableTextHitRegion; 8]>,
     callbacks: Callbacks,
     active: bool,
     appearance: WindowAppearance,
@@ -186,6 +196,8 @@ impl AndroidWindowState {
             scale,
             touch_state: TouchState::new(),
             input_handler: None,
+            selection_handler: None,
+            selection_hit_regions: SmallVec::new(),
             callbacks: Callbacks::default(),
             active,
             appearance: WindowAppearance::Light,
@@ -480,6 +492,65 @@ impl AndroidWindowState {
         self.with_text_input_handler(|handler| handler.unmark_text())
     }
 
+    pub fn handle_keyboard_accessory_action(&mut self, action: &str) -> bool {
+        let Some(mut input_handler) = self.input_handler.take() else {
+            return false;
+        };
+
+        let handled = if input_handler.query_accepts_text_input()
+            && input_handler.query_keyboard_accessory()
+        {
+            input_handler.handle_keyboard_accessory_action(action)
+        } else {
+            false
+        };
+        self.input_handler = Some(input_handler);
+        handled
+    }
+
+    pub fn has_active_keyboard_accessory(&mut self) -> bool {
+        let Some(mut input_handler) = self.input_handler.take() else {
+            return false;
+        };
+        let has_accessory =
+            input_handler.query_accepts_text_input() && input_handler.query_keyboard_accessory();
+        self.input_handler = Some(input_handler);
+        has_accessory
+    }
+
+    /// Handle a long-press gesture at physical-pixel coordinates.
+    ///
+    /// Called from Kotlin's `GestureDetector.onLongPress`. Enters selection
+    /// mode if the point lands on a registered selectable-text region.
+    pub fn handle_long_press(&mut self, x: f32, y: f32) {
+        let logical_x = x / self.scale;
+        let logical_y = y / self.scale;
+        let position = point(px(logical_x), px(logical_y));
+
+        let hits_selectable = self
+            .selection_hit_regions
+            .iter()
+            .any(|region| region.contains_text(position));
+        if !hits_selectable {
+            return;
+        }
+
+        let Some(mut handler) = self.selection_handler.take() else {
+            return;
+        };
+        let anchor = handler.character_index_for_point(position);
+        self.selection_handler = Some(handler);
+
+        let Some(anchor_index) = anchor else {
+            return;
+        };
+
+        self.touch_state.long_press_active = true;
+        self.touch_state.long_press_anchor_utf16 = Some(anchor_index);
+        // Suppress scroll so the drag extends the selection instead of scrolling.
+        self.touch_state.suppress_scroll = true;
+    }
+
     /// Handle a raw Android touch event (ACTION_DOWN/MOVE/UP/CANCEL).
     ///
     /// Coordinates are physical pixels. Android windows keep touch state
@@ -510,16 +581,19 @@ impl AndroidWindowState {
             ACTION_UP => {
                 let is_drag = self.touch_state.is_drag;
                 let suppress_scroll = self.touch_state.suppress_scroll;
+                let was_long_press = self.touch_state.long_press_active;
                 self.touch_state.last_position = None;
                 self.touch_state.down_position = None;
                 self.touch_state.is_drag = false;
+                self.touch_state.long_press_active = false;
+                self.touch_state.long_press_anchor_utf16 = None;
 
                 if !is_drag || suppress_scroll {
                     // Java forwards velocity unconditionally. If the pointer
                     // handler prevented default, the matching fling must die
                     // with the suppressed synthetic scroll stream.
                     self.touch_state.fling = None;
-                } else {
+                } else if !was_long_press {
                     self.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
                         delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
@@ -562,6 +636,30 @@ impl AndroidWindowState {
                     }
                 };
 
+                // When a long-press triggered selection, drag extends the range.
+                if self.touch_state.long_press_active {
+                    if let Some(anchor) = self.touch_state.long_press_anchor_utf16 {
+                        if let Some(mut handler) = self.selection_handler.take() {
+                            if let Some(current) =
+                                handler.nearest_character_index_for_point(position)
+                            {
+                                let range = anchor.min(current)..anchor.max(current);
+                                handler.set_selected_text_range(range);
+                            }
+                            self.selection_handler = Some(handler);
+                        }
+                    }
+                    self.handle_input(PlatformInput::PointerMove(PointerMoveEvent {
+                        pointer_id: 1,
+                        kind: PointerKind::Touch,
+                        is_primary: true,
+                        pressed_button: Some(PointerButton::Primary),
+                        position,
+                        modifiers: Modifiers::default(),
+                    }));
+                    return;
+                }
+
                 let pointer_result =
                     self.handle_input(PlatformInput::PointerMove(PointerMoveEvent {
                         pointer_id: 1,
@@ -593,6 +691,8 @@ impl AndroidWindowState {
                 self.touch_state.is_drag = false;
                 self.touch_state.suppress_scroll = false;
                 self.touch_state.fling = None;
+                self.touch_state.long_press_active = false;
+                self.touch_state.long_press_anchor_utf16 = None;
                 self.handle_input(PlatformInput::PointerCancel(PointerCancelEvent {
                     pointer_id: 1,
                     kind: PointerKind::Touch,
@@ -775,6 +875,22 @@ impl PlatformWindow for AndroidWindow {
         Capslock { on: false }
     }
 
+    fn set_selection_handler(&mut self, input_handler: PlatformInputHandler) {
+        self.state.borrow_mut().selection_handler = Some(input_handler);
+    }
+
+    fn take_selection_handler(&mut self) -> Option<PlatformInputHandler> {
+        self.state.borrow_mut().selection_handler.take()
+    }
+
+    fn clear_selection_handler(&mut self) {
+        self.state.borrow_mut().selection_handler = None;
+    }
+
+    fn set_selectable_text_hit_regions(&self, regions: SmallVec<[SelectableTextHitRegion; 8]>) {
+        self.state.borrow_mut().selection_hit_regions = regions;
+    }
+
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         let mut input_handler = input_handler;
         let should_auto_request_keyboard = {
@@ -816,6 +932,10 @@ impl PlatformWindow for AndroidWindow {
 
     fn is_soft_keyboard_visible(&self) -> bool {
         super::ffi::keyboard_height() > 0
+    }
+
+    fn has_active_keyboard_accessory(&self) -> bool {
+        self.state.borrow_mut().has_active_keyboard_accessory()
     }
 
     fn prompt(

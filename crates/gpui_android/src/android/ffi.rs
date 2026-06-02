@@ -295,6 +295,16 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeFlingEvent(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeLongPressEvent(
+    _env: JNIEnv,
+    _class: JClass,
+    x: jfloat,
+    y: jfloat,
+) {
+    app_state::with_platform(|platform| platform.handle_long_press(x, y));
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeKeyEvent(
     _env: JNIEnv,
     _class: JClass,

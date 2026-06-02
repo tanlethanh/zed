@@ -397,6 +397,13 @@ impl AndroidPlatform {
         }
     }
 
+    /// Handle a long-press gesture at physical-pixel coordinates for the root surface.
+    pub fn handle_long_press(&self, x: f32, y: f32) {
+        if let Some(window) = self.window_for_role(AndroidWindowRole::Root) {
+            window.borrow_mut().handle_long_press(x, y);
+        }
+    }
+
     /// Handle a fling gesture (velocity in physical pixels/second from Android VelocityTracker).
     pub fn handle_fling(&self, velocity_x: f32, velocity_y: f32) {
         self.handle_fling_for_role(AndroidWindowRole::Root, velocity_x, velocity_y);
@@ -503,6 +510,16 @@ impl AndroidPlatform {
     pub fn finish_composing_text(&self) -> bool {
         self.window_for_role(AndroidWindowRole::Root)
             .is_some_and(|window| window.borrow_mut().finish_composing_text())
+    }
+
+    pub fn handle_keyboard_accessory_action(&self, action: &str) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().handle_keyboard_accessory_action(action))
+    }
+
+    pub fn has_active_keyboard_accessory(&self) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().has_active_keyboard_accessory())
     }
 
     fn load_essential_fonts(text_system: &Arc<dyn PlatformTextSystem>) {
