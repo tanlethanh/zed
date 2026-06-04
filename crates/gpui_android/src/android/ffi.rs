@@ -346,7 +346,10 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeImeInput(
         }
     };
 
-    if app_state::with_platform(|platform| platform.insert_text(&text)).unwrap_or(false) {
+    log::debug!("[DEBUG-ANDROID-IME] nativeImeInput text={text:?}");
+    let handled = app_state::with_platform(|platform| platform.insert_text(&text)).unwrap_or(false);
+    log::debug!("[DEBUG-ANDROID-IME] nativeImeInput handled={handled}");
+    if handled {
         return;
     }
 
@@ -381,9 +384,14 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeImeSetComposingTe
         }
     };
 
-    app_state::with_platform(|platform| {
-        platform.set_composing_text(&text, new_cursor_position);
-    });
+    log::debug!(
+        "[DEBUG-ANDROID-IME] nativeImeSetComposingText text={text:?} cursor={new_cursor_position}"
+    );
+    let handled = app_state::with_platform(|platform| {
+        platform.set_composing_text(&text, new_cursor_position)
+    })
+    .unwrap_or(false);
+    log::debug!("[DEBUG-ANDROID-IME] nativeImeSetComposingText handled={handled}");
 }
 
 #[unsafe(no_mangle)]
@@ -391,9 +399,10 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeImeFinishComposin
     _env: JNIEnv,
     _class: JClass,
 ) {
-    app_state::with_platform(|platform| {
-        platform.finish_composing_text();
-    });
+    log::debug!("[DEBUG-ANDROID-IME] nativeImeFinishComposingText");
+    let handled =
+        app_state::with_platform(|platform| platform.finish_composing_text()).unwrap_or(false);
+    log::debug!("[DEBUG-ANDROID-IME] nativeImeFinishComposingText handled={handled}");
 }
 
 #[unsafe(no_mangle)]
@@ -402,6 +411,7 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeKeyboardHeightCha
     _class: JClass,
     height: jint,
 ) {
+    log::debug!("[DEBUG-ANDROID-IME] nativeKeyboardHeightChanged height={height}");
     KEYBOARD_HEIGHT.store(height.max(0) as u32, Ordering::Relaxed);
     app_state::with_platform(|platform| platform.request_frame_forced());
 }
@@ -422,7 +432,10 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeSystemInsetsChang
 
 fn dispatch_text_input_key(key_code: i32, unicode: i32) -> bool {
     if key_code == KEYCODE_DEL {
-        return app_state::with_platform(|platform| platform.delete_backward(1)).unwrap_or(false);
+        let handled =
+            app_state::with_platform(|platform| platform.delete_backward(1)).unwrap_or(false);
+        log::debug!("[DEBUG-ANDROID-IME] dispatchTextKey backspace handled={handled}");
+        return handled;
     }
 
     let text = match key_code {
@@ -433,7 +446,12 @@ fn dispatch_text_input_key(key_code: i32, unicode: i32) -> bool {
     };
 
     text.is_some_and(|text| {
-        app_state::with_platform(|platform| platform.insert_text(&text)).unwrap_or(false)
+        let handled =
+            app_state::with_platform(|platform| platform.insert_text(&text)).unwrap_or(false);
+        log::debug!(
+            "[DEBUG-ANDROID-IME] dispatchTextKey keyCode={key_code} unicode={unicode} text={text:?} handled={handled}"
+        );
+        handled
     })
 }
 

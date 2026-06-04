@@ -144,6 +144,7 @@ class GpuiSurfaceView
         // ----- Soft keyboard -----
 
         fun requestKeyboard() {
+            Log.d(TAG, "[DEBUG-ANDROID-IME] requestKeyboard before requested=$keyboardRequested focus=${hasFocus()}")
             keyboardRequested = true
             requestFocus()
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
@@ -151,13 +152,16 @@ class GpuiSurfaceView
             // connection after flipping text-editor state so IME show is honored.
             imm?.restartInput(this)
             imm?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+            Log.d(TAG, "[DEBUG-ANDROID-IME] requestKeyboard after requested=$keyboardRequested focus=${hasFocus()} imm=${imm != null}")
         }
 
         fun dismissKeyboard() {
+            Log.d(TAG, "[DEBUG-ANDROID-IME] dismissKeyboard before requested=$keyboardRequested focus=${hasFocus()}")
             keyboardRequested = false
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
             imm?.restartInput(this)
             imm?.hideSoftInputFromWindow(windowToken, 0)
+            Log.d(TAG, "[DEBUG-ANDROID-IME] dismissKeyboard after requested=$keyboardRequested imm=${imm != null}")
         }
 
         fun setKeyboardAccessoryHeight(height: Int) {
@@ -169,28 +173,42 @@ class GpuiSurfaceView
             // Host-provided keyboard accessory bars occupy app content above the IME,
             // so GPUI keyboard avoidance must reserve both regions together.
             val accessoryHeight = if (imeHeight > 0) keyboardAccessoryHeight else 0
+            Log.d(
+                TAG,
+                "[DEBUG-ANDROID-IME] pushKeyboardHeight ime=$imeHeight accessory=$accessoryHeight total=${imeHeight + accessoryHeight}",
+            )
             nativeKeyboardHeightChanged(imeHeight + accessoryHeight)
         }
 
-        override fun onCheckIsTextEditor(): Boolean = keyboardRequested
+        override fun onCheckIsTextEditor(): Boolean {
+            Log.d(TAG, "[DEBUG-ANDROID-IME] onCheckIsTextEditor requested=$keyboardRequested focus=${hasFocus()}")
+            return keyboardRequested
+        }
 
         override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+            Log.d(TAG, "[DEBUG-ANDROID-IME] onCreateInputConnection requested=$keyboardRequested focus=${hasFocus()}")
             outAttrs.inputType = InputType.TYPE_CLASS_TEXT
             outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_NONE
 
             return object : BaseInputConnection(this, false) {
                 override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                    Log.d(
+                        TAG,
+                        "[DEBUG-ANDROID-IME] setComposingText text='${text?.toString().orEmpty()}' cursor=$newCursorPosition",
+                    )
                     nativeImeSetComposingText(text?.toString().orEmpty(), newCursorPosition)
                     return true
                 }
 
                 override fun finishComposingText(): Boolean {
+                    Log.d(TAG, "[DEBUG-ANDROID-IME] finishComposingText")
                     nativeImeFinishComposingText()
                     return true
                 }
 
                 override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
                     val s = text?.toString().orEmpty()
+                    Log.d(TAG, "[DEBUG-ANDROID-IME] commitText text='$s' cursor=$newCursorPosition")
                     if (s.isNotEmpty()) {
                         nativeImeInput(s)
                     }
@@ -198,6 +216,10 @@ class GpuiSurfaceView
                 }
 
                 override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                    Log.d(
+                        TAG,
+                        "[DEBUG-ANDROID-IME] deleteSurroundingText before=$beforeLength after=$afterLength",
+                    )
                     repeat(beforeLength.coerceAtLeast(0)) {
                         nativeKeyEvent(KEY_ACTION_DOWN, KeyEvent.KEYCODE_DEL, 0)
                     }
@@ -208,6 +230,10 @@ class GpuiSurfaceView
                     deleteSurroundingText(beforeLength, afterLength)
 
                 override fun sendKeyEvent(event: KeyEvent): Boolean {
+                    Log.d(
+                        TAG,
+                        "[DEBUG-ANDROID-IME] sendKeyEvent action=${event.action} keyCode=${event.keyCode} unicode=${event.unicodeChar}",
+                    )
                     if (event.action == KeyEvent.ACTION_DOWN) {
                         nativeKeyEvent(KEY_ACTION_DOWN, event.keyCode, event.unicodeChar)
                     }
