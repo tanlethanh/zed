@@ -441,27 +441,18 @@ impl AndroidWindowState {
 
     pub fn insert_text(&mut self, text: &str) -> bool {
         let Some(mut input_handler) = self.input_handler.take() else {
-            log::debug!("[DEBUG-ANDROID-IME] window.insert_text text={text:?} handler=false");
             return false;
         };
 
-        let accepts = input_handler.query_accepts_text_input();
-        let handled = if accepts {
+        let handled = if input_handler.query_accepts_text_input() {
             // Android commitText is already confirmed input. Mirror iOS'
             // shouldChangeText preflight so terminal typing does not look like
             // UIKit's no-preflight dictation stream.
-            let should_change = input_handler.should_change_text_in_range(None, text);
-            log::debug!(
-                "[DEBUG-ANDROID-IME] window.insert_text text={text:?} handler=true accepts={accepts} should_change={should_change}"
-            );
-            if should_change {
+            if input_handler.should_change_text_in_range(None, text) {
                 input_handler.insert_text(text);
             }
             true
         } else {
-            log::debug!(
-                "[DEBUG-ANDROID-IME] window.insert_text text={text:?} handler=true accepts={accepts}"
-            );
             false
         };
         self.input_handler = Some(input_handler);
@@ -472,13 +463,11 @@ impl AndroidWindowState {
         if count == 0 {
             return false;
         }
-        let handled = self.with_text_input_handler(|handler| {
+        self.with_text_input_handler(|handler| {
             for _ in 0..count {
                 handler.delete_backward();
             }
-        });
-        log::debug!("[DEBUG-ANDROID-IME] window.delete_backward count={count} handled={handled}");
-        handled
+        })
     }
 
     pub fn set_composing_text(&mut self, text: &str, new_cursor_position: i32) -> bool {
@@ -490,23 +479,17 @@ impl AndroidWindowState {
         }
         .min(len);
 
-        let handled = self.with_text_input_handler(|handler| {
+        self.with_text_input_handler(|handler| {
             if text.is_empty() {
                 handler.unmark_text();
             } else {
                 handler.set_marked_text(text, Some(cursor..cursor), None);
             }
-        });
-        log::debug!(
-            "[DEBUG-ANDROID-IME] window.set_composing_text text={text:?} cursor={new_cursor_position} handled={handled}"
-        );
-        handled
+        })
     }
 
     pub fn finish_composing_text(&mut self) -> bool {
-        let handled = self.with_text_input_handler(|handler| handler.unmark_text());
-        log::debug!("[DEBUG-ANDROID-IME] window.finish_composing_text handled={handled}");
-        handled
+        self.with_text_input_handler(|handler| handler.unmark_text())
     }
 
     pub fn handle_keyboard_accessory_action(&mut self, action: &str) -> bool {
@@ -915,10 +898,6 @@ impl PlatformWindow for AndroidWindow {
             let had_input_handler = state.input_handler.is_some();
             let accepts_text_input = input_handler.query_accepts_text_input();
             let uses_manual_focus = input_handler.query_uses_manual_focus();
-            let keyboard_accessory = input_handler.query_keyboard_accessory();
-            log::debug!(
-                "[DEBUG-ANDROID-IME] window.set_input_handler had={had_input_handler} accepts={accepts_text_input} manual={uses_manual_focus} accessory={keyboard_accessory}"
-            );
             state.input_handler = Some(input_handler);
             should_auto_request_soft_keyboard(
                 accepts_text_input,
@@ -928,10 +907,7 @@ impl PlatformWindow for AndroidWindow {
         };
 
         if should_auto_request_keyboard {
-            log::debug!("[DEBUG-ANDROID-IME] window.set_input_handler auto_request_keyboard=true");
             super::app_state::with_platform(|platform| platform.request_soft_keyboard());
-        } else {
-            log::debug!("[DEBUG-ANDROID-IME] window.set_input_handler auto_request_keyboard=false");
         }
     }
 
@@ -941,19 +917,16 @@ impl PlatformWindow for AndroidWindow {
 
     fn clear_input_handler(&mut self) {
         let had_input_handler = self.state.borrow_mut().input_handler.take().is_some();
-        log::debug!("[DEBUG-ANDROID-IME] window.clear_input_handler had={had_input_handler}");
         if had_input_handler {
             super::app_state::with_platform(|platform| platform.hide_soft_keyboard());
         }
     }
 
     fn show_soft_keyboard(&self) {
-        log::debug!("[DEBUG-ANDROID-IME] window.show_soft_keyboard");
         super::app_state::with_platform(|platform| platform.request_soft_keyboard());
     }
 
     fn hide_soft_keyboard(&self) {
-        log::debug!("[DEBUG-ANDROID-IME] window.hide_soft_keyboard");
         super::app_state::with_platform(|platform| platform.hide_soft_keyboard());
     }
 

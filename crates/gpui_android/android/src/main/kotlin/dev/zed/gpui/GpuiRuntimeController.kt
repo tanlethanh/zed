@@ -121,17 +121,13 @@ class GpuiRuntimeController(private val activity: Activity) {
 
         @JvmStatic
         fun requestSoftKeyboard() {
-            val view = activeSurfaceView?.get()
-            Log.d(TAG, "[DEBUG-ANDROID-IME] requestSoftKeyboard view=${view != null}")
-            if (view == null) return
+            val view = activeSurfaceView?.get() ?: return
             view.post { activeSurfaceView?.get()?.requestKeyboard() }
         }
 
         @JvmStatic
         fun hideSoftKeyboard() {
-            val view = activeSurfaceView?.get()
-            Log.d(TAG, "[DEBUG-ANDROID-IME] hideSoftKeyboard view=${view != null}")
-            if (view == null) return
+            val view = activeSurfaceView?.get() ?: return
             view.post { activeSurfaceView?.get()?.dismissKeyboard() }
         }
 
