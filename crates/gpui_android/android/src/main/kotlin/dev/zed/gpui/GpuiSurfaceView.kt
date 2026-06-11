@@ -298,6 +298,12 @@ class GpuiSurfaceView
         }
 
         override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+            // System keys (volume, media, camera, brightness, back, ...) must
+            // reach the framework; consuming them breaks physical controls
+            // app-wide. BACK is owned by MainActivity.dispatchKeyEvent.
+            if (event.isSystem) {
+                return super.onKeyDown(keyCode, event)
+            }
             nativeKeyEvent(KEY_ACTION_DOWN, keyCode, event.unicodeChar)
             return true
         }
