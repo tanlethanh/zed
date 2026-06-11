@@ -173,6 +173,10 @@ pub struct AndroidWindowState {
     scale: f32,
     touch_state: TouchState,
     input_handler: Option<PlatformInputHandler>,
+    // Cached from the last set_input_handler. Window::draw takes the input
+    // handler for the duration of the frame, so views rendering mid-draw must
+    // read this flag instead of querying the (absent) live handler.
+    input_keyboard_accessory: bool,
     selection_handler: Option<PlatformInputHandler>,
     selection_hit_regions: SmallVec<[SelectableTextHitRegion; 8]>,
     callbacks: Callbacks,
@@ -196,6 +200,7 @@ impl AndroidWindowState {
             scale,
             touch_state: TouchState::new(),
             input_handler: None,
+            input_keyboard_accessory: false,
             selection_handler: None,
             selection_hit_regions: SmallVec::new(),
             callbacks: Callbacks::default(),
@@ -509,12 +514,14 @@ impl AndroidWindowState {
     }
 
     pub fn has_active_keyboard_accessory(&mut self) -> bool {
+        // Fall back to the cached flag when the handler is taken (mid-draw).
         let Some(mut input_handler) = self.input_handler.take() else {
-            return false;
+            return self.input_keyboard_accessory;
         };
         let has_accessory =
             input_handler.query_accepts_text_input() && input_handler.query_keyboard_accessory();
         self.input_handler = Some(input_handler);
+        self.input_keyboard_accessory = has_accessory;
         has_accessory
     }
 
@@ -898,6 +905,8 @@ impl PlatformWindow for AndroidWindow {
             let had_input_handler = state.input_handler.is_some();
             let accepts_text_input = input_handler.query_accepts_text_input();
             let uses_manual_focus = input_handler.query_uses_manual_focus();
+            state.input_keyboard_accessory =
+                accepts_text_input && input_handler.query_keyboard_accessory();
             state.input_handler = Some(input_handler);
             should_auto_request_soft_keyboard(
                 accepts_text_input,
@@ -916,7 +925,11 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn clear_input_handler(&mut self) {
-        let had_input_handler = self.state.borrow_mut().input_handler.take().is_some();
+        let had_input_handler = {
+            let mut state = self.state.borrow_mut();
+            state.input_keyboard_accessory = false;
+            state.input_handler.take().is_some()
+        };
         if had_input_handler {
             super::app_state::with_platform(|platform| platform.hide_soft_keyboard());
         }
