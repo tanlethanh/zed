@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_void,
     ptr::NonNull,
     rc::Rc,
@@ -783,6 +783,10 @@ pub type AndroidWindowStatePtr = Rc<RefCell<AndroidWindowState>>;
 
 pub struct AndroidWindow {
     pub state: AndroidWindowStatePtr,
+    // Window::draw temporarily takes the live handler every frame, and touch
+    // dispatch may already hold state when keyboard methods are called.
+    input_handler_registered: Cell<bool>,
+    keyboard_session_requested: Cell<bool>,
 }
 
 impl AndroidWindow {
@@ -796,6 +800,8 @@ impl AndroidWindow {
         let state = AndroidWindowState::new(role, bounds, scale, active);
         Self {
             state: Rc::new(RefCell::new(state)),
+            input_handler_registered: Cell::new(false),
+            keyboard_session_requested: Cell::new(false),
         }
     }
 
@@ -902,17 +908,20 @@ impl PlatformWindow for AndroidWindow {
         let mut input_handler = input_handler;
         let should_auto_request_keyboard = {
             let mut state = self.state.borrow_mut();
-            let had_input_handler = state.input_handler.is_some();
             let accepts_text_input = input_handler.query_accepts_text_input();
             let uses_manual_focus = input_handler.query_uses_manual_focus();
             state.input_keyboard_accessory =
                 accepts_text_input && input_handler.query_keyboard_accessory();
             state.input_handler = Some(input_handler);
-            should_auto_request_soft_keyboard(
+            let should_auto_request_keyboard = should_auto_request_soft_keyboard(
                 accepts_text_input,
                 uses_manual_focus,
-                had_input_handler,
-            )
+                self.input_handler_registered.get(),
+            );
+            self.input_handler_registered.set(true);
+            self.keyboard_session_requested
+                .set(self.keyboard_session_requested.get() || should_auto_request_keyboard);
+            should_auto_request_keyboard
         };
 
         if should_auto_request_keyboard {
@@ -925,21 +934,25 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn clear_input_handler(&mut self) {
-        let had_input_handler = {
+        let had_keyboard_session = {
             let mut state = self.state.borrow_mut();
             state.input_keyboard_accessory = false;
-            state.input_handler.take().is_some()
+            state.input_handler.take();
+            self.input_handler_registered.set(false);
+            self.keyboard_session_requested.replace(false)
         };
-        if had_input_handler {
+        if had_keyboard_session {
             super::app_state::with_platform(|platform| platform.hide_soft_keyboard());
         }
     }
 
     fn show_soft_keyboard(&self) {
+        self.keyboard_session_requested.set(true);
         super::app_state::with_platform(|platform| platform.request_soft_keyboard());
     }
 
     fn hide_soft_keyboard(&self) {
+        self.keyboard_session_requested.set(false);
         super::app_state::with_platform(|platform| platform.hide_soft_keyboard());
     }
 
