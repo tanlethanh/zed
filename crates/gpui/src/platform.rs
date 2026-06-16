@@ -1583,20 +1583,6 @@ impl PlatformInputHandler {
             .flatten()
     }
 
-    pub fn initial_native_selection_range(
-        &mut self,
-        range: std::ops::Range<usize>,
-    ) -> Option<std::ops::Range<usize>> {
-        self.cx
-            .update(|window, cx| {
-                self.handler
-                    .borrow_mut()
-                    .initial_native_selection_range(range, window, cx)
-            })
-            .ok()
-            .flatten()
-    }
-
     pub fn selection_action_names(&mut self) -> Vec<String> {
         self.selection_action_presentations()
             .into_iter()
@@ -2046,22 +2032,6 @@ pub trait InputHandler: 'static {
         _cx: &mut App,
     ) -> Option<std::ops::Range<usize>> {
         None
-    }
-
-    /// Returns the platform-owned selection range created by a native long press.
-    ///
-    /// Platform-neutral hook: given the seed range under a long press, a handler
-    /// may widen it (e.g. to the enclosing word). Backends call it only when they
-    /// synthesize the initial selection themselves. Android does; iOS does not,
-    /// because UIKit's `UITextInteraction` supplies long-press granularity
-    /// natively. The default returns the seed unchanged.
-    fn initial_native_selection_range(
-        &mut self,
-        range: std::ops::Range<usize>,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) -> Option<std::ops::Range<usize>> {
-        Some(range)
     }
 
     /// Returns custom actions for the active platform-owned selection.

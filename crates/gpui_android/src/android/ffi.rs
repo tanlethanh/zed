@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jboolean, jdoubleArray, jfloat, jint};
+use jni::sys::{jboolean, jdoubleArray, jfloat, jint, jstring};
 use ndk::native_window::NativeWindow;
 
 use gpui::{KeyDownEvent, Keystroke, Modifiers, PlatformInput};
@@ -424,9 +424,10 @@ pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionStar
     _class: JClass,
     x: jfloat,
     y: jfloat,
-) -> jboolean {
-    app_state::with_platform(|platform| platform.start_selection_at(x, y)).unwrap_or(false)
-        as jboolean
+) -> jint {
+    app_state::with_platform(|platform| platform.start_selection_at(x, y))
+        .flatten()
+        .map_or(-1, |index| index as jint)
 }
 
 #[unsafe(no_mangle)]
@@ -447,15 +448,36 @@ pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionSetR
     _class: JClass,
     start: jint,
     end: jint,
-    moving_start: jboolean,
 ) -> jboolean {
     if start < 0 || end < 0 {
         return false as jboolean;
     }
     app_state::with_platform(|platform| {
-        platform.update_active_selection(start as usize, end as usize, moving_start != 0)
+        platform.update_active_selection(start as usize, end as usize)
     })
     .unwrap_or(false) as jboolean
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionTextForRange(
+    env: JNIEnv,
+    _class: JClass,
+    start: jint,
+    end: jint,
+) -> jstring {
+    if start < 0 || end < 0 {
+        return std::ptr::null_mut();
+    }
+    let Some(text) = app_state::with_platform(|platform| {
+        platform.selection_text_for_range(start as usize, end as usize)
+    })
+    .flatten() else {
+        return std::ptr::null_mut();
+    };
+    let Ok(value) = env.new_string(text) else {
+        return std::ptr::null_mut();
+    };
+    value.into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -484,6 +506,64 @@ pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionCopy
 ) -> jboolean {
     app_state::with_platform(|platform| platform.copy_active_selection()).unwrap_or(false)
         as jboolean
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionText(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let Some(text) = app_state::with_platform(|platform| platform.selected_text()).flatten() else {
+        return std::ptr::null_mut();
+    };
+    let Ok(value) = env.new_string(text) else {
+        return std::ptr::null_mut();
+    };
+    value.into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionActionCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    app_state::with_platform(|platform| platform.selection_action_count())
+        .unwrap_or(0)
+        .min(i32::MAX as usize) as jint
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionActionTitle(
+    env: JNIEnv,
+    _class: JClass,
+    action_index: jint,
+) -> jstring {
+    if action_index < 0 {
+        return std::ptr::null_mut();
+    }
+    let Some(title) =
+        app_state::with_platform(|platform| platform.selection_action_title(action_index as usize))
+            .flatten()
+    else {
+        return std::ptr::null_mut();
+    };
+    let Ok(value) = env.new_string(title) else {
+        return std::ptr::null_mut();
+    };
+    value.into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionPerformAction(
+    _env: JNIEnv,
+    _class: JClass,
+    action_index: jint,
+) -> jboolean {
+    if action_index < 0 {
+        return false as jboolean;
+    }
+    app_state::with_platform(|platform| platform.perform_selection_action(action_index as usize))
+        .unwrap_or(false) as jboolean
 }
 
 #[unsafe(no_mangle)]

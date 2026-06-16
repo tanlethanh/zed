@@ -182,7 +182,6 @@ pub struct AndroidWindowState {
     selection_handler: Option<PlatformInputHandler>,
     selectable_text_hit_regions: SmallVec<[SelectableTextHitRegion; 8]>,
     active_selection_source: Option<ActiveSelectionSource>,
-    last_logged_selection_snapshot: Option<Vec<f64>>,
     // Cached from the last set_input_handler. Window::draw takes the input
     // handler for the duration of the frame, so views rendering mid-draw must
     // read this flag instead of querying the (absent) live handler.
@@ -211,7 +210,6 @@ impl AndroidWindowState {
             selection_handler: None,
             selectable_text_hit_regions: SmallVec::new(),
             active_selection_source: None,
-            last_logged_selection_snapshot: None,
             input_keyboard_accessory: false,
             callbacks: Callbacks::default(),
             active,
@@ -476,15 +474,13 @@ impl AndroidWindowState {
         self.with_selection_source_handler(self.active_selection_source?, f)
     }
 
-    pub fn start_selection_at(&mut self, physical_x: f32, physical_y: f32) -> bool {
+    /// Hit-test a long press and establish the active selection source, returning
+    /// the UTF-16 index under the point. Granularity (word vs character) is owned
+    /// by the native presenter (SelectionController), which then commits a range
+    /// through `update_active_selection`. iOS owns granularity via UIKit's
+    /// tokenizer; Android via `BreakIterator`. GPUI stays neutral.
+    pub fn start_selection_at(&mut self, physical_x: f32, physical_y: f32) -> Option<usize> {
         let point = point(px(physical_x / self.scale), px(physical_y / self.scale));
-        log::info!(
-            "ZEDRA_SELECTION_GEOMETRY start physical=({physical_x},{physical_y}) logical=({},{}) scale={} hit_regions={}",
-            point.x.as_f32(),
-            point.y.as_f32(),
-            self.scale,
-            self.selectable_text_hit_regions.len()
-        );
         let input_index = self.input_handler.as_mut().and_then(|handler| {
             handler
                 .query_handles_native_selection()
@@ -506,88 +502,38 @@ impl AndroidWindowState {
                     .flatten()
             });
         let Some((source, index)) = source_and_index else {
-            log::info!("ZEDRA_SELECTION_GEOMETRY start rejected no source/index");
-            return false;
+            return None;
         };
-        log::info!("ZEDRA_SELECTION_GEOMETRY start source={source:?} index={index}");
-
         self.active_selection_source = Some(source);
-        let selection = self
-            .with_selection_source_handler(source, |handler| {
-                // Seed a one-character range so handlers that only widen an
-                // existing selection (terminal stashes empty points as a
-                // candidate, never a selection) start non-empty. UIKit seeds its
-                // own granularity on iOS; on Android we synthesize the seed here.
-                let proposed_range = index..index.saturating_add(1);
-                let initial_range = handler
-                    .initial_native_selection_range(proposed_range.clone())
-                    .unwrap_or(proposed_range);
-                handler.set_selected_text_range(initial_range);
-                handler.selected_text_range(false)
-            })
-            .flatten()
-            .filter(|selection| !selection.range.is_empty());
-        if selection.is_none() {
-            self.active_selection_source = None;
-            log::info!("ZEDRA_SELECTION_GEOMETRY start rejected empty selection");
-            return false;
-        }
-        log::info!(
-            "ZEDRA_SELECTION_GEOMETRY start selection={:?}",
-            selection.as_ref().map(|selection| &selection.range)
-        );
-        true
+        Some(index)
     }
 
-    pub fn update_active_selection(
-        &mut self,
-        start: usize,
-        end: usize,
-        moving_start: bool,
-    ) -> bool {
-        // Read-only (markdown) drags follow Chrome's direction-aware granularity:
-        // the moving handle snaps to word boundaries while expanding and uses
-        // character granularity while contracting. Terminal/input selection keeps
-        // character granularity in both directions.
-        let word_granular = self.active_selection_source == Some(ActiveSelectionSource::ReadOnly);
+    /// Return the document text for a UTF-16 range from the active selection
+    /// source so the native presenter can compute word boundaries.
+    pub fn selection_text_for_range(&mut self, start: usize, end: usize) -> Option<String> {
         self.with_active_selection_handler(|handler| {
-            let Some(current) = handler.selected_text_range(false).map(|s| s.range) else {
-                return false;
-            };
-            // The handle Kotlin did not move stays anchored; the other tracks the
-            // finger. start/end arrive ordered as (anchor, moving) per side.
-            let (anchor, moving_target) = if moving_start {
-                (end, start)
-            } else {
-                (start, end)
-            };
-            let current_moving = if moving_start { current.start } else { current.end };
-            let expanding = if moving_start {
-                moving_target < current_moving
-            } else {
-                moving_target > current_moving
-            };
-            let moving = if word_granular && expanding {
-                handler
-                    .initial_native_selection_range(moving_target..moving_target)
-                    .map(|w| if moving_start { w.start } else { w.end })
-                    .unwrap_or(moving_target)
-            } else {
-                moving_target
-            };
-            let snapped = anchor.min(moving)..anchor.max(moving);
+            let mut adjusted = None;
+            handler.text_for_range(start..end, &mut adjusted)
+        })
+        .flatten()
+    }
+
+    /// Commit a selection range chosen by the native presenter. Neutral: clamp via
+    /// the handler and set it; no word/granularity policy lives here.
+    pub fn update_active_selection(&mut self, start: usize, end: usize) -> bool {
+        self.with_active_selection_handler(|handler| {
+            let requested = start.min(end)..start.max(end);
             let adjusted = handler
-                .adjusted_native_selection_range(snapped.clone())
-                .unwrap_or(snapped);
-            if adjusted.is_empty() || current == adjusted {
+                .adjusted_native_selection_range(requested.clone())
+                .unwrap_or(requested);
+            if adjusted.is_empty() {
+                return false;
+            }
+            let current = handler.selected_text_range(false).map(|s| s.range);
+            if current.as_ref() == Some(&adjusted) {
                 return false;
             }
             handler.set_selected_text_range(adjusted.clone());
-            log::info!(
-                "ZEDRA_SELECTION_GEOMETRY drag moving_start={moving_start} expanding={expanding} target={moving_target} -> {}..{}",
-                adjusted.start,
-                adjusted.end
-            );
             true
         })
         .unwrap_or(false)
@@ -636,10 +582,6 @@ impl AndroidWindowState {
                 Some(snapshot)
             })
             .flatten();
-        if snapshot != self.last_logged_selection_snapshot {
-            log::info!("ZEDRA_SELECTION_GEOMETRY snapshot physical={snapshot:?}");
-            self.last_logged_selection_snapshot = snapshot.clone();
-        }
         snapshot
     }
 
@@ -651,12 +593,35 @@ impl AndroidWindowState {
         .flatten()
     }
 
+    pub fn selection_action_count(&mut self) -> usize {
+        self.with_active_selection_handler(|handler| handler.selection_action_names().len())
+            .unwrap_or(0)
+    }
+
+    pub fn selection_action_title(&mut self, action_index: usize) -> Option<String> {
+        self.with_active_selection_handler(|handler| {
+            handler.selection_action_names().get(action_index).cloned()
+        })
+        .flatten()
+    }
+
+    pub fn perform_selection_action(&mut self, action_index: usize) -> bool {
+        self.with_active_selection_handler(|handler| {
+            if action_index < handler.selection_action_names().len() {
+                handler.perform_selection_action(action_index);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+    }
+
     pub fn clear_active_selection(&mut self, clear_handler: bool) {
         if clear_handler {
             self.with_active_selection_handler(|handler| handler.clear_selected_text_range());
         }
         self.active_selection_source = None;
-        self.last_logged_selection_snapshot = None;
     }
 
     pub fn insert_text(&mut self, text: &str) -> bool {

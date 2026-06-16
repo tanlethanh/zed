@@ -525,9 +525,9 @@ impl AndroidPlatform {
             .is_some_and(|window| window.borrow_mut().has_active_keyboard_accessory())
     }
 
-    pub fn start_selection_at(&self, x: f32, y: f32) -> bool {
+    pub fn start_selection_at(&self, x: f32, y: f32) -> Option<usize> {
         self.window_for_role(AndroidWindowRole::Root)
-            .is_some_and(|window| window.borrow_mut().start_selection_at(x, y))
+            .and_then(|window| window.borrow_mut().start_selection_at(x, y))
     }
 
     pub fn nearest_selection_index(&self, x: f32, y: f32) -> Option<usize> {
@@ -535,13 +535,14 @@ impl AndroidPlatform {
             .and_then(|window| window.borrow_mut().nearest_selection_index(x, y))
     }
 
-    pub fn update_active_selection(&self, start: usize, end: usize, moving_start: bool) -> bool {
+    pub fn selection_text_for_range(&self, start: usize, end: usize) -> Option<String> {
         self.window_for_role(AndroidWindowRole::Root)
-            .is_some_and(|window| {
-                window
-                    .borrow_mut()
-                    .update_active_selection(start, end, moving_start)
-            })
+            .and_then(|window| window.borrow_mut().selection_text_for_range(start, end))
+    }
+
+    pub fn update_active_selection(&self, start: usize, end: usize) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().update_active_selection(start, end))
     }
 
     pub fn active_selection_snapshot(&self) -> Option<Vec<f64>> {
@@ -558,6 +559,27 @@ impl AndroidPlatform {
         };
         self.set_clipboard_text(&text);
         true
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        self.window_for_role(AndroidWindowRole::Root)
+            .and_then(|window| window.borrow_mut().selected_text())
+    }
+
+    pub fn selection_action_count(&self) -> usize {
+        self.window_for_role(AndroidWindowRole::Root)
+            .map(|window| window.borrow_mut().selection_action_count())
+            .unwrap_or(0)
+    }
+
+    pub fn selection_action_title(&self, action_index: usize) -> Option<String> {
+        self.window_for_role(AndroidWindowRole::Root)
+            .and_then(|window| window.borrow_mut().selection_action_title(action_index))
+    }
+
+    pub fn perform_selection_action(&self, action_index: usize) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().perform_selection_action(action_index))
     }
 
     pub fn clear_active_selection(&self) {

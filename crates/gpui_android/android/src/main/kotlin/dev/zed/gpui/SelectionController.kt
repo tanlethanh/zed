@@ -1,11 +1,15 @@
 package dev.zed.gpui
 
+import android.app.SearchManager
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PointF
 import android.graphics.Rect
 import android.graphics.RectF
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -19,6 +23,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.widget.FrameLayout
 import android.widget.Magnifier
+import java.text.BreakIterator
 import java.lang.ref.WeakReference
 import kotlin.math.hypot
 
@@ -27,6 +32,11 @@ internal class SelectionController(
     private val rootView: FrameLayout,
     private val surfaceView: GpuiSurfaceView,
 ) {
+    private data class NativeSelectionAction(
+        val index: Int,
+        val title: String,
+    )
+
     private val handler = Handler(Looper.getMainLooper())
     private val touchSlop = ViewConfiguration.get(surfaceView.context).scaledTouchSlop.toFloat()
     private val longPressTimeout = ViewConfiguration.getLongPressTimeout().toLong()
@@ -40,6 +50,7 @@ internal class SelectionController(
     private var longPressActive = false
     private var snapshot: SelectionSnapshot? = null
     private var actionMode: ActionMode? = null
+    private var menuActions: List<NativeSelectionAction> = emptyList()
     private var lastLoggedSnapshot: SelectionSnapshot? = null
     private var dragOffsetX = 0f
     private var dragOffsetY = 0f
@@ -92,20 +103,7 @@ internal class SelectionController(
                 pendingLongPress =
                     Runnable {
                         pendingLongPress = null
-                        val started = nativeSelectionStartAt(downX, downY)
-                        Log.i(
-                            GEOMETRY_TAG,
-                            "long_press surface=($downX,$downY) surface_view=${surfaceView.geometryDescription()} started=$started",
-                        )
-                        if (started) {
-                            longPressActive = true
-                            surfaceView.cancelGpuiTouchForSelection()
-                            refresh()
-                            snapshot?.let {
-                                longPressAnchorStart = it.start
-                                longPressAnchorEnd = it.end
-                            }
-                        }
+                        startSelectionFromLongPress(downX, downY)
                     }.also { handler.postDelayed(it, longPressTimeout) }
             }
             MotionEvent.ACTION_MOVE -> {
@@ -118,18 +116,38 @@ internal class SelectionController(
         return false
     }
 
+    private fun startSelectionFromLongPress(x: Float, y: Float) {
+        val index = nativeSelectionStartAt(x, y)
+        Log.i(GEOMETRY_TAG, "long_press surface=($x,$y) index=$index")
+        if (index < 0) return
+        // Granularity is owned here, not in GPUI: expand the hit index to its word
+        // (BreakIterator), falling back to a single character on whitespace.
+        val word = wordBoundsAt(index) ?: (index to index + 1)
+        if (!nativeSelectionSetRange(word.first, word.second)) return
+        longPressActive = true
+        surfaceView.cancelGpuiTouchForSelection()
+        refresh()
+        snapshot?.let {
+            longPressAnchorStart = it.start
+            longPressAnchorEnd = it.end
+        }
+    }
+
     private fun extendLongPressSelection(x: Float, y: Float) {
         val anchorStart = longPressAnchorStart
         val anchorEnd = longPressAnchorEnd
         if (anchorStart < 0 || anchorEnd < 0) return
+        val current = snapshot ?: return
         val index = nativeSelectionNearestIndexAt(x, y)
         if (index < 0) return
-        // Keep the long-pressed word selected and grow toward the finger: extend
-        // the end when dragging past it, the start when dragging before it.
+        // Keep the long-pressed word selected and grow toward the finger, snapping
+        // the moving edge to words while expanding (character while contracting).
         val changed =
             when {
-                index >= anchorEnd -> nativeSelectionSetRange(anchorStart, index, movingStart = false)
-                index <= anchorStart -> nativeSelectionSetRange(index, anchorEnd, movingStart = true)
+                index >= anchorEnd ->
+                    nativeSelectionSetRange(anchorStart, snapEndpoint(index, current.end, false))
+                index <= anchorStart ->
+                    nativeSelectionSetRange(snapEndpoint(index, current.start, true), anchorEnd)
                 else -> false
             }
         if (changed) {
@@ -153,7 +171,12 @@ internal class SelectionController(
         if (actionMode == null) {
             actionMode = surfaceView.startActionMode(actionModeCallback, ActionMode.TYPE_FLOATING)
         } else {
-            actionMode?.invalidateContentRect()
+            val nextActions = nativeSelectionActions()
+            if (nextActions != menuActions) {
+                actionMode?.invalidate()
+            } else {
+                actionMode?.invalidateContentRect()
+            }
         }
     }
 
@@ -163,6 +186,7 @@ internal class SelectionController(
         longPressAnchorStart = -1
         longPressAnchorEnd = -1
         snapshot = null
+        menuActions = emptyList()
         lastLoggedSnapshot = null
         magnifier?.dismiss()
         overlay.hide()
@@ -235,9 +259,9 @@ internal class SelectionController(
             val changed =
                 when (handle) {
                     DragHandle.Start ->
-                        nativeSelectionSetRange(index, current.end, movingStart = true)
+                        nativeSelectionSetRange(snapEndpoint(index, current.start, true), current.end)
                     DragHandle.End ->
-                        nativeSelectionSetRange(current.start, index, movingStart = false)
+                        nativeSelectionSetRange(current.start, snapEndpoint(index, current.end, false))
                 }
             if (changed) refresh()
         }
@@ -245,6 +269,34 @@ internal class SelectionController(
         // (snapped) handle instead of the raw finger position.
         actionMode?.hide(ActionMode.DEFAULT_HIDE_DURATION.toLong())
         showMagnifierAtHandle(handle)
+    }
+
+    // Word-snap the moving endpoint while expanding away from the anchor; keep
+    // character granularity while contracting. Word boundaries come from the
+    // platform's BreakIterator, the Android peer of UIKit's tokenizer, so
+    // granularity is owned natively and GPUI stays neutral.
+    private fun snapEndpoint(rawIndex: Int, currentMoving: Int, movingStart: Boolean): Int {
+        val expanding = if (movingStart) rawIndex < currentMoving else rawIndex > currentMoving
+        if (!expanding) return rawIndex
+        val word = wordBoundsAt(rawIndex) ?: return rawIndex
+        return if (movingStart) word.first else word.second
+    }
+
+    // Returns [start, end) of the word containing [index], or null on whitespace
+    // or when no document text is available. Fetches a bounded text window around
+    // the index through the neutral text bridge and runs BreakIterator over it.
+    private fun wordBoundsAt(index: Int): Pair<Int, Int>? {
+        val windowStart = maxOf(0, index - WORD_WINDOW)
+        val text = nativeSelectionTextForRange(windowStart, index + WORD_WINDOW) ?: return null
+        if (text.isEmpty()) return null
+        val rel = (index - windowStart).coerceIn(0, text.length - 1)
+        val iterator = BreakIterator.getWordInstance()
+        iterator.setText(text)
+        val end = iterator.following(rel).let { if (it == BreakIterator.DONE) text.length else it }
+        val start = iterator.preceding(end).let { if (it == BreakIterator.DONE) 0 else it }
+        if (start >= end) return null
+        if ((start until end).none { text[it].isLetterOrDigit() }) return null
+        return (windowStart + start) to (windowStart + end)
     }
 
     private fun showMagnifierAtHandle(handle: DragHandle) {
@@ -265,22 +317,138 @@ internal class SelectionController(
         pendingLongPress = null
     }
 
+    private fun nativeSelectionActions(): List<NativeSelectionAction> {
+        val count = nativeSelectionActionCount()
+        if (count <= 0) {
+            return emptyList()
+        }
+        val actions = ArrayList<NativeSelectionAction>(count)
+        for (index in 0 until count) {
+            val title = nativeSelectionActionTitle(index)?.trim().orEmpty()
+            if (title.isNotEmpty()) {
+                actions.add(NativeSelectionAction(index, title))
+            }
+        }
+        return actions
+    }
+
+    private fun addMenuItem(menu: Menu, itemId: Int, title: CharSequence): MenuItem {
+        return menu.add(Menu.NONE, itemId, Menu.NONE, title)
+    }
+
+    private fun shareSelectedText(): Boolean {
+        val selectedText = nativeSelectionText() ?: return false
+        val context = surfaceView.context
+        val shareIntent =
+            Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, selectedText)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        return try {
+            context.startActivity(
+                Intent.createChooser(shareIntent, "Share").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+            true
+        } catch (_: ActivityNotFoundException) {
+            false
+        } catch (_: RuntimeException) {
+            false
+        }
+    }
+
+    private fun searchSelectedText(): Boolean {
+        val selectedText = nativeSelectionText() ?: return false
+        val context = surfaceView.context
+        val searchIntent =
+            Intent(Intent.ACTION_WEB_SEARCH).apply {
+                putExtra(SearchManager.QUERY, selectedText)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        return try {
+            context.startActivity(searchIntent)
+            true
+        } catch (_: ActivityNotFoundException) {
+            try {
+                val uri =
+                    Uri.parse("https://www.google.com/search?q=" + Uri.encode(selectedText))
+                context.startActivity(
+                    Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+                true
+            } catch (_: RuntimeException) {
+                false
+            }
+        } catch (_: RuntimeException) {
+            false
+        }
+    }
+
+    private fun rebuildActionModeMenu(menu: Menu) {
+        val actions = nativeSelectionActions()
+        menuActions = actions
+        menu.clear()
+        addMenuItem(menu, MENU_COPY, "Copy")
+            .setIcon(android.R.drawable.ic_menu_edit)
+            .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        addMenuItem(menu, MENU_SHARE, "Share")
+            .setIcon(android.R.drawable.ic_menu_share)
+            .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        addMenuItem(menu, MENU_SEARCH, "Search")
+            .setIcon(android.R.drawable.ic_menu_search)
+            .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        for (action in actions) {
+            addMenuItem(menu, MENU_CUSTOM_ACTION_BASE + action.index, action.title)
+                .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_NEVER)
+        }
+    }
+
     private val actionModeCallback =
         object : ActionMode.Callback2() {
             override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
-                menu.add(Menu.NONE, android.R.id.copy, Menu.NONE, android.R.string.copy)
-                    .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+                rebuildActionModeMenu(menu)
                 return true
             }
 
-            override fun onPrepareActionMode(mode: ActionMode, menu: Menu): Boolean = false
+            override fun onPrepareActionMode(mode: ActionMode, menu: Menu): Boolean {
+                rebuildActionModeMenu(menu)
+                return true
+            }
 
             override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
-                if (item.itemId != android.R.id.copy) return false
-                if (nativeSelectionCopy()) {
-                    dismiss(clearGpui = true)
+                when (item.itemId) {
+                    MENU_COPY -> {
+                        if (nativeSelectionCopy()) {
+                            dismiss(clearGpui = true)
+                        }
+                        return true
+                    }
+
+                    MENU_SHARE -> {
+                        if (shareSelectedText()) {
+                            dismiss(clearGpui = true)
+                        }
+                        return true
+                    }
+
+                    MENU_SEARCH -> {
+                        if (searchSelectedText()) {
+                            dismiss(clearGpui = true)
+                        }
+                        return true
+                    }
+
                 }
-                return true
+
+                if (item.itemId >= MENU_CUSTOM_ACTION_BASE) {
+                    val actionIndex = item.itemId - MENU_CUSTOM_ACTION_BASE
+                    if (nativeSelectionPerformAction(actionIndex)) {
+                        dismiss(clearGpui = true)
+                    }
+                    return true
+                }
+
+                return false
             }
 
             override fun onDestroyActionMode(mode: ActionMode) {
@@ -302,6 +470,8 @@ internal class SelectionController(
         internal const val GEOMETRY_TAG = "ZEDRA_SELECTION_GEOMETRY"
         // Loupe disabled until the canvas/overlay share one surface (TextureView).
         private const val LOUPE_ENABLED = false
+        // UTF-16 units fetched on each side of the hit index for word lookup.
+        private const val WORD_WINDOW = 96
         private var activeController: WeakReference<SelectionController>? = null
 
         @JvmStatic
@@ -318,18 +488,28 @@ internal class SelectionController(
             }
         }
 
-        @JvmStatic private external fun nativeSelectionStartAt(x: Float, y: Float): Boolean
+        @JvmStatic private external fun nativeSelectionStartAt(x: Float, y: Float): Int
 
         @JvmStatic private external fun nativeSelectionNearestIndexAt(x: Float, y: Float): Int
 
-        @JvmStatic
-        private external fun nativeSelectionSetRange(start: Int, end: Int, movingStart: Boolean): Boolean
+        @JvmStatic private external fun nativeSelectionSetRange(start: Int, end: Int): Boolean
+
+        @JvmStatic private external fun nativeSelectionTextForRange(start: Int, end: Int): String?
 
         @JvmStatic private external fun nativeSelectionSnapshot(): DoubleArray?
 
         @JvmStatic private external fun nativeSelectionCopy(): Boolean
+        @JvmStatic private external fun nativeSelectionText(): String?
+        @JvmStatic private external fun nativeSelectionActionCount(): Int
+        @JvmStatic private external fun nativeSelectionActionTitle(index: Int): String?
+        @JvmStatic private external fun nativeSelectionPerformAction(index: Int): Boolean
 
         @JvmStatic private external fun nativeSelectionClear()
+
+        private const val MENU_COPY = 1
+        private const val MENU_SHARE = 2
+        private const val MENU_SEARCH = 3
+        private const val MENU_CUSTOM_ACTION_BASE = 1000
     }
 }
 
