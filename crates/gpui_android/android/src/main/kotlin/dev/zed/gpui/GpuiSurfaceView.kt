@@ -11,6 +11,7 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.VelocityTracker
+import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
@@ -30,9 +31,12 @@ class GpuiSurfaceView
         context: Context,
         attrs: AttributeSet? = null,
         defStyleAttr: Int = 0,
-    ) : SurfaceView(context, attrs, defStyleAttr), SurfaceHolder.Callback {
+    ) : SurfaceView(context, attrs, defStyleAttr), SurfaceHolder.Callback, SelectionHost {
         companion object {
             private const val TAG = "GpuiSurfaceView"
+
+            // Root/primary GPUI window handle. Matches Rust `ROOT_WINDOW_HANDLE`.
+            private const val ROOT_WINDOW_HANDLE = 0L
 
             private const val ACTION_DOWN = 0
             private const val ACTION_UP = 1
@@ -93,7 +97,10 @@ class GpuiSurfaceView
         private var keyboardAccessoryHeight = 0
         internal var selectionController: SelectionController? = null
 
-        internal fun cancelGpuiTouchForSelection() {
+        override val selectionView: View get() = this
+        override val selectionWindowHandle: Long = ROOT_WINDOW_HANDLE
+
+        override fun cancelGpuiTouchForSelection() {
             nativeTouchEvent(ACTION_CANCEL, downTimeX, downTimeY, 0)
         }
 

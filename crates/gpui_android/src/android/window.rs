@@ -171,6 +171,10 @@ type AndroidRenderer = super::pipelined_renderer::PipelinedRenderer;
 
 pub struct AndroidWindowState {
     role: AndroidWindowRole,
+    // Opaque, stable per-window id used to route native text selection to the
+    // right GPUI window independent of role (0 = root/primary window). Survives
+    // surface re-creation so a re-shown sheet keeps the same selection target.
+    window_handle: u64,
     raw_window: Option<RawWindow>,
     native_window: Option<NativeWindow>,
     renderer: Option<AndroidRenderer>,
@@ -196,9 +200,16 @@ pub struct AndroidWindowState {
 }
 
 impl AndroidWindowState {
-    pub fn new(role: AndroidWindowRole, bounds: Bounds<Pixels>, scale: f32, active: bool) -> Self {
+    pub fn new(
+        role: AndroidWindowRole,
+        window_handle: u64,
+        bounds: Bounds<Pixels>,
+        scale: f32,
+        active: bool,
+    ) -> Self {
         Self {
             role,
+            window_handle,
             raw_window: None,
             native_window: None,
             renderer: None,
@@ -224,6 +235,10 @@ impl AndroidWindowState {
 
     pub fn role(&self) -> AndroidWindowRole {
         self.role
+    }
+
+    pub fn window_handle(&self) -> u64 {
+        self.window_handle
     }
 
     pub fn set_active(&mut self, active: bool) -> bool {
@@ -533,6 +548,17 @@ impl AndroidWindowState {
             if current.as_ref() == Some(&adjusted) {
                 return false;
             }
+            // Refuse an initial selection that renders nothing (e.g. a long press
+            // landing on a separator/blank line between paragraphs): a phantom with
+            // no visible geometry would leave the document stuck. Only the first
+            // commit can be non-visible — extending an existing (non-empty)
+            // selection always includes visible content — so skip this probe on the
+            // per-drag path. `selected_text_range` reports `0..0` (empty), never
+            // `None`, when there is no selection, so test emptiness, not presence.
+            let extending = current.is_some_and(|range| !range.is_empty());
+            if !extending && handler.rects_for_range(adjusted.clone()).is_empty() {
+                return false;
+            }
             handler.set_selected_text_range(adjusted.clone());
             true
         })
@@ -556,8 +582,34 @@ impl AndroidWindowState {
                     return None;
                 }
                 let rects = handler.rects_for_range(range.clone());
-                let start_bounds = handler.bounds_for_range(range.start..range.start);
-                let end_bounds = handler.bounds_for_range(range.end..range.end);
+                // A non-empty range that produces no rects covers only
+                // non-visible content (a separator/newline, e.g. a long press on
+                // empty space). It has no highlight, so present nothing rather
+                // than a stray handle anchored to a fallback caret.
+                if rects.is_empty() {
+                    return None;
+                }
+                // Anchor the handles to the selection rects, which are always a
+                // single text line tall and share the highlight's geometry.
+                let line_caret = |bounds: Bounds<Pixels>, at_end: bool| {
+                    let x = if at_end {
+                        bounds.origin.x + bounds.size.width
+                    } else {
+                        bounds.origin.x
+                    };
+                    Bounds::new(
+                        gpui::point(x, bounds.origin.y),
+                        gpui::size(gpui::px(0.0), bounds.size.height),
+                    )
+                };
+                let start_bounds = rects
+                    .first()
+                    .map(|rect| line_caret(*rect, false))
+                    .or_else(|| handler.bounds_for_range(range.start..range.start));
+                let end_bounds = rects
+                    .last()
+                    .map(|rect| line_caret(*rect, true))
+                    .or_else(|| handler.bounds_for_range(range.end..range.end));
                 let scaled = |bounds: Bounds<Pixels>| {
                     [
                         (bounds.origin.x.as_f32() * scale) as f64,
@@ -973,11 +1025,12 @@ impl AndroidWindow {
     pub fn new(
         _handle: AnyWindowHandle,
         role: AndroidWindowRole,
+        window_handle: u64,
         bounds: Bounds<Pixels>,
         scale: f32,
         active: bool,
     ) -> Self {
-        let state = AndroidWindowState::new(role, bounds, scale, active);
+        let state = AndroidWindowState::new(role, window_handle, bounds, scale, active);
         Self {
             state: Rc::new(RefCell::new(state)),
             input_handler_registered: Cell::new(false),
@@ -1095,9 +1148,20 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn clear_active_selection(&self) {
-        // GPUI cleared its own selection state (e.g. on focus/blur); mirror that
-        // by dropping the native presentation without re-clearing the handler.
-        self.state.borrow_mut().clear_active_selection(false);
+        // GPUI cleared its own selection state; mirror that by dropping the
+        // native presentation without re-clearing the handler.
+        //
+        // GPUI calls this reentrantly: our selection ops (e.g. `update_active_selection`,
+        // `clear_active_selection`) run a handler closure while the platform holds
+        // the window borrow, and GPUI can clear its selection from inside that
+        // closure and call back here. The outer op already owns a consistent
+        // resulting state, so a failed borrow must be a no-op rather than a panic.
+        // The next per-frame refresh reflects the true state, so nothing is lost.
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return;
+        };
+        state.clear_active_selection(false);
+        drop(state);
         super::app_state::with_platform(|platform| platform.dismiss_selection());
     }
 

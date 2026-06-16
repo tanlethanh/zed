@@ -26,6 +26,10 @@ use super::keyboard::AndroidKeyboardLayout;
 use super::text_system::CosmicTextSystem;
 use super::window::{AndroidWindow, AndroidWindowRole, AndroidWindowState};
 
+/// Selection-routing handle for the root/primary window. Matches the Kotlin
+/// `SelectionHost` constant; non-root windows receive unique non-zero handles.
+pub(crate) const ROOT_WINDOW_HANDLE: u64 = 0;
+
 #[derive(Default)]
 pub(crate) struct PlatformHandlers {
     pub(crate) open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
@@ -79,6 +83,9 @@ pub struct AndroidPlatform {
     main_receiver: RefCell<AndroidQueueReceiver<RunnableVariant>>,
     wgpu_context: GpuContext,
     next_window_role: Cell<AndroidWindowRole>,
+    // Opaque id assigned to the next opened window for selection routing; 0 is
+    // the root/primary window. See `AndroidWindowState::window_handle`.
+    next_window_handle: Cell<u64>,
     windows: RefCell<Vec<RcWeak<RefCell<AndroidWindowState>>>>,
     pending_root_native_window: RefCell<Option<ndk::native_window::NativeWindow>>,
     pending_sheet_native_window: RefCell<Option<ndk::native_window::NativeWindow>>,
@@ -111,6 +118,7 @@ impl AndroidPlatform {
             main_receiver: RefCell::new(main_receiver),
             wgpu_context: Rc::new(RefCell::new(None)),
             next_window_role: Cell::new(AndroidWindowRole::Root),
+            next_window_handle: Cell::new(ROOT_WINDOW_HANDLE),
             windows: RefCell::new(Vec::new()),
             pending_root_native_window: RefCell::new(None),
             pending_sheet_native_window: RefCell::new(None),
@@ -155,6 +163,21 @@ impl AndroidPlatform {
 
     pub fn prepare_embedded_window(&self) {
         self.next_window_role.set(AndroidWindowRole::EmbeddedSheet);
+    }
+
+    /// Assign the selection-routing handle the next opened window will carry.
+    /// Reset to the root handle after each open.
+    pub fn prepare_window(&self, window_handle: u64) {
+        self.next_window_handle.set(window_handle);
+    }
+
+    /// Selection-routing handle of the current embedded sheet window, if any.
+    /// The sheet surface fetches this so its selection targets the right window
+    /// even after the sheet's native surface is re-created.
+    pub fn sheet_window_handle(&self) -> u64 {
+        self.window_for_role(AndroidWindowRole::EmbeddedSheet)
+            .map(|window| window.borrow().window_handle())
+            .unwrap_or(ROOT_WINDOW_HANDLE)
     }
 
     pub fn set_app_active(&self, active: bool) {
@@ -240,6 +263,24 @@ impl AndroidPlatform {
             .rev()
             .filter_map(|window| window.upgrade())
             .find(|window| window.borrow().role() == role)
+    }
+
+    // Resolve the selection target by opaque handle (0 = root). Selection is the
+    // one input modality keyed by handle rather than role, so it generalizes to
+    // any GPUI window without enumerating window kinds.
+    fn window_for_handle(&self, window_handle: u64) -> Option<Rc<RefCell<AndroidWindowState>>> {
+        // The root handle is reserved for the root/primary window; resolve it by
+        // role so an embedded window that was opened without `prepare_window`
+        // (and therefore defaulted to handle 0) can never shadow root routing.
+        if window_handle == ROOT_WINDOW_HANDLE {
+            return self.window_for_role(AndroidWindowRole::Root);
+        }
+        self.windows
+            .borrow()
+            .iter()
+            .rev()
+            .filter_map(|window| window.upgrade())
+            .find(|window| window.borrow().window_handle() == window_handle)
     }
 
     fn store_pending_native_window(
@@ -525,34 +566,39 @@ impl AndroidPlatform {
             .is_some_and(|window| window.borrow_mut().has_active_keyboard_accessory())
     }
 
-    pub fn start_selection_at(&self, x: f32, y: f32) -> Option<usize> {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn start_selection_at(&self, window_handle: u64, x: f32, y: f32) -> Option<usize> {
+        self.window_for_handle(window_handle)
             .and_then(|window| window.borrow_mut().start_selection_at(x, y))
     }
 
-    pub fn nearest_selection_index(&self, x: f32, y: f32) -> Option<usize> {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn nearest_selection_index(&self, window_handle: u64, x: f32, y: f32) -> Option<usize> {
+        self.window_for_handle(window_handle)
             .and_then(|window| window.borrow_mut().nearest_selection_index(x, y))
     }
 
-    pub fn selection_text_for_range(&self, start: usize, end: usize) -> Option<String> {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn selection_text_for_range(
+        &self,
+        window_handle: u64,
+        start: usize,
+        end: usize,
+    ) -> Option<String> {
+        self.window_for_handle(window_handle)
             .and_then(|window| window.borrow_mut().selection_text_for_range(start, end))
     }
 
-    pub fn update_active_selection(&self, start: usize, end: usize) -> bool {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn update_active_selection(&self, window_handle: u64, start: usize, end: usize) -> bool {
+        self.window_for_handle(window_handle)
             .is_some_and(|window| window.borrow_mut().update_active_selection(start, end))
     }
 
-    pub fn active_selection_snapshot(&self) -> Option<Vec<f64>> {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn active_selection_snapshot(&self, window_handle: u64) -> Option<Vec<f64>> {
+        self.window_for_handle(window_handle)
             .and_then(|window| window.borrow_mut().active_selection_snapshot())
     }
 
-    pub fn copy_active_selection(&self) -> bool {
+    pub fn copy_active_selection(&self, window_handle: u64) -> bool {
         let Some(text) = self
-            .window_for_role(AndroidWindowRole::Root)
+            .window_for_handle(window_handle)
             .and_then(|window| window.borrow_mut().selected_text())
         else {
             return false;
@@ -561,29 +607,33 @@ impl AndroidPlatform {
         true
     }
 
-    pub fn selected_text(&self) -> Option<String> {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn selected_text(&self, window_handle: u64) -> Option<String> {
+        self.window_for_handle(window_handle)
             .and_then(|window| window.borrow_mut().selected_text())
     }
 
-    pub fn selection_action_count(&self) -> usize {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn selection_action_count(&self, window_handle: u64) -> usize {
+        self.window_for_handle(window_handle)
             .map(|window| window.borrow_mut().selection_action_count())
             .unwrap_or(0)
     }
 
-    pub fn selection_action_title(&self, action_index: usize) -> Option<String> {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn selection_action_title(
+        &self,
+        window_handle: u64,
+        action_index: usize,
+    ) -> Option<String> {
+        self.window_for_handle(window_handle)
             .and_then(|window| window.borrow_mut().selection_action_title(action_index))
     }
 
-    pub fn perform_selection_action(&self, action_index: usize) -> bool {
-        self.window_for_role(AndroidWindowRole::Root)
+    pub fn perform_selection_action(&self, window_handle: u64, action_index: usize) -> bool {
+        self.window_for_handle(window_handle)
             .is_some_and(|window| window.borrow_mut().perform_selection_action(action_index))
     }
 
-    pub fn clear_active_selection(&self) {
-        if let Some(window) = self.window_for_role(AndroidWindowRole::Root) {
+    pub fn clear_active_selection(&self, window_handle: u64) {
+        if let Some(window) = self.window_for_handle(window_handle) {
             window.borrow_mut().clear_active_selection(true);
         }
     }
@@ -743,8 +793,16 @@ impl Platform for AndroidPlatform {
     ) -> Result<Box<dyn PlatformWindow>> {
         let scale = self.display_scale.get();
         let role = self.next_window_role.replace(AndroidWindowRole::Root);
+        let window_handle = self.next_window_handle.replace(ROOT_WINDOW_HANDLE);
 
-        let window = AndroidWindow::new(handle, role, options.bounds, scale, self.app_active.get());
+        let window = AndroidWindow::new(
+            handle,
+            role,
+            window_handle,
+            options.bounds,
+            scale,
+            self.app_active.get(),
+        );
 
         if let Some(native_window) = self.take_pending_native_window(role) {
             // GPUI draws once before `open_window` returns. Android must bind

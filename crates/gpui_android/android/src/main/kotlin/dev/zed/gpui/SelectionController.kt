@@ -26,23 +26,55 @@ import java.text.BreakIterator
 import java.lang.ref.WeakReference
 import kotlin.math.hypot
 
+/**
+ * Surface that a [SelectionController] presents native selection on top of.
+ *
+ * Implemented by both the framework root surface ([GpuiSurfaceView]) and the
+ * app's embedded-sheet surface so each drives selection against its own GPUI
+ * window via [selectionWindowHandle].
+ */
+interface SelectionHost {
+    /** The GPUI surface view rendering the selectable content. */
+    val selectionView: View
+
+    /**
+     * Opaque handle of the GPUI window this surface renders (`0` = root). The
+     * selection bridge routes every call by this handle, so selection works for
+     * any GPUI surface without enumerating window kinds. Read lazily at
+     * selection start, since a surface may not have its window yet at attach.
+     */
+    val selectionWindowHandle: Long
+
+    /** Cancel the in-flight GPUI touch when a long press promotes to selection. */
+    fun cancelGpuiTouchForSelection()
+}
+
 /** Presents Android-native text selection for GPUI selection handlers. */
-internal class SelectionController(
+class SelectionController(
     private val rootView: FrameLayout,
-    private val surfaceView: GpuiSurfaceView,
+    private val host: SelectionHost,
 ) {
     private data class NativeSelectionAction(
         val index: Int,
         val title: String,
     )
 
+    private val view: View = host.selectionView
+    // Window handle of the live selection, pinned at long-press start so a drag
+    // never switches windows even if the host's reported handle changes.
+    private var activeHandle: Long = 0
+    // Whether this controller currently owns a committed selection on
+    // [activeHandle]. Guards GPUI clears so a controller that never selected
+    // (e.g. a sheet dismissed without selecting) can't clear another window's
+    // selection via the default handle.
+    private var hasSelection = false
     private val handler = Handler(Looper.getMainLooper())
-    private val touchSlop = ViewConfiguration.get(surfaceView.context).scaledTouchSlop.toFloat()
+    private val touchSlop = ViewConfiguration.get(view.context).scaledTouchSlop.toFloat()
     private val longPressTimeout = ViewConfiguration.getLongPressTimeout().toLong()
-    private val density = surfaceView.resources.displayMetrics.density
+    private val density = view.resources.displayMetrics.density
     private val handleRadius = 10f * density
     private val handleTouchRadius = maxOf(handleRadius * 1.8f, 24f * density)
-    private val overlay = SelectionOverlayView(surfaceView, this)
+    private val overlay = SelectionOverlayView(view, this)
     private var pendingLongPress: Runnable? = null
     private var downX = 0f
     private var downY = 0f
@@ -62,7 +94,7 @@ internal class SelectionController(
     // LOUPE_ENABLED to restore. See docs/GPUI_ANDROID_TEXT_SELECTION.md.
     private val magnifier =
         if (LOUPE_ENABLED && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            Magnifier(surfaceView)
+            Magnifier(view)
         } else {
             null
         }
@@ -75,7 +107,6 @@ internal class SelectionController(
                 FrameLayout.LayoutParams.MATCH_PARENT,
             ),
         )
-        activeController = WeakReference(this)
     }
 
     fun onSurfaceTouch(event: MotionEvent): Boolean {
@@ -115,14 +146,29 @@ internal class SelectionController(
     }
 
     private fun startSelectionFromLongPress(x: Float, y: Float) {
-        val index = nativeSelectionStartAt(x, y)
+        // Resolve the host's window handle once, at the start of the interaction.
+        activeHandle = host.selectionWindowHandle
+        val index = nativeSelectionStartAt(activeHandle, x, y)
         if (index < 0) return
         // Granularity is owned here, not in GPUI: expand the hit index to its word
         // (BreakIterator), falling back to a single character on whitespace.
         val word = wordBoundsAt(index) ?: (index to index + 1)
-        if (!nativeSelectionSetRange(word.first, word.second)) return
+        if (!nativeSelectionSetRange(activeHandle, word.first, word.second)) {
+            // The press resolved to nothing selectable (e.g. a separator/blank line
+            // GPUI refused to select). `start_selection_at` already latched the
+            // active source, so clear it; otherwise the per-frame refresh would
+            // spin on an empty selection and block the next long press.
+            nativeSelectionClear(activeHandle)
+            return
+        }
         longPressActive = true
-        surfaceView.cancelGpuiTouchForSelection()
+        hasSelection = true
+        // Claim the global active slot, dismissing any other surface's selection
+        // first so a stale overlay/action mode can't linger on another window and
+        // so refresh/dismiss callbacks aren't split across two live selections.
+        activeController?.get()?.takeIf { it !== this }?.dismiss(clearGpui = true)
+        activeController = WeakReference(this)
+        host.cancelGpuiTouchForSelection()
         refresh()
         snapshot?.let {
             longPressAnchorStart = it.start
@@ -135,16 +181,16 @@ internal class SelectionController(
         val anchorEnd = longPressAnchorEnd
         if (anchorStart < 0 || anchorEnd < 0) return
         val current = snapshot ?: return
-        val index = nativeSelectionNearestIndexAt(x, y)
+        val index = nativeSelectionNearestIndexAt(activeHandle, x, y)
         if (index < 0) return
         // Keep the long-pressed word selected and grow toward the finger, snapping
         // the moving edge to words while expanding (character while contracting).
         val changed =
             when {
                 index >= anchorEnd ->
-                    nativeSelectionSetRange(anchorStart, snapEndpoint(index, current.end, false))
+                    nativeSelectionSetRange(activeHandle, anchorStart, snapEndpoint(index, current.end, false))
                 index <= anchorStart ->
-                    nativeSelectionSetRange(snapEndpoint(index, current.start, true), anchorEnd)
+                    nativeSelectionSetRange(activeHandle, snapEndpoint(index, current.start, true), anchorEnd)
                 else -> false
             }
         if (changed) {
@@ -154,15 +200,18 @@ internal class SelectionController(
     }
 
     fun refresh() {
-        val next = nativeSelectionSnapshot()?.let(SelectionSnapshot::fromNative)
+        val next = nativeSelectionSnapshot(activeHandle)?.let(SelectionSnapshot::fromNative)
         if (next == null) {
+            // No presentable selection; hide the native UI but leave GPUI's state
+            // alone (refresh is a pure presenter, not a dismiss). Non-visible
+            // selections are refused at commit, so this is just defensive.
             dismiss(clearGpui = false)
             return
         }
         snapshot = next
         overlay.show(next)
         if (actionMode == null) {
-            actionMode = surfaceView.startActionMode(actionModeCallback, ActionMode.TYPE_FLOATING)
+            actionMode = view.startActionMode(actionModeCallback, ActionMode.TYPE_FLOATING)
         } else {
             val nextActions = nativeSelectionActions()
             if (nextActions != menuActions) {
@@ -184,9 +233,13 @@ internal class SelectionController(
         overlay.hide()
         actionMode?.finish()
         actionMode = null
-        if (clearGpui) {
-            nativeSelectionClear()
+        // Only clear GPUI when this controller actually owns a selection on
+        // `activeHandle`; otherwise a never-selected controller (default handle)
+        // would clear an unrelated window's selection.
+        if (clearGpui && hasSelection) {
+            nativeSelectionClear(activeHandle)
         }
+        hasSelection = false
     }
 
     fun destroy() {
@@ -199,7 +252,7 @@ internal class SelectionController(
         }
     }
 
-    fun beginHandleDrag(x: Float, y: Float): DragHandle? {
+    internal fun beginHandleDrag(x: Float, y: Float): DragHandle? {
         val current = snapshot ?: return null
         // Hit-test the whole handle glyph as a vertical capsule (text line down
         // through the drawn circle), not just the circle center, so taps along
@@ -242,18 +295,18 @@ internal class SelectionController(
         return hypot(x - edgeX, dy)
     }
 
-    fun dragHandle(handle: DragHandle, x: Float, y: Float) {
+    internal fun dragHandle(handle: DragHandle, x: Float, y: Float) {
         val effectiveX = x + dragOffsetX
         val effectiveY = y + dragOffsetY
-        val index = nativeSelectionNearestIndexAt(effectiveX, effectiveY)
+        val index = nativeSelectionNearestIndexAt(activeHandle, effectiveX, effectiveY)
         val current = snapshot
         if (index >= 0 && current != null) {
             val changed =
                 when (handle) {
                     DragHandle.Start ->
-                        nativeSelectionSetRange(snapEndpoint(index, current.start, true), current.end)
+                        nativeSelectionSetRange(activeHandle, snapEndpoint(index, current.start, true), current.end)
                     DragHandle.End ->
-                        nativeSelectionSetRange(current.start, snapEndpoint(index, current.end, false))
+                        nativeSelectionSetRange(activeHandle, current.start, snapEndpoint(index, current.end, false))
                 }
             if (changed) refresh()
         }
@@ -279,7 +332,7 @@ internal class SelectionController(
     // the index through the neutral text bridge and runs BreakIterator over it.
     private fun wordBoundsAt(index: Int): Pair<Int, Int>? {
         val windowStart = maxOf(0, index - WORD_WINDOW)
-        val text = nativeSelectionTextForRange(windowStart, index + WORD_WINDOW) ?: return null
+        val text = nativeSelectionTextForRange(activeHandle, windowStart, index + WORD_WINDOW) ?: return null
         if (text.isEmpty()) return null
         val rel = (index - windowStart).coerceIn(0, text.length - 1)
         val iterator = BreakIterator.getWordInstance()
@@ -310,13 +363,13 @@ internal class SelectionController(
     }
 
     private fun nativeSelectionActions(): List<NativeSelectionAction> {
-        val count = nativeSelectionActionCount()
+        val count = nativeSelectionActionCount(activeHandle)
         if (count <= 0) {
             return emptyList()
         }
         val actions = ArrayList<NativeSelectionAction>(count)
         for (index in 0 until count) {
-            val title = nativeSelectionActionTitle(index)?.trim().orEmpty()
+            val title = nativeSelectionActionTitle(activeHandle, index)?.trim().orEmpty()
             if (title.isNotEmpty()) {
                 actions.add(NativeSelectionAction(index, title))
             }
@@ -329,8 +382,8 @@ internal class SelectionController(
     }
 
     private fun shareSelectedText(): Boolean {
-        val selectedText = nativeSelectionText() ?: return false
-        val context = surfaceView.context
+        val selectedText = nativeSelectionText(activeHandle) ?: return false
+        val context = view.context
         val shareIntent =
             Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
@@ -350,8 +403,8 @@ internal class SelectionController(
     }
 
     private fun searchSelectedText(): Boolean {
-        val selectedText = nativeSelectionText() ?: return false
-        val context = surfaceView.context
+        val selectedText = nativeSelectionText(activeHandle) ?: return false
+        val context = view.context
         val searchIntent =
             Intent(Intent.ACTION_WEB_SEARCH).apply {
                 putExtra(SearchManager.QUERY, selectedText)
@@ -410,7 +463,7 @@ internal class SelectionController(
             override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
                 when (item.itemId) {
                     MENU_COPY -> {
-                        if (nativeSelectionCopy()) {
+                        if (nativeSelectionCopy(activeHandle)) {
                             dismiss(clearGpui = true)
                         }
                         return true
@@ -434,7 +487,7 @@ internal class SelectionController(
 
                 if (item.itemId >= MENU_CUSTOM_ACTION_BASE) {
                     val actionIndex = item.itemId - MENU_CUSTOM_ACTION_BASE
-                    if (nativeSelectionPerformAction(actionIndex)) {
+                    if (nativeSelectionPerformAction(activeHandle, actionIndex)) {
                         dismiss(clearGpui = true)
                     }
                     return true
@@ -467,35 +520,37 @@ internal class SelectionController(
 
         @JvmStatic
         fun refreshActiveSelection() {
-            activeController?.get()?.surfaceView?.post {
+            activeController?.get()?.view?.post {
                 activeController?.get()?.refresh()
             }
         }
 
         @JvmStatic
         fun dismissActiveSelection() {
-            activeController?.get()?.surfaceView?.post {
+            activeController?.get()?.view?.post {
                 activeController?.get()?.dismiss(clearGpui = false)
             }
         }
 
-        @JvmStatic private external fun nativeSelectionStartAt(x: Float, y: Float): Int
+        // Each call carries the host surface's opaque window handle so selection
+        // resolves against the right GPUI window (0 = root).
+        @JvmStatic private external fun nativeSelectionStartAt(windowHandle: Long, x: Float, y: Float): Int
 
-        @JvmStatic private external fun nativeSelectionNearestIndexAt(x: Float, y: Float): Int
+        @JvmStatic private external fun nativeSelectionNearestIndexAt(windowHandle: Long, x: Float, y: Float): Int
 
-        @JvmStatic private external fun nativeSelectionSetRange(start: Int, end: Int): Boolean
+        @JvmStatic private external fun nativeSelectionSetRange(windowHandle: Long, start: Int, end: Int): Boolean
 
-        @JvmStatic private external fun nativeSelectionTextForRange(start: Int, end: Int): String?
+        @JvmStatic private external fun nativeSelectionTextForRange(windowHandle: Long, start: Int, end: Int): String?
 
-        @JvmStatic private external fun nativeSelectionSnapshot(): DoubleArray?
+        @JvmStatic private external fun nativeSelectionSnapshot(windowHandle: Long): DoubleArray?
 
-        @JvmStatic private external fun nativeSelectionCopy(): Boolean
-        @JvmStatic private external fun nativeSelectionText(): String?
-        @JvmStatic private external fun nativeSelectionActionCount(): Int
-        @JvmStatic private external fun nativeSelectionActionTitle(index: Int): String?
-        @JvmStatic private external fun nativeSelectionPerformAction(index: Int): Boolean
+        @JvmStatic private external fun nativeSelectionCopy(windowHandle: Long): Boolean
+        @JvmStatic private external fun nativeSelectionText(windowHandle: Long): String?
+        @JvmStatic private external fun nativeSelectionActionCount(windowHandle: Long): Int
+        @JvmStatic private external fun nativeSelectionActionTitle(windowHandle: Long, index: Int): String?
+        @JvmStatic private external fun nativeSelectionPerformAction(windowHandle: Long, index: Int): Boolean
 
-        @JvmStatic private external fun nativeSelectionClear()
+        @JvmStatic private external fun nativeSelectionClear(windowHandle: Long)
 
         private const val MENU_COPY = 1
         private const val MENU_SHARE = 2
@@ -592,12 +647,19 @@ private class SelectionOverlayView(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 dragging = controller.beginHandleDrag(surfaceX, surfaceY)
-                if (dragging == null) {
+                if (dragging != null) {
+                    // Own the whole drag: stop ancestors (e.g. a bottom sheet's
+                    // CoordinatorLayout) from intercepting it as a sheet drag.
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                } else {
                     controller.dismiss(clearGpui = true)
                 }
             }
             MotionEvent.ACTION_MOVE -> dragging?.let { controller.dragHandle(it, surfaceX, surfaceY) }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (dragging != null) {
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                }
                 dragging = null
                 controller.endHandleDrag()
             }
