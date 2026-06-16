@@ -13,7 +13,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.util.TypedValue
 import android.view.ActionMode
 import android.view.Menu
@@ -51,7 +50,6 @@ internal class SelectionController(
     private var snapshot: SelectionSnapshot? = null
     private var actionMode: ActionMode? = null
     private var menuActions: List<NativeSelectionAction> = emptyList()
-    private var lastLoggedSnapshot: SelectionSnapshot? = null
     private var dragOffsetX = 0f
     private var dragOffsetY = 0f
     // The word selected by the long press; the same-gesture drag grows from it.
@@ -118,7 +116,6 @@ internal class SelectionController(
 
     private fun startSelectionFromLongPress(x: Float, y: Float) {
         val index = nativeSelectionStartAt(x, y)
-        Log.i(GEOMETRY_TAG, "long_press surface=($x,$y) index=$index")
         if (index < 0) return
         // Granularity is owned here, not in GPUI: expand the hit index to its word
         // (BreakIterator), falling back to a single character on whitespace.
@@ -163,10 +160,6 @@ internal class SelectionController(
             return
         }
         snapshot = next
-        if (next != lastLoggedSnapshot) {
-            lastLoggedSnapshot = next
-            Log.i(GEOMETRY_TAG, "snapshot $next")
-        }
         overlay.show(next)
         if (actionMode == null) {
             actionMode = surfaceView.startActionMode(actionModeCallback, ActionMode.TYPE_FLOATING)
@@ -187,7 +180,6 @@ internal class SelectionController(
         longPressAnchorEnd = -1
         snapshot = null
         menuActions = emptyList()
-        lastLoggedSnapshot = null
         magnifier?.dismiss()
         overlay.hide()
         actionMode?.finish()
@@ -467,7 +459,6 @@ internal class SelectionController(
     }
 
     companion object {
-        internal const val GEOMETRY_TAG = "ZEDRA_SELECTION_GEOMETRY"
         // Loupe disabled until the canvas/overlay share one surface (TextureView).
         private const val LOUPE_ENABLED = false
         // UTF-16 units fetched on each side of the hit index for word lookup.
@@ -562,7 +553,6 @@ private class SelectionOverlayView(
     private var snapshot: SelectionSnapshot? = null
     private var dragging: SelectionController.DragHandle? = null
     private var coordinateSpace = SelectionOverlayCoordinateSpace()
-    private var lastLoggedGeometry: Pair<SelectionSnapshot, SelectionOverlayCoordinateSpace>? = null
 
     init {
         visibility = GONE
@@ -574,14 +564,6 @@ private class SelectionOverlayView(
     fun show(snapshot: SelectionSnapshot) {
         this.snapshot = snapshot
         coordinateSpace = SelectionOverlayCoordinateSpace.between(this, surfaceView)
-        val geometry = snapshot to coordinateSpace
-        if (geometry != lastLoggedGeometry) {
-            lastLoggedGeometry = geometry
-            Log.i(
-                SelectionController.GEOMETRY_TAG,
-                "overlay_show overlay=${geometryDescription()} surface=${surfaceView.geometryDescription()} coordinates=$coordinateSpace",
-            )
-        }
         visibility = VISIBLE
         invalidate()
     }
@@ -589,7 +571,6 @@ private class SelectionOverlayView(
     fun hide() {
         dragging = null
         snapshot = null
-        lastLoggedGeometry = null
         visibility = GONE
     }
 
@@ -611,10 +592,6 @@ private class SelectionOverlayView(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 dragging = controller.beginHandleDrag(surfaceX, surfaceY)
-                Log.i(
-                    SelectionController.GEOMETRY_TAG,
-                    "overlay_down surface=($surfaceX,$surfaceY) grabbed=$dragging",
-                )
                 if (dragging == null) {
                     controller.dismiss(clearGpui = true)
                 }
@@ -647,12 +624,6 @@ private class SelectionOverlayView(
         val value = TypedValue()
         return if (context.theme.resolveAttribute(attribute, value, true)) value.data else fallback
     }
-}
-
-private fun View.geometryDescription(): String {
-    val location = IntArray(2)
-    getLocationInWindow(location)
-    return "window=(${location[0]},${location[1]}) local=($left,$top)-($right,$bottom) size=${width}x$height translation=($translationX,$translationY)"
 }
 
 internal data class SelectionOverlayCoordinateSpace(
