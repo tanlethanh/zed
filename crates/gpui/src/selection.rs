@@ -5,6 +5,7 @@ use crate::{
 };
 use smallvec::SmallVec;
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Wrap a subtree in a logical text-selection boundary.
 ///
@@ -605,6 +606,11 @@ impl SelectionDocument {
         text
     }
 
+    fn word_range_at(&self, offset_utf16: usize) -> Option<Range<usize>> {
+        let text = self.serialize_text();
+        word_range_at_utf16(&text, offset_utf16)
+    }
+
     fn character_index_for_point(&self, point: Point<Pixels>, window: &Window) -> Option<usize> {
         if self.bounds.is_some_and(|bounds| !bounds.contains(&point)) {
             return None;
@@ -908,6 +914,17 @@ impl InputHandler for WindowSelectionHandler {
         window.selection_state = SelectionState::default();
     }
 
+    fn initial_native_selection_range(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Range<usize>> {
+        let document = SelectionDocument::active(window)?;
+        let range = document.clamped_range(range);
+        document.word_range_at(range.start).or(Some(range))
+    }
+
     fn selection_actions(
         &mut self,
         window: &mut Window,
@@ -928,6 +945,15 @@ impl InputHandler for WindowSelectionHandler {
 
 fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
+}
+
+fn word_range_at_utf16(text: &str, offset_utf16: usize) -> Option<Range<usize>> {
+    let offset_byte = utf16_offset_to_byte(text, offset_utf16);
+    text.unicode_word_indices()
+        .find(|(start, word)| *start <= offset_byte && offset_byte < start + word.len())
+        .map(|(start, word)| {
+            byte_offset_to_utf16(text, start)..byte_offset_to_utf16(text, start + word.len())
+        })
 }
 
 fn selection_area_is_occluded_at_point(
@@ -1169,7 +1195,7 @@ impl IntoElement for SelectionAreaElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectionAreaKey, SelectionDocument, SelectionState};
+    use super::{SelectionAreaKey, SelectionDocument, SelectionState, word_range_at_utf16};
     use crate::EntityId;
     use crate::{
         self as gpui, AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement,
@@ -1183,6 +1209,29 @@ mod tests {
     };
 
     struct SelectionTestView;
+
+    #[test]
+    fn initial_native_selection_expands_to_surrounding_word() {
+        let text = "If a task needs more detail";
+
+        assert_eq!(word_range_at_utf16(text, 11), Some(10..15));
+        assert_eq!(&text[10..15], "needs");
+    }
+
+    #[test]
+    fn initial_native_selection_preserves_non_word_characters() {
+        let text = "needs, details";
+
+        assert_eq!(word_range_at_utf16(text, 5), None);
+        assert_eq!(word_range_at_utf16(text, 6), None);
+    }
+
+    #[test]
+    fn initial_native_selection_uses_utf16_offsets() {
+        let text = "😀 needs";
+
+        assert_eq!(word_range_at_utf16(text, 4), Some(3..8));
+    }
 
     impl Render for SelectionTestView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {

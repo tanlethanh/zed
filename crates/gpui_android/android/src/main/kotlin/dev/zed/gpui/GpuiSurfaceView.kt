@@ -6,14 +6,11 @@ import android.os.Build
 import android.text.InputType
 import android.util.AttributeSet
 import android.util.Log
-import android.view.GestureDetector
-import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.VelocityTracker
-import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
@@ -82,8 +79,6 @@ class GpuiSurfaceView
                 velocityY: Float,
             )
 
-            @JvmStatic private external fun nativeLongPressEvent(x: Float, y: Float)
-
             @JvmStatic private external fun nativeKeyboardHeightChanged(height: Int)
 
             @JvmStatic private external fun nativeSystemInsetsChanged(
@@ -96,17 +91,14 @@ class GpuiSurfaceView
         private var keyboardRequested = false
         private var imeHeight = 0
         private var keyboardAccessoryHeight = 0
+        internal var selectionController: SelectionController? = null
 
-        private val gestureDetector =
-            GestureDetector(
-                context,
-                object : GestureDetector.SimpleOnGestureListener() {
-                    override fun onLongPress(e: MotionEvent) {
-                        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                        nativeLongPressEvent(e.x, e.y)
-                    }
-                },
-            )
+        internal fun cancelGpuiTouchForSelection() {
+            nativeTouchEvent(ACTION_CANCEL, downTimeX, downTimeY, 0)
+        }
+
+        private var downTimeX = 0f
+        private var downTimeY = 0f
 
         init {
             holder.addCallback(this)
@@ -178,42 +170,16 @@ class GpuiSurfaceView
             outAttrs.inputType = InputType.TYPE_CLASS_TEXT
             outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_NONE
 
-            return object : BaseInputConnection(this, false) {
-                override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                    nativeImeSetComposingText(text?.toString().orEmpty(), newCursorPosition)
-                    return true
-                }
-
-                override fun finishComposingText(): Boolean {
-                    nativeImeFinishComposingText()
-                    return true
-                }
-
-                override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                    val s = text?.toString().orEmpty()
-                    if (s.isNotEmpty()) {
-                        nativeImeInput(s)
-                    }
-                    return true
-                }
-
-                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                    repeat(beforeLength.coerceAtLeast(0)) {
-                        nativeKeyEvent(KEY_ACTION_DOWN, KeyEvent.KEYCODE_DEL, 0)
-                    }
-                    return true
-                }
-
-                override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
-                    deleteSurroundingText(beforeLength, afterLength)
-
-                override fun sendKeyEvent(event: KeyEvent): Boolean {
-                    if (event.action == KeyEvent.ACTION_DOWN) {
-                        nativeKeyEvent(KEY_ACTION_DOWN, event.keyCode, event.unicodeChar)
-                    }
-                    return true
-                }
-            }
+            return InputMethodAdapter(
+                targetView = this,
+                commitTextToGpui = ::nativeImeInput,
+                setComposingTextInGpui = ::nativeImeSetComposingText,
+                finishComposingTextInGpui = ::nativeImeFinishComposingText,
+                deleteBackwardInGpui = { nativeKeyEvent(KEY_ACTION_DOWN, KeyEvent.KEYCODE_DEL, 0) },
+                sendKeyEventToGpui = { event ->
+                    nativeKeyEvent(KEY_ACTION_DOWN, event.keyCode, event.unicodeChar)
+                },
+            )
         }
 
         // ----- Surface lifecycle -----
@@ -235,16 +201,21 @@ class GpuiSurfaceView
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             Log.d(TAG, "surfaceDestroyed")
+            selectionController?.dismiss(clearGpui = true)
             nativeSurfaceDestroyed()
         }
 
         // ----- Input -----
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
-            gestureDetector.onTouchEvent(event)
+            if (selectionController?.onSurfaceTouch(event) == true) {
+                return true
+            }
             val action =
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
+                        downTimeX = event.x
+                        downTimeY = event.y
                         velocityTracker?.recycle()
                         velocityTracker = VelocityTracker.obtain().also { it.addMovement(event) }
                         ACTION_DOWN

@@ -1233,7 +1233,6 @@ impl InputLatencyTracker {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DrawPhase {
     None,
@@ -2744,7 +2743,6 @@ impl Window {
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
-
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -2795,7 +2793,6 @@ impl Window {
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
-
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
@@ -2827,7 +2824,6 @@ impl Window {
                 &self.next_frame.inspector_hitboxes,
             );
         }
-
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
@@ -5275,7 +5271,7 @@ impl Window {
         self.platform_window.is_soft_keyboard_visible()
     }
 
-    /// Returns whether the active platform text input owns a keyboard accessory.
+    /// Returns whether the active input handler owns a platform keyboard accessory.
     pub fn has_active_keyboard_accessory(&self) -> bool {
         self.platform_window.has_active_keyboard_accessory()
     }

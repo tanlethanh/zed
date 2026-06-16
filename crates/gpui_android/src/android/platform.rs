@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
-use jni::{JNIEnv, JavaVM, objects::GlobalRef};
+use jni::{
+    JNIEnv, JavaVM,
+    objects::{GlobalRef, JString},
+};
 
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DispatchEventResult,
@@ -522,6 +525,86 @@ impl AndroidPlatform {
             .is_some_and(|window| window.borrow_mut().has_active_keyboard_accessory())
     }
 
+    pub fn start_selection_at(&self, x: f32, y: f32) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| window.borrow_mut().start_selection_at(x, y))
+    }
+
+    pub fn nearest_selection_index(&self, x: f32, y: f32) -> Option<usize> {
+        self.window_for_role(AndroidWindowRole::Root)
+            .and_then(|window| window.borrow_mut().nearest_selection_index(x, y))
+    }
+
+    pub fn update_active_selection(&self, start: usize, end: usize, moving_start: bool) -> bool {
+        self.window_for_role(AndroidWindowRole::Root)
+            .is_some_and(|window| {
+                window
+                    .borrow_mut()
+                    .update_active_selection(start, end, moving_start)
+            })
+    }
+
+    pub fn active_selection_snapshot(&self) -> Option<Vec<f64>> {
+        self.window_for_role(AndroidWindowRole::Root)
+            .and_then(|window| window.borrow_mut().active_selection_snapshot())
+    }
+
+    pub fn copy_active_selection(&self) -> bool {
+        let Some(text) = self
+            .window_for_role(AndroidWindowRole::Root)
+            .and_then(|window| window.borrow_mut().selected_text())
+        else {
+            return false;
+        };
+        self.set_clipboard_text(&text);
+        true
+    }
+
+    pub fn clear_active_selection(&self) {
+        if let Some(window) = self.window_for_role(AndroidWindowRole::Root) {
+            window.borrow_mut().clear_active_selection(true);
+        }
+    }
+
+    pub fn refresh_selection(&self) {
+        self.call_runtime_controller_static("refresh_selection", "refreshSelection");
+    }
+
+    pub fn dismiss_selection(&self) {
+        self.call_runtime_controller_static("dismiss_selection", "dismissSelection");
+    }
+
+    fn set_clipboard_text(&self, text: &str) {
+        self.with_jni_env("set_clipboard_text", |env| {
+            let class = env.find_class("dev/zed/gpui/GpuiRuntimeController")?;
+            let value = env.new_string(text)?;
+            env.call_static_method(
+                class,
+                "setClipboardText",
+                "(Ljava/lang/String;)V",
+                &[(&value).into()],
+            )?;
+            Ok(())
+        });
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        let mut result = None;
+        self.with_jni_env("get_clipboard_text", |env| {
+            let class = env.find_class("dev/zed/gpui/GpuiRuntimeController")?;
+            let value = env
+                .call_static_method(class, "getClipboardText", "()Ljava/lang/String;", &[])?
+                .l()?;
+            if value.is_null() {
+                return Ok(());
+            }
+            let text: String = env.get_string(&JString::from(value))?.into();
+            result = Some(text);
+            Ok(())
+        });
+        result
+    }
+
     fn load_essential_fonts(text_system: &Arc<dyn PlatformTextSystem>) {
         const ESSENTIAL_FONTS: &[&str] = &[
             "/system/fonts/Roboto-Regular.ttf",
@@ -774,9 +857,15 @@ impl Platform for AndroidPlatform {
         Task::ready(Err(anyhow!("register_url_scheme unimplemented on Android")))
     }
 
-    fn write_to_clipboard(&self, _item: ClipboardItem) {}
+    fn write_to_clipboard(&self, item: ClipboardItem) {
+        if let Some(text) = item.text() {
+            self.set_clipboard_text(&text);
+        }
+    }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        self.clipboard_text()
+            .filter(|text| !text.is_empty())
+            .map(ClipboardItem::new_string)
     }
 }

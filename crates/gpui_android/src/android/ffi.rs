@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jfloat, jint};
+use jni::sys::{jboolean, jdoubleArray, jfloat, jint};
 use ndk::native_window::NativeWindow;
 
 use gpui::{KeyDownEvent, Keystroke, Modifiers, PlatformInput};
@@ -416,6 +416,82 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiSurfaceView_nativeSystemInsetsChang
     SYSTEM_INSET_TOP.store(top.max(0) as u32, Ordering::Relaxed);
     SYSTEM_INSET_BOTTOM.store(bottom.max(0) as u32, Ordering::Relaxed);
     app_state::with_platform(|platform| platform.request_frame_forced());
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionStartAt(
+    _env: JNIEnv,
+    _class: JClass,
+    x: jfloat,
+    y: jfloat,
+) -> jboolean {
+    app_state::with_platform(|platform| platform.start_selection_at(x, y)).unwrap_or(false)
+        as jboolean
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionNearestIndexAt(
+    _env: JNIEnv,
+    _class: JClass,
+    x: jfloat,
+    y: jfloat,
+) -> jint {
+    app_state::with_platform(|platform| platform.nearest_selection_index(x, y))
+        .flatten()
+        .map_or(-1, |index| index as jint)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionSetRange(
+    _env: JNIEnv,
+    _class: JClass,
+    start: jint,
+    end: jint,
+    moving_start: jboolean,
+) -> jboolean {
+    if start < 0 || end < 0 {
+        return false as jboolean;
+    }
+    app_state::with_platform(|platform| {
+        platform.update_active_selection(start as usize, end as usize, moving_start != 0)
+    })
+    .unwrap_or(false) as jboolean
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionSnapshot(
+    env: JNIEnv,
+    _class: JClass,
+) -> jdoubleArray {
+    let Some(snapshot) =
+        app_state::with_platform(|platform| platform.active_selection_snapshot()).flatten()
+    else {
+        return std::ptr::null_mut();
+    };
+    let Ok(array) = env.new_double_array(snapshot.len() as jint) else {
+        return std::ptr::null_mut();
+    };
+    if env.set_double_array_region(&array, 0, &snapshot).is_err() {
+        return std::ptr::null_mut();
+    }
+    array.into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionCopy(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    app_state::with_platform(|platform| platform.copy_active_selection()).unwrap_or(false)
+        as jboolean
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionClear(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    app_state::with_platform(|platform| platform.clear_active_selection());
 }
 
 // ===== Helpers =====

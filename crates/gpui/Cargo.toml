@@ -108,6 +108,7 @@ pin-project = "1.1.10"
 spin = "0.10.0"
 pollster.workspace = true
 url.workspace = true
+unicode-segmentation.workspace = true
 uuid.workspace = true
 web-time.workspace = true
 
@@ -160,7 +161,6 @@ lyon = { version = "1.0", features = ["extra"] }
 proptest = { workspace = true }
 rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
-unicode-segmentation = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }

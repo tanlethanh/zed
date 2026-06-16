@@ -1,6 +1,9 @@
 package dev.zed.gpui
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Build
 import android.util.Log
 import android.view.Choreographer
@@ -64,6 +67,7 @@ class GpuiRuntimeController(private val activity: Activity) {
                 FrameLayout.LayoutParams.MATCH_PARENT,
             ),
         )
+        view.selectionController = SelectionController(rootView, view)
         view.requestFocus()
         surfaceView = view
         activeSurfaceView = WeakReference(view)
@@ -95,6 +99,7 @@ class GpuiRuntimeController(private val activity: Activity) {
 
     fun onDestroy() {
         isRunning = false
+        surfaceView?.selectionController?.destroy()
         if (activeSurfaceView?.get() === surfaceView) {
             activeSurfaceView = null
         }
@@ -129,6 +134,34 @@ class GpuiRuntimeController(private val activity: Activity) {
         fun hideSoftKeyboard() {
             val view = activeSurfaceView?.get() ?: return
             view.post { activeSurfaceView?.get()?.dismissKeyboard() }
+        }
+
+        @JvmStatic
+        fun refreshSelection() {
+            SelectionController.refreshActiveSelection()
+        }
+
+        @JvmStatic
+        fun dismissSelection() {
+            SelectionController.dismissActiveSelection()
+        }
+
+        @JvmStatic
+        fun setClipboardText(text: String) {
+            val context = activeSurfaceView?.get()?.context ?: return
+            val clipboard =
+                context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+            clipboard.setPrimaryClip(ClipData.newPlainText(null, text))
+        }
+
+        @JvmStatic
+        fun getClipboardText(): String {
+            val context = activeSurfaceView?.get()?.context ?: return ""
+            val clipboard =
+                context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return ""
+            val clip = clipboard.primaryClip ?: return ""
+            if (clip.itemCount == 0) return ""
+            return clip.getItemAt(0).coerceToText(context)?.toString() ?: ""
         }
 
         @JvmStatic external fun gpuiInit(activity: Activity)

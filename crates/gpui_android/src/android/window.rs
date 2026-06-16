@@ -20,7 +20,7 @@ use gpui::{
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent,
     PointerUpEvent, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
-    ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, WindowAppearance,
+    ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, UTF16Selection, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, point, px,
     should_auto_request_soft_keyboard,
 };
@@ -38,6 +38,12 @@ const ACTION_CANCEL: i32 = 3;
 pub enum AndroidWindowRole {
     Root,
     EmbeddedSheet,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveSelectionSource {
+    Input,
+    ReadOnly,
 }
 
 struct FlingState {
@@ -173,12 +179,14 @@ pub struct AndroidWindowState {
     scale: f32,
     touch_state: TouchState,
     input_handler: Option<PlatformInputHandler>,
+    selection_handler: Option<PlatformInputHandler>,
+    selectable_text_hit_regions: SmallVec<[SelectableTextHitRegion; 8]>,
+    active_selection_source: Option<ActiveSelectionSource>,
+    last_logged_selection_snapshot: Option<Vec<f64>>,
     // Cached from the last set_input_handler. Window::draw takes the input
     // handler for the duration of the frame, so views rendering mid-draw must
     // read this flag instead of querying the (absent) live handler.
     input_keyboard_accessory: bool,
-    selection_handler: Option<PlatformInputHandler>,
-    selection_hit_regions: SmallVec<[SelectableTextHitRegion; 8]>,
     callbacks: Callbacks,
     active: bool,
     appearance: WindowAppearance,
@@ -200,9 +208,11 @@ impl AndroidWindowState {
             scale,
             touch_state: TouchState::new(),
             input_handler: None,
-            input_keyboard_accessory: false,
             selection_handler: None,
-            selection_hit_regions: SmallVec::new(),
+            selectable_text_hit_regions: SmallVec::new(),
+            active_selection_source: None,
+            last_logged_selection_snapshot: None,
+            input_keyboard_accessory: false,
             callbacks: Callbacks::default(),
             active,
             appearance: WindowAppearance::Light,
@@ -444,6 +454,211 @@ impl AndroidWindowState {
         handled
     }
 
+    fn with_selection_source_handler<R>(
+        &mut self,
+        source: ActiveSelectionSource,
+        f: impl FnOnce(&mut PlatformInputHandler) -> R,
+    ) -> Option<R> {
+        let slot = match source {
+            ActiveSelectionSource::Input => &mut self.input_handler,
+            ActiveSelectionSource::ReadOnly => &mut self.selection_handler,
+        };
+        let mut handler = slot.take()?;
+        let result = f(&mut handler);
+        *slot = Some(handler);
+        Some(result)
+    }
+
+    fn with_active_selection_handler<R>(
+        &mut self,
+        f: impl FnOnce(&mut PlatformInputHandler) -> R,
+    ) -> Option<R> {
+        self.with_selection_source_handler(self.active_selection_source?, f)
+    }
+
+    pub fn start_selection_at(&mut self, physical_x: f32, physical_y: f32) -> bool {
+        let point = point(px(physical_x / self.scale), px(physical_y / self.scale));
+        log::info!(
+            "ZEDRA_SELECTION_GEOMETRY start physical=({physical_x},{physical_y}) logical=({},{}) scale={} hit_regions={}",
+            point.x.as_f32(),
+            point.y.as_f32(),
+            self.scale,
+            self.selectable_text_hit_regions.len()
+        );
+        let input_index = self.input_handler.as_mut().and_then(|handler| {
+            handler
+                .query_handles_native_selection()
+                .then(|| handler.character_index_for_point(point))
+                .flatten()
+        });
+        let source_and_index = input_index
+            .map(|index| (ActiveSelectionSource::Input, index))
+            .or_else(|| {
+                self.selectable_text_hit_regions
+                    .iter()
+                    .any(|region| region.contains_text(point))
+                    .then(|| {
+                        self.selection_handler
+                            .as_mut()?
+                            .character_index_for_point(point)
+                            .map(|index| (ActiveSelectionSource::ReadOnly, index))
+                    })
+                    .flatten()
+            });
+        let Some((source, index)) = source_and_index else {
+            log::info!("ZEDRA_SELECTION_GEOMETRY start rejected no source/index");
+            return false;
+        };
+        log::info!("ZEDRA_SELECTION_GEOMETRY start source={source:?} index={index}");
+
+        self.active_selection_source = Some(source);
+        let selection = self
+            .with_selection_source_handler(source, |handler| {
+                // Seed a one-character range so handlers that only widen an
+                // existing selection (terminal stashes empty points as a
+                // candidate, never a selection) start non-empty. UIKit seeds its
+                // own granularity on iOS; on Android we synthesize the seed here.
+                let proposed_range = index..index.saturating_add(1);
+                let initial_range = handler
+                    .initial_native_selection_range(proposed_range.clone())
+                    .unwrap_or(proposed_range);
+                handler.set_selected_text_range(initial_range);
+                handler.selected_text_range(false)
+            })
+            .flatten()
+            .filter(|selection| !selection.range.is_empty());
+        if selection.is_none() {
+            self.active_selection_source = None;
+            log::info!("ZEDRA_SELECTION_GEOMETRY start rejected empty selection");
+            return false;
+        }
+        log::info!(
+            "ZEDRA_SELECTION_GEOMETRY start selection={:?}",
+            selection.as_ref().map(|selection| &selection.range)
+        );
+        true
+    }
+
+    pub fn update_active_selection(
+        &mut self,
+        start: usize,
+        end: usize,
+        moving_start: bool,
+    ) -> bool {
+        // Read-only (markdown) drags follow Chrome's direction-aware granularity:
+        // the moving handle snaps to word boundaries while expanding and uses
+        // character granularity while contracting. Terminal/input selection keeps
+        // character granularity in both directions.
+        let word_granular = self.active_selection_source == Some(ActiveSelectionSource::ReadOnly);
+        self.with_active_selection_handler(|handler| {
+            let Some(current) = handler.selected_text_range(false).map(|s| s.range) else {
+                return false;
+            };
+            // The handle Kotlin did not move stays anchored; the other tracks the
+            // finger. start/end arrive ordered as (anchor, moving) per side.
+            let (anchor, moving_target) = if moving_start {
+                (end, start)
+            } else {
+                (start, end)
+            };
+            let current_moving = if moving_start { current.start } else { current.end };
+            let expanding = if moving_start {
+                moving_target < current_moving
+            } else {
+                moving_target > current_moving
+            };
+            let moving = if word_granular && expanding {
+                handler
+                    .initial_native_selection_range(moving_target..moving_target)
+                    .map(|w| if moving_start { w.start } else { w.end })
+                    .unwrap_or(moving_target)
+            } else {
+                moving_target
+            };
+            let snapped = anchor.min(moving)..anchor.max(moving);
+            let adjusted = handler
+                .adjusted_native_selection_range(snapped.clone())
+                .unwrap_or(snapped);
+            if adjusted.is_empty() || current == adjusted {
+                return false;
+            }
+            handler.set_selected_text_range(adjusted.clone());
+            log::info!(
+                "ZEDRA_SELECTION_GEOMETRY drag moving_start={moving_start} expanding={expanding} target={moving_target} -> {}..{}",
+                adjusted.start,
+                adjusted.end
+            );
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    pub fn nearest_selection_index(&mut self, physical_x: f32, physical_y: f32) -> Option<usize> {
+        let point = point(px(physical_x / self.scale), px(physical_y / self.scale));
+        self.with_active_selection_handler(|handler| {
+            handler.nearest_character_index_for_point(point)
+        })
+        .flatten()
+    }
+
+    pub fn active_selection_snapshot(&mut self) -> Option<Vec<f64>> {
+        let scale = self.scale;
+        let snapshot = self
+            .with_active_selection_handler(|handler| {
+                let UTF16Selection { range, reversed } = handler.selected_text_range(false)?;
+                if range.is_empty() {
+                    return None;
+                }
+                let rects = handler.rects_for_range(range.clone());
+                let start_bounds = handler.bounds_for_range(range.start..range.start);
+                let end_bounds = handler.bounds_for_range(range.end..range.end);
+                let scaled = |bounds: Bounds<Pixels>| {
+                    [
+                        (bounds.origin.x.as_f32() * scale) as f64,
+                        (bounds.origin.y.as_f32() * scale) as f64,
+                        (bounds.size.width.as_f32() * scale) as f64,
+                        (bounds.size.height.as_f32() * scale) as f64,
+                    ]
+                };
+                let mut snapshot = Vec::with_capacity(4 + rects.len() * 4 + 8);
+                snapshot.extend([
+                    range.start as f64,
+                    range.end as f64,
+                    if reversed { 1.0 } else { 0.0 },
+                    rects.len() as f64,
+                ]);
+                for rect in rects {
+                    snapshot.extend(scaled(rect));
+                }
+                for bounds in [start_bounds, end_bounds] {
+                    snapshot.extend(scaled(bounds.unwrap_or_default()));
+                }
+                Some(snapshot)
+            })
+            .flatten();
+        if snapshot != self.last_logged_selection_snapshot {
+            log::info!("ZEDRA_SELECTION_GEOMETRY snapshot physical={snapshot:?}");
+            self.last_logged_selection_snapshot = snapshot.clone();
+        }
+        snapshot
+    }
+
+    pub fn selected_text(&mut self) -> Option<String> {
+        self.with_active_selection_handler(|handler| {
+            let range = handler.selected_text_range(false)?.range;
+            handler.text_for_range(range, &mut None)
+        })
+        .flatten()
+    }
+
+    pub fn clear_active_selection(&mut self, clear_handler: bool) {
+        if clear_handler {
+            self.with_active_selection_handler(|handler| handler.clear_selected_text_range());
+        }
+        self.active_selection_source = None;
+        self.last_logged_selection_snapshot = None;
+    }
+
     pub fn insert_text(&mut self, text: &str) -> bool {
         let Some(mut input_handler) = self.input_handler.take() else {
             return false;
@@ -535,7 +750,7 @@ impl AndroidWindowState {
         let position = point(px(logical_x), px(logical_y));
 
         let hits_selectable = self
-            .selection_hit_regions
+            .selectable_text_hit_regions
             .iter()
             .any(|region| region.contains_text(position));
         if !hits_selectable {
@@ -897,11 +1112,32 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn clear_selection_handler(&mut self) {
-        self.state.borrow_mut().selection_handler = None;
+        let dismissed_selection = {
+            let mut state = self.state.borrow_mut();
+            state.selection_handler = None;
+            state.selectable_text_hit_regions.clear();
+            // The read-only document is gone; drop any active selection sourced
+            // from it so stale hit regions can't seed a new interaction.
+            let dismissed = state.active_selection_source == Some(ActiveSelectionSource::ReadOnly);
+            if dismissed {
+                state.active_selection_source = None;
+            }
+            dismissed
+        };
+        if dismissed_selection {
+            super::app_state::with_platform(|platform| platform.dismiss_selection());
+        }
+    }
+
+    fn clear_active_selection(&self) {
+        // GPUI cleared its own selection state (e.g. on focus/blur); mirror that
+        // by dropping the native presentation without re-clearing the handler.
+        self.state.borrow_mut().clear_active_selection(false);
+        super::app_state::with_platform(|platform| platform.dismiss_selection());
     }
 
     fn set_selectable_text_hit_regions(&self, regions: SmallVec<[SelectableTextHitRegion; 8]>) {
-        self.state.borrow_mut().selection_hit_regions = regions;
+        self.state.borrow_mut().selectable_text_hit_regions = regions;
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
@@ -934,15 +1170,26 @@ impl PlatformWindow for AndroidWindow {
     }
 
     fn clear_input_handler(&mut self) {
-        let had_keyboard_session = {
+        let (had_keyboard_session, dismissed_selection) = {
             let mut state = self.state.borrow_mut();
             state.input_keyboard_accessory = false;
+            let dismissed_selection =
+                state.active_selection_source == Some(ActiveSelectionSource::Input);
+            if dismissed_selection {
+                state.active_selection_source = None;
+            }
             state.input_handler.take();
             self.input_handler_registered.set(false);
-            self.keyboard_session_requested.replace(false)
+            (
+                self.keyboard_session_requested.replace(false),
+                dismissed_selection,
+            )
         };
         if had_keyboard_session {
             super::app_state::with_platform(|platform| platform.hide_soft_keyboard());
+        }
+        if dismissed_selection {
+            super::app_state::with_platform(|platform| platform.dismiss_selection());
         }
     }
 
@@ -964,6 +1211,11 @@ impl PlatformWindow for AndroidWindow {
         self.state.borrow_mut().has_active_keyboard_accessory()
     }
 
+    fn completed_frame(&self) {
+        if self.state.borrow().active_selection_source.is_some() {
+            super::app_state::with_platform(|platform| platform.refresh_selection());
+        }
+    }
     fn prompt(
         &self,
         _level: PromptLevel,

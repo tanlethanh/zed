@@ -1522,17 +1522,12 @@ impl PlatformInputHandler {
         self.handles_native_selection
     }
 
-    #[allow(dead_code)]
-    pub fn query_keyboard_accessory(&self) -> bool {
-        self.keyboard_accessory
+    pub fn keyboard_accessory(&mut self) -> bool {
+        self.cx
+            .update(|window, cx| self.handler.borrow_mut().keyboard_accessory(window, cx))
+            .unwrap_or(false)
     }
 
-    #[allow(dead_code)]
-    pub fn query_text_input_traits(&self) -> PlatformTextInputTraits {
-        self.text_input_traits
-    }
-
-    #[allow(dead_code)]
     pub fn handle_keyboard_accessory_action(&mut self, action: &str) -> bool {
         self.cx
             .update(|window, cx| {
@@ -1541,6 +1536,16 @@ impl PlatformInputHandler {
                     .handle_keyboard_accessory_action(action, window, cx)
             })
             .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub fn query_keyboard_accessory(&self) -> bool {
+        self.keyboard_accessory
+    }
+
+    #[allow(dead_code)]
+    pub fn query_text_input_traits(&self) -> PlatformTextInputTraits {
+        self.text_input_traits
     }
 
     #[allow(dead_code)]
@@ -1573,6 +1578,20 @@ impl PlatformInputHandler {
                 self.handler
                     .borrow_mut()
                     .adjusted_native_selection_range(range, window, cx)
+            })
+            .ok()
+            .flatten()
+    }
+
+    pub fn initial_native_selection_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .initial_native_selection_range(range, window, cx)
             })
             .ok()
             .flatten()
@@ -1971,7 +1990,7 @@ pub trait InputHandler: 'static {
         false
     }
 
-    /// Returns whether this handler wants the platform keyboard accessory view
+    /// Returns whether this input handler wants the platform keyboard accessory
     /// while it owns the software keyboard session.
     fn keyboard_accessory(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         false
@@ -2027,6 +2046,22 @@ pub trait InputHandler: 'static {
         _cx: &mut App,
     ) -> Option<std::ops::Range<usize>> {
         None
+    }
+
+    /// Returns the platform-owned selection range created by a native long press.
+    ///
+    /// Platform-neutral hook: given the seed range under a long press, a handler
+    /// may widen it (e.g. to the enclosing word). Backends call it only when they
+    /// synthesize the initial selection themselves. Android does; iOS does not,
+    /// because UIKit's `UITextInteraction` supplies long-press granularity
+    /// natively. The default returns the seed unchanged.
+    fn initial_native_selection_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
+        Some(range)
     }
 
     /// Returns custom actions for the active platform-owned selection.
