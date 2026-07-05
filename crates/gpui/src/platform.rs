@@ -59,6 +59,7 @@ use std::io::Cursor;
 use std::ops;
 use std::time::Duration;
 use std::{
+    any::Any,
     cell::RefCell,
     fmt::{self, Debug},
     ops::Range,
@@ -702,6 +703,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    // Backend-defined post-scene effect object; backends downcast, default drops it.
+    fn set_render_effect(&self, _effect: Option<Box<dyn Any>>) {}
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

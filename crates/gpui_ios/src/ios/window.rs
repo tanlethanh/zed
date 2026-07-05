@@ -4663,6 +4663,20 @@ impl PlatformWindow for IosWindow {
         self.renderer.borrow_mut().draw(scene);
     }
 
+    fn set_render_effect(&self, effect: Option<Box<dyn std::any::Any>>) {
+        let effect = match effect {
+            Some(effect) => match effect.downcast::<crate::render_effect::IosRenderEffect>() {
+                Ok(effect) => Some(effect.0),
+                Err(_) => {
+                    log::error!("set_render_effect: expected IosRenderEffect, dropping effect");
+                    None
+                }
+            },
+            None => None,
+        };
+        self.renderer.borrow_mut().set_render_effect(effect);
+    }
+
     fn completed_frame(&self) {
         self.refresh_selection_geometry();
     }

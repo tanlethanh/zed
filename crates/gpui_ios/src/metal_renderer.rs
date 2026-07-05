@@ -1,4 +1,5 @@
 use crate::metal_atlas::MetalAtlas;
+use crate::render_effect::{MetalEffectContext, MetalRenderEffect};
 use anyhow::Result;
 use block::ConcreteBlock;
 use objc::runtime::{NO, YES};
@@ -144,6 +145,7 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    render_effect: Option<Box<dyn MetalRenderEffect>>,
 }
 
 #[repr(C)]
@@ -328,7 +330,12 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            render_effect: None,
         }
+    }
+
+    pub fn set_render_effect(&mut self, effect: Option<Box<dyn MetalRenderEffect>>) {
+        self.render_effect = effect;
     }
 
     pub fn layer(&self) -> &metal::MetalLayerRef {
@@ -438,6 +445,16 @@ impl MetalRenderer {
                     });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
+
+                    // Post-scene effect encodes before present; render_to_image stays effect-free.
+                    if let Some(effect) = self.render_effect.as_mut() {
+                        effect.encode(&MetalEffectContext {
+                            device: &self.device,
+                            command_buffer: &command_buffer,
+                            drawable_texture: drawable.texture(),
+                            viewport_size,
+                        });
+                    }
 
                     if self.presents_with_transaction {
                         command_buffer.commit();

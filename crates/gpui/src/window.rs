@@ -2727,6 +2727,12 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
+    /// Installs a post-scene render effect. The box must be the active backend's
+    /// wrapper type (e.g. `IosRenderEffect`); other backends drop it. `None` removes.
+    pub fn set_render_effect(&mut self, effect: Option<Box<dyn Any>>) {
+        self.platform_window.set_render_effect(effect);
+    }
+
     #[profiling::function]
     fn present(&mut self) {
         self.platform_window.draw(&self.rendered_frame.scene);
