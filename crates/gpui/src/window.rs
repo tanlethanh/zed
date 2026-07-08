@@ -1476,7 +1476,13 @@ impl Window {
                     || needs_present.get()
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
-                if invalidator.is_dirty() || request_frame_options.force_render {
+                #[cfg(feature = "devtool")]
+                let devtool_pending =
+                    crate::devtool::has_pending_publish() || crate::devtool::has_pending_calls();
+                #[cfg(not(feature = "devtool"))]
+                let devtool_pending = false;
+
+                if invalidator.is_dirty() || request_frame_options.force_render || devtool_pending {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -2819,7 +2825,7 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
 
-        #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+        #[cfg(feature = "devtool")]
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static DEVTOOL_FRAME_ID: AtomicU64 = AtomicU64::new(0);
@@ -2829,7 +2835,30 @@ impl Window {
                 &self.next_frame.hitboxes,
                 &self.next_frame.inspector_hitboxes,
             );
+
+            for (id, name, params) in crate::devtool::drain_pending_calls() {
+                let (invoked, result) = self.invoke_devtool_call(&name, params, cx);
+                crate::devtool::mark_call_result(id, invoked, result);
+            }
         }
+    }
+
+    /// Look up `name` in the main-thread-only `ActionRegistry` global and call it. `false` means
+    /// nothing was ever registered under that name.
+    #[cfg(feature = "devtool")]
+    fn invoke_devtool_call(
+        &mut self,
+        name: &str,
+        params: serde_json::Value,
+        cx: &mut App,
+    ) -> (bool, serde_json::Value) {
+        let Some(f) = cx
+            .try_global::<crate::devtool::ActionRegistry>()
+            .and_then(|registry| registry.functions.get(name).cloned())
+        else {
+            return (false, serde_json::Value::Null);
+        };
+        (true, f(params, self, cx))
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {

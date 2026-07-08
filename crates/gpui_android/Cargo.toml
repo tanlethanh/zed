@@ -13,11 +13,12 @@ path = "src/gpui_android.rs"
 
 [features]
 default = []
-# In-app HTTP devtool (see crate::devtool_server). Debug-only AI tap harness.
-devtool = ["gpui/devtool"]
+# In-app HTTP devtool (see gpui_devtool). Debug-only AI tap harness.
+devtool = ["gpui/devtool", "dep:gpui_devtool"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 gpui.workspace = true
+gpui_devtool = { workspace = true, optional = true }
 gpui_wgpu.workspace = true
 anyhow.workspace = true
 collections.workspace = true

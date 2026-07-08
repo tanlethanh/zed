@@ -56,6 +56,15 @@ impl IosPlatform {
         #[cfg(not(feature = "font-kit"))]
         let text_system = Arc::new(gpui::NoopTextSystem::new());
 
+        #[cfg(feature = "devtool")]
+        {
+            let port: u16 = std::env::var("ZEDRA_DEVTOOL_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9777);
+            gpui_devtool::start(port);
+        }
+
         Self(Mutex::new(IosPlatformState {
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),

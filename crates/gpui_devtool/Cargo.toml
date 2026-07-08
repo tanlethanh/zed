@@ -1,0 +1,18 @@
+[package]
+name = "gpui_devtool"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_devtool.rs"
+
+[dependencies]
+gpui = { workspace = true, features = ["devtool"] }
+log.workspace = true
+rand.workspace = true
+serde_json.workspace = true

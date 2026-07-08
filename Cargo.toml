@@ -91,6 +91,7 @@ members = [
     "crates/grammars",
     "crates/gpui",
     "crates/gpui_android",
+    "crates/gpui_devtool",
     "crates/gpui_ios",
     "crates/gpui_shared_string",
     "crates/gpui_linux",
@@ -346,6 +347,7 @@ google_ai = { path = "crates/google_ai" }
 grammars = { path = "crates/grammars" }
 gpui = { path = "crates/gpui", default-features = false }
 gpui_android = { path = "crates/gpui_android" }
+gpui_devtool = { path = "crates/gpui_devtool" }
 gpui_ios = { path = "crates/gpui_ios", default-features = false }
 gpui_shared_string = { path = "crates/gpui_shared_string" }
 gpui_linux = { path = "crates/gpui_linux", default-features = false }

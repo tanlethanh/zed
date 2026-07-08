@@ -104,13 +104,13 @@ impl AndroidPlatform {
         let text_system_bg = common.text_system.clone();
         std::thread::spawn(move || Self::load_system_fonts(&text_system_bg));
 
-        #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+        #[cfg(feature = "devtool")]
         {
             let port: u16 = std::env::var("ZEDRA_DEVTOOL_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(9777);
-            super::devtool_server::start(port);
+            gpui_devtool::start(port);
         }
 
         Self {
@@ -314,14 +314,14 @@ impl AndroidPlatform {
         self.request_frame_with_options(false);
     }
 
-    #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
-    pub fn process_devtool_taps(&self) {
+    #[cfg(feature = "devtool")]
+    pub fn process_devtool_gestures(&self) {
         use gpui::{
-            Modifiers, PlatformInput, PointerButton, PointerDownEvent, PointerKind, PointerUpEvent,
-            point, px,
+            Modifiers, PlatformInput, PointerButton, PointerDownEvent, PointerKind,
+            PointerMoveEvent, PointerUpEvent, point, px,
         };
-        let taps = super::devtool_server::drain_pending_taps();
-        if taps.is_empty() {
+        let events = gpui_devtool::drain_gesture_events();
+        if events.is_empty() {
             return;
         }
         let windows: Vec<_> = self
@@ -331,36 +331,50 @@ impl AndroidPlatform {
             .filter_map(|w| w.upgrade())
             .collect();
         let Some(window) = windows.first() else {
-            log::warn!("devtool: tap dropped, no active window");
+            log::warn!("devtool: gesture event dropped, no active window");
             return;
         };
-        for tap in taps {
-            let position = point(px(tap.x), px(tap.y));
-            window
-                .borrow_mut()
-                .handle_input(PlatformInput::PointerDown(PointerDownEvent {
-                    pointer_id: 999,
-                    kind: PointerKind::Touch,
-                    is_primary: true,
-                    button: PointerButton::Primary,
-                    position,
-                    modifiers: Modifiers::default(),
-                }));
-            window
-                .borrow_mut()
-                .handle_input(PlatformInput::PointerUp(PointerUpEvent {
-                    pointer_id: 999,
-                    kind: PointerKind::Touch,
-                    is_primary: true,
-                    button: PointerButton::Primary,
-                    position,
-                    modifiers: Modifiers::default(),
-                }));
-            log::info!(
-                "devtool: synthetic tap dispatched at ({:.1},{:.1})",
-                tap.x,
-                tap.y
-            );
+        for event in events {
+            let (input, x, y) = match event {
+                gpui_devtool::GestureEvent::Down(x, y) => (
+                    PlatformInput::PointerDown(PointerDownEvent {
+                        pointer_id: 999,
+                        kind: PointerKind::Touch,
+                        is_primary: true,
+                        button: PointerButton::Primary,
+                        position: point(px(x), px(y)),
+                        modifiers: Modifiers::default(),
+                    }),
+                    x,
+                    y,
+                ),
+                gpui_devtool::GestureEvent::Move(x, y) => (
+                    PlatformInput::PointerMove(PointerMoveEvent {
+                        pointer_id: 999,
+                        kind: PointerKind::Touch,
+                        is_primary: true,
+                        pressed_button: Some(PointerButton::Primary),
+                        position: point(px(x), px(y)),
+                        modifiers: Modifiers::default(),
+                    }),
+                    x,
+                    y,
+                ),
+                gpui_devtool::GestureEvent::Up(x, y) => (
+                    PlatformInput::PointerUp(PointerUpEvent {
+                        pointer_id: 999,
+                        kind: PointerKind::Touch,
+                        is_primary: true,
+                        button: PointerButton::Primary,
+                        position: point(px(x), px(y)),
+                        modifiers: Modifiers::default(),
+                    }),
+                    x,
+                    y,
+                ),
+            };
+            window.borrow_mut().handle_input(input);
+            log::info!("devtool: synthetic gesture event at ({:.1},{:.1})", x, y);
         }
     }
 

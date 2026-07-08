@@ -816,6 +816,18 @@ impl Interactivity {
     }
 }
 
+/// Synthetic gesture kinds the in-app devtool can inject via `POST /press`/`/long_press`. Named
+/// to match the element callback each one triggers (`on_press`/`on_long_press`), not generic
+/// touch terminology. Kept here (rather than in the feature-gated `devtool` module) so it
+/// compiles regardless of the `devtool` cargo feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GestureKind {
+    /// Press and release at the same point — fires `on_press`.
+    Press,
+    /// Press, hold, then release at the same point — fires `on_long_press`.
+    LongPress,
+}
+
 /// A trait for elements that want to use the standard GPUI event handlers that don't
 /// require any state.
 pub trait InteractiveElement: Sized {

@@ -7803,6 +7803,7 @@ dependencies = [
  "cosmic-text 0.14.2",
  "futures 0.3.32",
  "gpui",
+ "gpui_devtool",
  "gpui_wgpu",
  "itertools 0.14.0",
  "jni",
@@ -7816,6 +7817,16 @@ dependencies = [
  "swash",
  "unicode-script",
  "util",
+]
+
+[[package]]
+name = "gpui_devtool"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "log",
+ "rand 0.9.4",
+ "serde_json",
 ]
 
 [[package]]
@@ -7837,6 +7848,7 @@ dependencies = [
  "foreign-types 0.5.0",
  "futures 0.3.32",
  "gpui",
+ "gpui_devtool",
  "image",
  "itertools 0.14.0",
  "libc",

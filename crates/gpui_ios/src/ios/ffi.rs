@@ -365,6 +365,8 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
     // Advance fling before the render callback so scroll events are processed
     // in the same frame they are generated.
     window.process_fling();
+    #[cfg(feature = "devtool")]
+    window.process_devtool_gestures();
 
     let callback = window.request_frame_callback.borrow_mut().take();
     if let Some(mut cb) = callback {

@@ -4023,6 +4023,42 @@ impl IosWindow {
         }
     }
 
+    /// Drain devtool-queued gesture events and dispatch each through the
+    /// same `input_callback` real touches use. Called from
+    /// `gpui_ios_request_frame` every tick, mirroring Android's
+    /// `AndroidPlatform::process_devtool_gestures`. A gesture (long-press,
+    /// swipe) spans multiple calls; each call fires whatever steps are due.
+    #[cfg(feature = "devtool")]
+    pub(super) fn process_devtool_gestures(&self) {
+        let events = gpui_devtool::drain_gesture_events();
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            let (platform_input, x, y) = match event {
+                gpui_devtool::GestureEvent::Down(x, y) => (
+                    touch_began_to_pointer_down(Point::new(px(x), px(y)), 999, Modifiers::default()),
+                    x,
+                    y,
+                ),
+                gpui_devtool::GestureEvent::Move(x, y) => (
+                    touch_moved_to_pointer_move(Point::new(px(x), px(y)), 999, Modifiers::default()),
+                    x,
+                    y,
+                ),
+                gpui_devtool::GestureEvent::Up(x, y) => (
+                    touch_ended_to_pointer_up(Point::new(px(x), px(y)), 999, Modifiers::default()),
+                    x,
+                    y,
+                ),
+            };
+            if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                callback(platform_input);
+            }
+            log::info!("devtool: synthetic gesture event at ({:.1},{:.1})", x, y);
+        }
+    }
+
     pub(super) fn inject_scroll(
         &self,
         position: Point<Pixels>,

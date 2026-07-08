@@ -169,8 +169,8 @@ pub extern "system" fn Java_dev_zed_gpui_GpuiRuntimeController_gpuiRequestFrame(
     app_state::with_platform(|platform| {
         platform.process_pending_tasks();
         platform.process_fling();
-        #[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
-        platform.process_devtool_taps();
+        #[cfg(feature = "devtool")]
+        platform.process_devtool_gestures();
         // See: docs/GPUI_ANDROID_PERFORMANCE.md § fling-no-force
         platform.request_frame_for_all_windows();
     });

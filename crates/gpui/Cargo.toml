@@ -41,7 +41,11 @@ windows-manifest = ["dep:embed-resource"]
 input-latency-histogram = ["dep:hdrhistogram"]
 # In-app HTTP devtool: exposes interactive hitboxes by `ElementId` path and
 # accepts synthetic taps. Debug-build opt-in for AI-driven UI scripting.
-devtool = []
+# Depends on `inspector` so its hitbox/instance-id storage exists even in a
+# --release build that opts into --devtool without --debug (otherwise the
+# snapshot registry never populates and every element-addressed endpoint
+# silently returns "not found").
+devtool = ["inspector"]
 
 [lib]
 path = "src/gpui.rs"
