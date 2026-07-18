@@ -20,9 +20,9 @@ use gpui::{
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PointerButton, PointerCancelEvent, PointerDownEvent, PointerKind, PointerMoveEvent,
     PointerUpEvent, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
-    ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, UTF16Selection, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, point, px,
-    should_auto_request_soft_keyboard,
+    ScrollWheelEvent, SelectableTextHitRegion, SelectionMenuPresentation, Size, TouchPhase,
+    UTF16Selection, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    point, px, should_auto_request_soft_keyboard,
 };
 use gpui_wgpu::{GpuContext, WgpuAtlas, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -648,6 +648,13 @@ impl AndroidWindowState {
     pub fn selection_action_count(&mut self) -> usize {
         self.with_active_selection_handler(|handler| handler.selection_action_names().len())
             .unwrap_or(0)
+    }
+
+    pub fn selection_custom_actions_only(&mut self) -> bool {
+        self.with_active_selection_handler(|handler| {
+            handler.selection_menu_presentation() == SelectionMenuPresentation::CustomActionsOnly
+        })
+        .unwrap_or(false)
     }
 
     pub fn selection_action_title(&mut self, action_index: usize) -> Option<String> {

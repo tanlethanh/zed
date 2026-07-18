@@ -30,9 +30,9 @@ use gpui::{
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformTextAutocapitalization, PlatformTextInputTrait, PlatformTextInputTraits,
     PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
-    ScrollWheelEvent, SelectableTextHitRegion, Size, TouchPhase, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, px,
-    should_auto_request_soft_keyboard, should_show_keyboard_accessory, size,
+    ScrollWheelEvent, SelectableTextHitRegion, SelectionMenuPresentation, Size, TouchPhase,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    px, should_auto_request_soft_keyboard, should_show_keyboard_accessory, size,
 };
 use objc::{
     Encode, Encoding, class,
@@ -79,8 +79,11 @@ fn edit_menu_action_policy(
     interaction_mode: i8,
     input_native_selection_enabled: bool,
     is_copy_action: bool,
+    menu_presentation: SelectionMenuPresentation,
 ) -> EditMenuActionPolicy {
-    if handles_native_touch_selection(interaction_mode, input_native_selection_enabled)
+    if menu_presentation == SelectionMenuPresentation::CustomActionsOnly && is_copy_action {
+        EditMenuActionPolicy::DisableNativeMenu
+    } else if handles_native_touch_selection(interaction_mode, input_native_selection_enabled)
         && is_copy_action
     {
         EditMenuActionPolicy::CopySelection
@@ -668,6 +671,13 @@ fn selection_action_presentations(view: &Object) -> Vec<(String, Option<String>)
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn selection_menu_presentation(view: &Object) -> SelectionMenuPresentation {
+    if !view_handles_native_touch_selection(view) {
+        return SelectionMenuPresentation::default();
+    }
+    with_input_handler(view, |handler| handler.selection_menu_presentation()).unwrap_or_default()
 }
 
 fn perform_selection_menu_action(view: *mut Object, action_index: usize) {
@@ -1612,14 +1622,19 @@ fn register_metal_view_class() -> &'static Class {
             suggested_actions: *mut Object,
         ) -> *mut Object {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let menu_presentation = selection_menu_presentation(this);
                 let action_presentations = selection_action_presentations(this);
-                if action_presentations.is_empty() {
+                if action_presentations.is_empty()
+                    && menu_presentation == SelectionMenuPresentation::SystemAndCustomActions
+                {
                     return ptr::null_mut();
                 }
 
                 unsafe {
                     let children: *mut Object = msg_send![class!(NSMutableArray), array];
-                    if !suggested_actions.is_null() {
+                    if menu_presentation == SelectionMenuPresentation::SystemAndCustomActions
+                        && !suggested_actions.is_null()
+                    {
                         let _: () = msg_send![children, addObjectsFromArray: suggested_actions];
                     }
 
@@ -1675,6 +1690,7 @@ fn register_metal_view_class() -> &'static Class {
                 interaction_mode,
                 input_native_selection_enabled,
                 action == sel!(copy:),
+                selection_menu_presentation(this),
             );
             let result = match policy {
                 EditMenuActionPolicy::CopySelection => {
@@ -4754,11 +4770,11 @@ mod tests {
     #[test]
     fn editable_edit_menu_actions_are_disabled_for_current_inputs() {
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false, true),
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false, true, Default::default()),
             EditMenuActionPolicy::DisableNativeMenu
         );
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false, false),
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, false, false, Default::default()),
             EditMenuActionPolicy::DisableNativeMenu
         );
     }
@@ -4766,11 +4782,11 @@ mod tests {
     #[test]
     fn editable_native_selection_copy_uses_selection_policy() {
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true, true),
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true, true, Default::default()),
             EditMenuActionPolicy::CopySelection
         );
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true, false),
+            edit_menu_action_policy(TEXT_INTERACTION_EDITABLE, true, false, Default::default()),
             EditMenuActionPolicy::DelegateToSystem
         );
     }
@@ -4778,12 +4794,35 @@ mod tests {
     #[test]
     fn noneditable_copy_uses_selection_policy_but_other_actions_delegate() {
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_NONEDITABLE, false, true),
+            edit_menu_action_policy(
+                TEXT_INTERACTION_NONEDITABLE,
+                false,
+                true,
+                Default::default(),
+            ),
             EditMenuActionPolicy::CopySelection
         );
         assert_eq!(
-            edit_menu_action_policy(TEXT_INTERACTION_NONEDITABLE, false, false),
+            edit_menu_action_policy(
+                TEXT_INTERACTION_NONEDITABLE,
+                false,
+                false,
+                Default::default(),
+            ),
             EditMenuActionPolicy::DelegateToSystem
+        );
+    }
+
+    #[test]
+    fn custom_only_selection_disables_responder_copy() {
+        assert_eq!(
+            edit_menu_action_policy(
+                TEXT_INTERACTION_NONEDITABLE,
+                false,
+                true,
+                SelectionMenuPresentation::CustomActionsOnly,
+            ),
+            EditMenuActionPolicy::DisableNativeMenu
         );
     }
 

@@ -24,6 +24,17 @@ pub fn selection_area(child: impl IntoElement) -> SelectionAreaElement {
 pub struct SelectionArea {
     id: ElementId,
     actions: SmallVec<[SelectionAction; 4]>,
+    menu_presentation: SelectionMenuPresentation,
+}
+
+/// Controls whether a native selection menu includes system-provided actions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelectionMenuPresentation {
+    /// Show the platform's system actions followed by GPUI custom actions.
+    #[default]
+    SystemAndCustomActions,
+    /// Show only GPUI custom actions while retaining native selection handles.
+    CustomActionsOnly,
 }
 
 impl SelectionArea {
@@ -32,6 +43,7 @@ impl SelectionArea {
         Self {
             id: id.into(),
             actions: SmallVec::new(),
+            menu_presentation: SelectionMenuPresentation::default(),
         }
     }
 
@@ -43,6 +55,17 @@ impl SelectionArea {
     /// Returns the custom actions exposed for the current selection.
     pub fn actions(&self) -> &[SelectionAction] {
         &self.actions
+    }
+
+    /// Returns how the native selection menu presents system and custom actions.
+    pub fn menu_presentation(&self) -> SelectionMenuPresentation {
+        self.menu_presentation
+    }
+
+    /// Set how the native selection menu presents system and custom actions.
+    pub fn selection_menu_presentation(mut self, presentation: SelectionMenuPresentation) -> Self {
+        self.menu_presentation = presentation;
+        self
     }
 
     /// Append a custom action to the native selection menu.
@@ -530,6 +553,13 @@ impl SelectionDocument {
             .unwrap_or_default()
     }
 
+    fn menu_presentation(&self) -> SelectionMenuPresentation {
+        self.fragments
+            .first()
+            .map(|fragment| fragment.fragment.selection_area().menu_presentation())
+            .unwrap_or_default()
+    }
+
     fn from_fragments(
         key: SelectionAreaKey,
         mut fragments: Vec<(usize, RegisteredTextSelectionFragment)>,
@@ -924,6 +954,16 @@ impl InputHandler for WindowSelectionHandler {
         }
         document.actions()
     }
+
+    fn selection_menu_presentation(
+        &mut self,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> SelectionMenuPresentation {
+        SelectionDocument::active(window)
+            .map(|document| document.menu_presentation())
+            .unwrap_or_default()
+    }
 }
 
 fn utf16_len(text: &str) -> usize {
@@ -1086,6 +1126,12 @@ impl SelectionAreaElement {
         self
     }
 
+    /// Set how the native selection menu presents system and custom actions.
+    pub fn selection_menu_presentation(mut self, presentation: SelectionMenuPresentation) -> Self {
+        self.selection_area.menu_presentation = presentation;
+        self
+    }
+
     /// Returns the logical selection-area metadata for this wrapper.
     pub fn selection_area(&self) -> &SelectionArea {
         &self.selection_area
@@ -1169,7 +1215,7 @@ impl IntoElement for SelectionAreaElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectionAreaKey, SelectionDocument, SelectionState};
+    use super::{SelectionAreaKey, SelectionDocument, SelectionMenuPresentation, SelectionState};
     use crate::EntityId;
     use crate::{
         self as gpui, AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement,
@@ -1210,6 +1256,22 @@ mod tests {
             selection_area(div().child(StyledText::new("hello").selectable()))
                 .action_with_system_image("Add to Chat", "plus.bubble", SelectionMenuAction)
                 .action("Other", OtherSelectionMenuAction)
+        }
+    }
+
+    struct CustomOnlySelectionActionTestView {
+        has_actions: bool,
+    }
+
+    impl Render for CustomOnlySelectionActionTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let area = selection_area(div().child(StyledText::new("hello").selectable()))
+                .selection_menu_presentation(SelectionMenuPresentation::CustomActionsOnly);
+            if self.has_actions {
+                area.action("Other", OtherSelectionMenuAction)
+            } else {
+                area
+            }
         }
     }
 
@@ -1503,6 +1565,22 @@ mod tests {
                 assert!(window.latest_read_only_selection().is_none());
             })
             .unwrap();
+
+        window
+            .update(cx, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                window.selection_state = SelectionState {
+                    active_area: Some(document.key.clone()),
+                    range_utf16: Some(0..5),
+                    reversed: false,
+                };
+                window.latest_read_only_selection = document.snapshot_for_range(0..5);
+                window.clear_read_only_selection();
+                assert!(window.active_read_only_selection().is_none());
+                assert!(window.latest_read_only_selection().is_none());
+            })
+            .unwrap();
+        assert!(test_window.active_selection_cleared_for_test());
     }
 
     #[gpui::test]
@@ -1544,9 +1622,85 @@ mod tests {
         );
         assert_eq!(presentations[1].name.to_string(), "Other");
         assert!(presentations[1].image_name.is_none());
+        assert_eq!(
+            handler.selection_menu_presentation(),
+            SelectionMenuPresentation::SystemAndCustomActions
+        );
 
         handler.clear_selected_text_range();
         assert!(handler.selection_action_names().is_empty());
+    }
+
+    #[gpui::test]
+    fn selection_handler_exposes_custom_only_policy_and_dispatches(cx: &mut TestAppContext) {
+        let action_count = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            let action_count = action_count.clone();
+            cx.on_action(move |_: &OtherSelectionMenuAction, _| {
+                action_count.set(action_count.get() + 1);
+            });
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| CustomOnlySelectionActionTestView { has_actions: true })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                window.selection_state = SelectionState {
+                    active_area: Some(document.key),
+                    range_utf16: Some(0..5),
+                    reversed: false,
+                };
+            })
+            .unwrap();
+
+        let mut handler = cx
+            .test_window(*window)
+            .take_selection_handler_for_test()
+            .unwrap();
+        assert_eq!(
+            handler.selection_menu_presentation(),
+            SelectionMenuPresentation::CustomActionsOnly
+        );
+        assert_eq!(handler.selection_action_names(), vec!["Other"]);
+        handler.perform_selection_action(0);
+        cx.run_until_parked();
+        assert_eq!(action_count.get(), 1);
+    }
+
+    #[gpui::test]
+    fn empty_custom_only_selection_does_not_restore_system_policy(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| CustomOnlySelectionActionTestView { has_actions: false })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| {
+                let document = SelectionDocument::all(window).into_iter().next().unwrap();
+                window.selection_state = SelectionState {
+                    active_area: Some(document.key),
+                    range_utf16: Some(0..5),
+                    reversed: false,
+                };
+            })
+            .unwrap();
+
+        let mut handler = cx
+            .test_window(*window)
+            .take_selection_handler_for_test()
+            .unwrap();
+        assert!(handler.selection_action_names().is_empty());
+        assert_eq!(
+            handler.selection_menu_presentation(),
+            SelectionMenuPresentation::CustomActionsOnly
+        );
     }
 
     #[gpui::test]

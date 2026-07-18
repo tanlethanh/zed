@@ -33,9 +33,9 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
     PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
-    RenderSvgParams, Scene, SelectionAction, SelectionActionPresentation, ShapedGlyph, ShapedRun,
-    SharedString, Size, SvgRenderer, SystemWindowTab, Task, ThreadTaskTimings, Window,
-    WindowControlArea, hash, point, px, size,
+    RenderSvgParams, Scene, SelectionAction, SelectionActionPresentation,
+    SelectionMenuPresentation, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
+    SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -1606,6 +1606,16 @@ impl PlatformInputHandler {
             .unwrap_or_default()
     }
 
+    pub fn selection_menu_presentation(&mut self) -> SelectionMenuPresentation {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .selection_menu_presentation(window, cx)
+            })
+            .unwrap_or_default()
+    }
+
     pub fn perform_selection_action(&mut self, action_index: usize) {
         self.cx
             .update(|window, cx| {
@@ -2044,6 +2054,15 @@ pub trait InputHandler: 'static {
         _cx: &mut App,
     ) -> SmallVec<[SelectionAction; 4]> {
         SmallVec::new()
+    }
+
+    /// Returns whether the native selection menu includes system actions.
+    fn selection_menu_presentation(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> SelectionMenuPresentation {
+        SelectionMenuPresentation::default()
     }
 }
 

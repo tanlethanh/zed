@@ -431,20 +431,26 @@ class SelectionController(
 
     private fun rebuildActionModeMenu(menu: Menu) {
         val actions = nativeSelectionActions()
+        val customActionsOnly = nativeSelectionCustomActionsOnly(activeHandle)
         menuActions = actions
         menu.clear()
-        addMenuItem(menu, MENU_COPY, "Copy")
-            .setIcon(android.R.drawable.ic_menu_edit)
-            .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
-        addMenuItem(menu, MENU_SHARE, "Share")
-            .setIcon(android.R.drawable.ic_menu_share)
-            .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
-        addMenuItem(menu, MENU_SEARCH, "Search")
-            .setIcon(android.R.drawable.ic_menu_search)
-            .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        if (!customActionsOnly) {
+            addMenuItem(menu, MENU_COPY, "Copy")
+                .setIcon(android.R.drawable.ic_menu_edit)
+                .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
+            addMenuItem(menu, MENU_SHARE, "Share")
+                .setIcon(android.R.drawable.ic_menu_share)
+                .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
+            addMenuItem(menu, MENU_SEARCH, "Search")
+                .setIcon(android.R.drawable.ic_menu_search)
+                .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        }
         for (action in actions) {
             addMenuItem(menu, MENU_CUSTOM_ACTION_BASE + action.index, action.title)
-                .setShowAsActionFlags(MenuItem.SHOW_AS_ACTION_NEVER)
+                .setShowAsActionFlags(
+                    if (customActionsOnly) MenuItem.SHOW_AS_ACTION_ALWAYS
+                    else MenuItem.SHOW_AS_ACTION_NEVER,
+                )
         }
     }
 
@@ -547,6 +553,7 @@ class SelectionController(
         @JvmStatic private external fun nativeSelectionCopy(windowHandle: Long): Boolean
         @JvmStatic private external fun nativeSelectionText(windowHandle: Long): String?
         @JvmStatic private external fun nativeSelectionActionCount(windowHandle: Long): Int
+        @JvmStatic private external fun nativeSelectionCustomActionsOnly(windowHandle: Long): Boolean
         @JvmStatic private external fun nativeSelectionActionTitle(windowHandle: Long, index: Int): String?
         @JvmStatic private external fun nativeSelectionPerformAction(windowHandle: Long, index: Int): Boolean
 

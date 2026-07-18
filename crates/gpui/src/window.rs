@@ -1881,7 +1881,14 @@ impl Window {
             .or_else(|| self.latest_read_only_selection.clone())
     }
 
-    /// Clear the cached read-only text selection.
+    /// Clear active and cached read-only selection state and dismiss platform UI.
+    pub fn clear_read_only_selection(&mut self) {
+        self.selection_state = SelectionState::default();
+        self.latest_read_only_selection = None;
+        self.platform_window.clear_active_selection();
+    }
+
+    /// Clear only the cached read-only text selection.
     pub fn clear_read_only_selection_cache(&mut self) {
         self.latest_read_only_selection = None;
     }

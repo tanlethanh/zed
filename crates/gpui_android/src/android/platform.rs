@@ -632,6 +632,11 @@ impl AndroidPlatform {
             .unwrap_or(0)
     }
 
+    pub fn selection_custom_actions_only(&self, window_handle: u64) -> bool {
+        self.window_for_handle(window_handle)
+            .is_some_and(|window| window.borrow_mut().selection_custom_actions_only())
+    }
+
     pub fn selection_action_title(
         &self,
         window_handle: u64,

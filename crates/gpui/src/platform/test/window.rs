@@ -35,6 +35,7 @@ pub(crate) struct TestWindowState {
     input_handler: Option<PlatformInputHandler>,
     selection_handler: Option<PlatformInputHandler>,
     selectable_text_hit_regions: Vec<SelectableTextHitRegion>,
+    active_selection_cleared: bool,
     soft_keyboard_visible: bool,
     is_fullscreen: bool,
 }
@@ -90,6 +91,7 @@ impl TestWindow {
             input_handler: None,
             selection_handler: None,
             selectable_text_hit_regions: Vec::new(),
+            active_selection_cleared: false,
             soft_keyboard_visible: false,
             is_fullscreen: false,
         })))
@@ -142,9 +144,18 @@ impl TestWindow {
     pub(crate) fn selectable_text_hit_regions_for_test(&self) -> Vec<SelectableTextHitRegion> {
         self.0.lock().selectable_text_hit_regions.clone()
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn active_selection_cleared_for_test(&self) -> bool {
+        self.0.lock().active_selection_cleared
+    }
 }
 
 impl PlatformWindow for TestWindow {
+    fn clear_active_selection(&self) {
+        self.0.lock().active_selection_cleared = true;
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.lock().bounds
     }

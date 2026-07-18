@@ -559,6 +559,17 @@ pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionActi
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionCustomActionsOnly(
+    _env: JNIEnv,
+    _class: JClass,
+    window_handle: jlong,
+) -> jboolean {
+    let window_handle = selection_handle(window_handle);
+    app_state::with_platform(|platform| platform.selection_custom_actions_only(window_handle))
+        .unwrap_or(false) as jboolean
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_zed_gpui_SelectionController_nativeSelectionActionTitle(
     env: JNIEnv,
     _class: JClass,
