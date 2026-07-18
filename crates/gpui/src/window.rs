@@ -2555,6 +2555,14 @@ impl Window {
         self.mouse_position
     }
 
+    /// Whether `point` reaches the hitbox in the rendered frame, i.e. no occluding
+    /// element painted above it contains the point. Uses the same top-down,
+    /// break-at-`BlockMouse` walk that routes pointer events, so answers stay
+    /// consistent with event dispatch.
+    pub fn point_reaches_hitbox(&self, id: HitboxId, point: Point<Pixels>) -> bool {
+        self.rendered_frame.hit_test(point).ids.contains(&id)
+    }
+
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
     /// events will be routed to listeners that check this hitbox's `is_hovered` status,
     /// regardless of actual hit testing. This enables drag operations that continue

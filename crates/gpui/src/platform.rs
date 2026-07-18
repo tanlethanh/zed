@@ -1494,6 +1494,17 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    #[allow(unused)]
+    pub fn native_selection_allowed_at(&mut self, point: Point<Pixels>) -> bool {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .borrow_mut()
+                    .native_selection_allowed_at(point, window, cx)
+            })
+            .unwrap_or(false)
+    }
+
     pub fn nearest_character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
             .update(|window, cx| {
@@ -1977,6 +1988,21 @@ pub trait InputHandler: 'static {
     /// read-only selection handler.
     fn handles_native_selection(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         false
+    }
+
+    /// Returns whether native touch selection may begin at `point`.
+    ///
+    /// Handlers that own a visible surface should deny points occluded by
+    /// elements painted above it, so a top layer suppresses selection the same
+    /// way it suppresses pointer events. Queried only when selection begins;
+    /// in-progress selection updates bypass it.
+    fn native_selection_allowed_at(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> bool {
+        true
     }
 
     /// Returns whether this input handler wants the platform keyboard accessory

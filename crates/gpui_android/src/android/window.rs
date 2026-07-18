@@ -497,8 +497,9 @@ impl AndroidWindowState {
     pub fn start_selection_at(&mut self, physical_x: f32, physical_y: f32) -> Option<usize> {
         let point = point(px(physical_x / self.scale), px(physical_y / self.scale));
         let input_index = self.input_handler.as_mut().and_then(|handler| {
-            handler
-                .query_handles_native_selection()
+            // Occlusion first: a layer painted above the surface (e.g. a
+            // drawer) suppresses selection beneath it.
+            (handler.query_handles_native_selection() && handler.native_selection_allowed_at(point))
                 .then(|| handler.character_index_for_point(point))
                 .flatten()
         });
