@@ -1294,11 +1294,13 @@ fn register_metal_view_class() -> &'static Class {
                             if input_native_tap_count != 1 || !input_native_long_press {
                                 false
                             } else {
+                                // Occlusion first: a layer painted above the surface
+                                // (e.g. a drawer) suppresses selection beneath it.
                                 with_input_handler(this, |handler| {
-                                    handler.character_index_for_point(point)
+                                    handler.native_selection_allowed_at(point)
+                                        && handler.character_index_for_point(point).is_some()
                                 })
-                                .flatten()
-                                .is_some()
+                                .unwrap_or(false)
                             }
                         } else {
                             window.point_hits_selectable_text(point)
