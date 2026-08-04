@@ -4260,6 +4260,26 @@ impl IosWindow {
         }
     }
 
+    /// Dispatch an accessory action from a key bar that is not attached to the
+    /// software keyboard, so it works with no keyboard session in flight.
+    pub fn handle_key_bar_action(&self, action: &str) -> bool {
+        if !(self.input_handler.borrow().is_some()
+            || self.callback_input_handler.borrow().is_some())
+            || !self.input_accepts_text_input.get()
+            || !self.input_keyboard_accessory_enabled.get()
+        {
+            return false;
+        }
+
+        unsafe {
+            let view = &*(self.view as *const Object);
+            with_input_handler(view, |handler| {
+                handler.handle_keyboard_accessory_action(action)
+            })
+            .unwrap_or(false)
+        }
+    }
+
     /// Handle arrow key navigation directly via the input handler.
     /// Returns true if the key was handled, false otherwise.
     fn handle_arrow_key(&self, key: &str, _shift: bool) -> bool {

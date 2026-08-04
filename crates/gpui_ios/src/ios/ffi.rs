@@ -479,6 +479,25 @@ pub extern "C" fn gpui_ios_handle_keyboard_accessory_action(
     window.handle_keyboard_accessory_action(action)
 }
 
+/// Dispatch a key-bar action that is not tied to an active keyboard session.
+///
+/// Same input-handler routing as `gpui_ios_handle_keyboard_accessory_action`,
+/// minus the requirement that the software keyboard be up.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_handle_key_bar_action(
+    window_ptr: *mut c_void,
+    action: *const c_char,
+) -> bool {
+    if window_ptr.is_null() || action.is_null() {
+        return false;
+    }
+    let Ok(action) = (unsafe { CStr::from_ptr(action) }).to_str() else {
+        return false;
+    };
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.handle_key_bar_action(action)
+}
+
 /// Track whether the iOS software keyboard is currently visible.
 ///
 /// Called from ObjC keyboard notifications (keyboardWillShow / keyboardWillHide).
