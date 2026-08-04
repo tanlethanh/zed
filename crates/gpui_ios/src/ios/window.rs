@@ -4280,6 +4280,28 @@ impl IosWindow {
         }
     }
 
+    /// Insert composed text straight into the focused input handler.
+    ///
+    /// `handle_text_input` dispatches per-character key events through GPUI's
+    /// keymap, which a key bar hosted outside the keyboard cannot rely on; this
+    /// takes the same route as `handle_key_bar_action`.
+    pub fn handle_key_bar_text(&self, text: &str) -> bool {
+        if !(self.input_handler.borrow().is_some()
+            || self.callback_input_handler.borrow().is_some())
+            || !self.input_accepts_text_input.get()
+        {
+            return false;
+        }
+
+        unsafe {
+            let view = &*(self.view as *const Object);
+            with_input_handler(view, |handler| {
+                handler.replace_text_in_range(None, text);
+            })
+            .is_some()
+        }
+    }
+
     /// Handle arrow key navigation directly via the input handler.
     /// Returns true if the key was handled, false otherwise.
     fn handle_arrow_key(&self, key: &str, _shift: bool) -> bool {

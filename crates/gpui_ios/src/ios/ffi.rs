@@ -498,6 +498,22 @@ pub extern "C" fn gpui_ios_handle_key_bar_action(
     window.handle_key_bar_action(action)
 }
 
+/// Insert composed text from a key bar into the focused input handler.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_handle_key_bar_text(
+    window_ptr: *mut c_void,
+    text: *const c_char,
+) -> bool {
+    if window_ptr.is_null() || text.is_null() {
+        return false;
+    }
+    let Ok(text) = (unsafe { CStr::from_ptr(text) }).to_str() else {
+        return false;
+    };
+    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    window.handle_key_bar_text(text)
+}
+
 /// Track whether the iOS software keyboard is currently visible.
 ///
 /// Called from ObjC keyboard notifications (keyboardWillShow / keyboardWillHide).
