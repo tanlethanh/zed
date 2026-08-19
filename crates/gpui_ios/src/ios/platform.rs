@@ -261,7 +261,9 @@ impl Platform for IosPlatform {
     fn write_to_clipboard(&self, item: ClipboardItem) {
         unsafe {
             let pasteboard: *mut Object = msg_send![class!(UIPasteboard), generalPasteboard];
-            if let Some(text) = item.text() {
+            // `stringWithUTF8String:` reads to the first NUL, so the bytes must be
+            // NUL-terminated — a Rust `String`'s buffer is not.
+            if let Some(text) = item.text().and_then(|text| std::ffi::CString::new(text).ok()) {
                 let ns_string: *mut Object =
                     msg_send![class!(NSString), stringWithUTF8String: text.as_ptr()];
                 let _: () = msg_send![pasteboard, setString: ns_string];
