@@ -308,19 +308,20 @@ pub fn key_code_to_string(code: u32) -> String {
 /// - command: 1 << 20
 /// - numericPad: 1 << 21
 pub fn modifier_flags_to_modifiers(flags: u32) -> Modifiers {
-    const SHIFT: u32 = 1 << 17;
-    const CONTROL: u32 = 1 << 18;
-    const ALT: u32 = 1 << 19;
-    const COMMAND: u32 = 1 << 20;
-
     Modifiers {
-        control: flags & CONTROL != 0,
-        alt: flags & ALT != 0,
-        shift: flags & SHIFT != 0,
-        platform: flags & COMMAND != 0,
+        control: flags & UI_KEY_MODIFIER_CONTROL != 0,
+        alt: flags & UI_KEY_MODIFIER_ALTERNATE != 0,
+        shift: flags & UI_KEY_MODIFIER_SHIFT != 0,
+        platform: flags & UI_KEY_MODIFIER_COMMAND != 0,
         function: false,
     }
 }
+
+/// Raw `UIKeyModifierFlags` bits, shared by `pressesBegan` and `UIKeyCommand` paths.
+pub const UI_KEY_MODIFIER_SHIFT: u32 = 1 << 17;
+pub const UI_KEY_MODIFIER_CONTROL: u32 = 1 << 18;
+pub const UI_KEY_MODIFIER_ALTERNATE: u32 = 1 << 19;
+pub const UI_KEY_MODIFIER_COMMAND: u32 = 1 << 20;
 
 /// Create a key down event from a character.
 pub fn character_to_key_down(c: char) -> PlatformInput {

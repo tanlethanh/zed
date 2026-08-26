@@ -14,8 +14,9 @@ use super::{
     events::*,
     text_input,
     text_input::{
-        create_text_position, create_text_range, get_position_index, get_range_indices,
-        set_range_indices,
+        UI_KEY_MODIFIER_ALTERNATE, UI_KEY_MODIFIER_COMMAND, UI_KEY_MODIFIER_CONTROL,
+        UI_KEY_MODIFIER_SHIFT, create_text_position, create_text_range, get_position_index,
+        get_range_indices, set_range_indices,
     },
 };
 use crate::metal_renderer;
@@ -1043,6 +1044,117 @@ fn ns_string_from_str(text: &str) -> *mut Object {
     unsafe { msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()] }
 }
 
+#[link(name = "UIKit", kind = "framework")]
+unsafe extern "C" {
+    static UIKeyInputUpArrow: *mut Object;
+    static UIKeyInputDownArrow: *mut Object;
+    static UIKeyInputLeftArrow: *mut Object;
+    static UIKeyInputRightArrow: *mut Object;
+}
+
+/// HID key codes for the inputs registered in `build_key_commands`.
+const KEY_CODE_TAB: u32 = 0x2B;
+const KEY_CODE_RIGHT_ARROW: u32 = 0x4F;
+const KEY_CODE_LEFT_ARROW: u32 = 0x50;
+const KEY_CODE_DOWN_ARROW: u32 = 0x51;
+const KEY_CODE_UP_ARROW: u32 = 0x52;
+const KEY_CODE_V: u32 = 0x19;
+
+/// Build the `keyCommands` array for GPUIMetalView.
+///
+/// Scoped deliberately: only the keys UIKit's text-input system claims for the
+/// synthetic UITextInput document before `pressesBegan` ever runs. Everything
+/// else (escape, function keys, ctrl+letter) still arrives through `pressesBegan`.
+unsafe fn build_key_commands() -> *mut Object {
+    unsafe {
+        let commands: *mut Object = msg_send![class!(NSMutableArray), array];
+
+        // Modifier sets a terminal cares about. Cmd+arrow is left to the system.
+        const ARROW_MODIFIERS: [u32; 8] = [
+            0,
+            UI_KEY_MODIFIER_SHIFT,
+            UI_KEY_MODIFIER_CONTROL,
+            UI_KEY_MODIFIER_ALTERNATE,
+            UI_KEY_MODIFIER_SHIFT | UI_KEY_MODIFIER_CONTROL,
+            UI_KEY_MODIFIER_SHIFT | UI_KEY_MODIFIER_ALTERNATE,
+            UI_KEY_MODIFIER_CONTROL | UI_KEY_MODIFIER_ALTERNATE,
+            UI_KEY_MODIFIER_SHIFT | UI_KEY_MODIFIER_CONTROL | UI_KEY_MODIFIER_ALTERNATE,
+        ];
+        for input in [
+            UIKeyInputUpArrow,
+            UIKeyInputDownArrow,
+            UIKeyInputLeftArrow,
+            UIKeyInputRightArrow,
+        ] {
+            for modifiers in ARROW_MODIFIERS {
+                push_key_command(commands, input, modifiers);
+            }
+        }
+
+        // Tab: iPadOS hands it to the focus system instead of the app.
+        let tab = ns_string_from_str("\t");
+        push_key_command(commands, tab, 0);
+        push_key_command(commands, tab, UI_KEY_MODIFIER_SHIFT);
+
+        // Cmd+V has no responder-chain path today (`paste:` is unimplemented), so
+        // UIKit swallows it. Cmd+C/X/A are left alone: they still reach `copy:`
+        // or the UITextInput document, and stealing them would regress those.
+        push_key_command(commands, ns_string_from_str("v"), UI_KEY_MODIFIER_COMMAND);
+
+        msg_send![commands, copy]
+    }
+}
+
+unsafe fn push_key_command(commands: *mut Object, input: *mut Object, modifier_flags: u32) {
+    unsafe {
+        if input.is_null() {
+            return;
+        }
+        let command: *mut Object = msg_send![
+            class!(UIKeyCommand),
+            keyCommandWithInput: input
+            modifierFlags: modifier_flags as i64
+            action: sel!(gpuiHandleKeyCommand:)
+        ];
+        if command.is_null() {
+            return;
+        }
+        // Without this the system's own text navigation still wins these keys.
+        let _: () = msg_send![command, setWantsPriorityOverSystemBehavior: YES];
+        let _: () = msg_send![commands, addObject: command];
+    }
+}
+
+/// Map a `UIKeyCommand.input` string back to the HID code `handle_key_event` expects.
+unsafe fn key_command_key_code(input: *mut Object) -> Option<u32> {
+    unsafe {
+        if input.is_null() {
+            return None;
+        }
+        for (constant, key_code) in [
+            (UIKeyInputUpArrow, KEY_CODE_UP_ARROW),
+            (UIKeyInputDownArrow, KEY_CODE_DOWN_ARROW),
+            (UIKeyInputLeftArrow, KEY_CODE_LEFT_ARROW),
+            (UIKeyInputRightArrow, KEY_CODE_RIGHT_ARROW),
+        ] {
+            let equal: BOOL = msg_send![input, isEqualToString: constant];
+            if equal == YES {
+                return Some(key_code);
+            }
+        }
+
+        let utf8: *const std::os::raw::c_char = msg_send![input, UTF8String];
+        if utf8.is_null() {
+            return None;
+        }
+        match std::ffi::CStr::from_ptr(utf8).to_str().ok()? {
+            "\t" => Some(KEY_CODE_TAB),
+            "v" => Some(KEY_CODE_V),
+            _ => None,
+        }
+    }
+}
+
 fn ui_image_from_name(name: &str) -> *mut Object {
     let image_name = ns_string_from_str(name);
     if image_name.is_null() {
@@ -1615,6 +1727,39 @@ fn register_metal_view_class() -> &'static Class {
             }));
         }
 
+        // UIKeyCommand target for the keys UIKit's text-input system would
+        // otherwise consume before `pressesBegan` (arrows, tab, cmd editing).
+        extern "C" fn handle_key_command(this: &mut Object, _sel: Sel, command: *mut Object) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+                if command.is_null() {
+                    return;
+                }
+                let input: *mut Object = msg_send![command, input];
+                let Some(key_code) = key_command_key_code(input) else {
+                    return;
+                };
+                let modifier_flags: i64 = msg_send![command, modifierFlags];
+
+                let window_ptr: *mut std::ffi::c_void = *this.get_ivar(GPUI_WINDOW_IVAR);
+                if window_ptr.is_null() {
+                    return;
+                }
+                let window = &*(window_ptr as *const IosWindow);
+                window.handle_key_event(key_code, modifier_flags as u32, true);
+            }));
+        }
+
+        // UIResponder - keyCommands
+        extern "C" fn key_commands(_this: &Object, _sel: Sel) -> *mut Object {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                // UIKit re-queries this on every responder-chain rebuild; the set
+                // is constant, so build the retained array once.
+                static COMMANDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                *COMMANDS.get_or_init(|| unsafe { build_key_commands() as usize }) as *mut Object
+            }));
+            result.unwrap_or(ptr::null_mut())
+        }
+
         // UITextInput - editMenuForTextRange:suggestedActions:
         // Append GPUI selection-area actions to UIKit's native edit menu.
         extern "C" fn edit_menu_for_text_range(
@@ -1686,6 +1831,12 @@ fn register_metal_view_class() -> &'static Class {
             action: Sel,
             sender: *mut Object,
         ) -> BOOL {
+            // Key commands are validated through this selector too; the edit-menu
+            // policy below would otherwise veto them in editable mode.
+            if action == sel!(gpuiHandleKeyCommand:) {
+                return YES;
+            }
+
             let interaction_mode = active_text_interaction_mode(this);
             let input_native_selection_enabled = view_input_native_selection_enabled(this);
             let policy = edit_menu_action_policy(
@@ -2959,6 +3110,15 @@ fn register_metal_view_class() -> &'static Class {
                 sel!(copy:),
                 copy_action as extern "C" fn(&Object, Sel, *mut Object),
             );
+            // UIResponder - hardware keyboard keys claimed back from UIKit.
+            decl.add_method(
+                sel!(keyCommands),
+                key_commands as extern "C" fn(&Object, Sel) -> *mut Object,
+            );
+            decl.add_method(
+                sel!(gpuiHandleKeyCommand:),
+                handle_key_command as extern "C" fn(&mut Object, Sel, *mut Object),
+            );
             decl.add_method(
                 sel!(editMenuForTextRange:suggestedActions:),
                 edit_menu_for_text_range
@@ -3047,22 +3207,10 @@ fn handle_presses(view: &mut Object, presses: *mut Object, is_key_down: bool) {
             let key_code: i64 = msg_send![key, keyCode];
 
             // Get modifier flags
+            // Raw UIKeyModifierFlags: `handle_key_event` decodes them with
+            // `modifier_flags_to_modifiers`, so they must not be re-encoded here.
             let modifier_flags: u64 = msg_send![key, modifierFlags];
-
-            // Convert modifier flags to our format
-            let mut modifiers: u32 = 0;
-            if modifier_flags & (1 << 17) != 0 {
-                modifiers |= 1 << 0;
-            } // Shift
-            if modifier_flags & (1 << 18) != 0 {
-                modifiers |= 1 << 1;
-            } // Control
-            if modifier_flags & (1 << 19) != 0 {
-                modifiers |= 1 << 2;
-            } // Alt/Option
-            if modifier_flags & (1 << 20) != 0 {
-                modifiers |= 1 << 3;
-            } // Command
+            let modifiers = modifier_flags as u32;
 
             // When the software keyboard is visible, backspace/delete are delivered
             // via deleteBackward. Keep skipping here to avoid duplicate deletion.
@@ -3079,7 +3227,9 @@ fn handle_presses(view: &mut Object, presses: *mut Object, is_key_down: bool) {
             // produce duplicate input (especially visible on simulator with
             // hardware keyboard). Only non-printable keys (arrows, escape,
             // function keys, etc.) and modified keys (ctrl+c) go through here.
-            let has_action_modifier = (modifiers & 0b1110) != 0; // ctrl | alt | cmd
+            let has_action_modifier = modifiers
+                & (UI_KEY_MODIFIER_CONTROL | UI_KEY_MODIFIER_ALTERNATE | UI_KEY_MODIFIER_COMMAND)
+                != 0;
             if !has_action_modifier && !is_non_printable_key(key_code) {
                 ios_log_cstr(
                     c"GPUI iOS: handle_presses - skipping printable key (handled by insertText)",
@@ -4055,12 +4205,20 @@ impl IosWindow {
         for event in events {
             let (platform_input, x, y) = match event {
                 gpui_devtool::GestureEvent::Down(x, y) => (
-                    touch_began_to_pointer_down(Point::new(px(x), px(y)), 999, Modifiers::default()),
+                    touch_began_to_pointer_down(
+                        Point::new(px(x), px(y)),
+                        999,
+                        Modifiers::default(),
+                    ),
                     x,
                     y,
                 ),
                 gpui_devtool::GestureEvent::Move(x, y) => (
-                    touch_moved_to_pointer_move(Point::new(px(x), px(y)), 999, Modifiers::default()),
+                    touch_moved_to_pointer_move(
+                        Point::new(px(x), px(y)),
+                        999,
+                        Modifiers::default(),
+                    ),
                     x,
                     y,
                 ),
@@ -4206,26 +4364,7 @@ impl IosWindow {
 
     /// Handle a key event from an external keyboard
     pub fn handle_key_event(&self, key_code: u32, modifier_flags: u32, is_key_down: bool) {
-        use super::text_input::{
-            key_code_to_key_down, key_code_to_key_up, key_code_to_string,
-            modifier_flags_to_modifiers,
-        };
-
-        let key = key_code_to_string(key_code);
-        let modifiers = modifier_flags_to_modifiers(modifier_flags);
-
-        // Handle arrow keys directly via input handler for cursor navigation
-        // This bypasses GPUI's key event dispatch which may not work correctly on iOS
-        if is_key_down {
-            let handled = self.handle_arrow_key(&key, modifiers.shift);
-            if handled {
-                ios_log_format(&format!(
-                    "GPUI iOS: handle_key_event - arrow key '{}' handled directly",
-                    key
-                ));
-                return;
-            }
-        }
+        use super::text_input::{key_code_to_key_down, key_code_to_key_up};
 
         let event = if is_key_down {
             key_code_to_key_down(key_code, modifier_flags)
@@ -4299,64 +4438,6 @@ impl IosWindow {
                 handler.replace_text_in_range(None, text);
             })
             .is_some()
-        }
-    }
-
-    /// Handle arrow key navigation directly via the input handler.
-    /// Returns true if the key was handled, false otherwise.
-    fn handle_arrow_key(&self, key: &str, _shift: bool) -> bool {
-        // Only handle arrow keys
-        let delta: i64 = match key {
-            "left" => -1,
-            "right" => 1,
-            "up" => -1, // For now, up/down also move by 1 char (proper line nav needs layout info)
-            "down" => 1,
-            _ => return false,
-        };
-
-        // Use with_input_handler via the view, just like insertText does
-        // This properly takes/restores the handler from the RefCell
-        unsafe {
-            let view = &*(self.view as *const Object);
-
-            let handled = with_input_handler(view, |handler| {
-                // Get current selection
-                let Some(selection) = handler.selected_text_range(false) else {
-                    ios_log_cstr(c"GPUI iOS: handle_arrow_key - couldn't get selection");
-                    return false;
-                };
-
-                ios_log_format(&format!(
-                    "GPUI iOS: handle_arrow_key - selection: {:?}, delta: {}",
-                    selection.range, delta
-                ));
-
-                // Calculate new cursor position
-                let current_pos = if selection.reversed {
-                    selection.range.start
-                } else {
-                    selection.range.end
-                };
-
-                let new_pos = if delta < 0 {
-                    current_pos.saturating_sub((-delta) as usize)
-                } else {
-                    current_pos.saturating_add(delta as usize)
-                };
-
-                ios_log_format(&format!(
-                    "GPUI iOS: handle_arrow_key - moving from {} to {}",
-                    current_pos, new_pos
-                ));
-
-                // Set new cursor position using replace_text_in_range with empty text
-                handler.replace_text_in_range(Some(new_pos..new_pos), "");
-
-                ios_log_cstr(c"GPUI iOS: handle_arrow_key - cursor moved");
-                true
-            });
-
-            handled.unwrap_or(false)
         }
     }
 

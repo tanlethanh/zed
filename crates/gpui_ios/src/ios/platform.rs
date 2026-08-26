@@ -263,7 +263,10 @@ impl Platform for IosPlatform {
             let pasteboard: *mut Object = msg_send![class!(UIPasteboard), generalPasteboard];
             // `stringWithUTF8String:` reads to the first NUL, so the bytes must be
             // NUL-terminated — a Rust `String`'s buffer is not.
-            if let Some(text) = item.text().and_then(|text| std::ffi::CString::new(text).ok()) {
+            if let Some(text) = item
+                .text()
+                .and_then(|text| std::ffi::CString::new(text).ok())
+            {
                 let ns_string: *mut Object =
                     msg_send![class!(NSString), stringWithUTF8String: text.as_ptr()];
                 let _: () = msg_send![pasteboard, setString: ns_string];

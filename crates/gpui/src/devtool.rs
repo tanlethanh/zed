@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
-use crate::{App, ElementId, Global, GlobalElementId, Hitbox, InspectorElementId, SharedString, Window};
+use crate::{
+    App, ElementId, Global, GlobalElementId, Hitbox, InspectorElementId, SharedString, Window,
+};
 
 /// Longest `snapshot()` blocks waiting for a fresh publish — generous headroom for a slow
 /// render loop, not an expected-case duration (publish normally resolves within one frame tick).
@@ -172,8 +174,10 @@ fn format_element_id(id: &ElementId, out: &mut String) {
 /// `#[cfg(...)]`.
 #[derive(Default)]
 pub(crate) struct ActionRegistry {
-    pub(crate) functions:
-        HashMap<SharedString, Rc<dyn Fn(serde_json::Value, &mut Window, &mut App) -> serde_json::Value>>,
+    pub(crate) functions: HashMap<
+        SharedString,
+        Rc<dyn Fn(serde_json::Value, &mut Window, &mut App) -> serde_json::Value>,
+    >,
 }
 
 impl Global for ActionRegistry {}
@@ -273,7 +277,12 @@ impl CallQueue {
     fn drain(&self) -> Vec<(u64, String, serde_json::Value)> {
         self.pending
             .lock()
-            .map(|mut pending| pending.drain(..).map(|c| (c.id, c.name, c.params)).collect())
+            .map(|mut pending| {
+                pending
+                    .drain(..)
+                    .map(|c| (c.id, c.name, c.params))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -313,7 +322,10 @@ impl CallQueue {
     }
 
     fn has_pending(&self) -> bool {
-        self.pending.lock().map(|pending| !pending.is_empty()).unwrap_or(false)
+        self.pending
+            .lock()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(false)
     }
 }
 

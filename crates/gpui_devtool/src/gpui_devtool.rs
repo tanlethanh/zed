@@ -104,9 +104,8 @@ pub fn wait_for_gesture(id: u64) -> bool {
     let Ok(guard) = GESTURE_DONE.lock() else {
         return false;
     };
-    let result = GESTURE_CONDVAR.wait_timeout_while(guard, GESTURE_WAIT_TIMEOUT, |done| {
-        !done.contains(&id)
-    });
+    let result =
+        GESTURE_CONDVAR.wait_timeout_while(guard, GESTURE_WAIT_TIMEOUT, |done| !done.contains(&id));
     let Ok((mut guard, wait_result)) = result else {
         return false;
     };
@@ -261,11 +260,13 @@ fn handle_request(stream: &mut TcpStream) {
     }
 
     if path != "/ping" {
-        let authorized = TOKEN.get().is_none_or(|expected| {
-            token_header.as_deref().is_some_and(|got| got == expected)
-        });
+        let authorized = TOKEN
+            .get()
+            .is_none_or(|expected| token_header.as_deref().is_some_and(|got| got == expected));
         if !authorized {
-            let body_resp = json!({"ok": false, "error": "missing or invalid X-Devtool-Token header"}).to_string();
+            let body_resp =
+                json!({"ok": false, "error": "missing or invalid X-Devtool-Token header"})
+                    .to_string();
             let response = format!(
                 "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body_resp}",
                 len = body_resp.len()
@@ -411,7 +412,10 @@ fn handle_gesture(body: &[u8], kind: GestureKind) -> (&'static str, String) {
         );
     };
     let (ok, result) = do_gesture_by_id(path, kind);
-    (if ok { "200 OK" } else { "404 Not Found" }, result.to_string())
+    (
+        if ok { "200 OK" } else { "404 Not Found" },
+        result.to_string(),
+    )
 }
 
 fn handle_tap_xy(body: &[u8]) -> (&'static str, String) {
@@ -466,7 +470,10 @@ fn handle_call(body: &[u8]) -> (&'static str, String) {
     };
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     let (ok, result) = do_call(name, params);
-    (if ok { "200 OK" } else { "404 Not Found" }, result.to_string())
+    (
+        if ok { "200 OK" } else { "404 Not Found" },
+        result.to_string(),
+    )
 }
 
 /// `POST /sequence` steps, executed in order. Stops at the first step whose element itself
@@ -514,7 +521,10 @@ fn handle_sequence(body: &[u8]) -> (&'static str, String) {
             }
             "wait_for_element" => {
                 let element_id = step.get("element_id").and_then(Value::as_str);
-                let timeout_ms = step.get("timeout_ms").and_then(Value::as_u64).unwrap_or(2000);
+                let timeout_ms = step
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(2000);
                 match element_id {
                     Some(id) => do_wait_for_element(id, timeout_ms),
                     None => (false, json!({"ok": false, "error": "element_id required"})),
@@ -548,4 +558,3 @@ fn handle_sequence(body: &[u8]) -> (&'static str, String) {
         .to_string(),
     )
 }
-

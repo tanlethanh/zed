@@ -15,9 +15,9 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 #[cfg(target_os = "android")]
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "android")]
 use std::thread::JoinHandle;
 
@@ -1363,7 +1363,14 @@ impl WgpuRenderer {
         // there so we can skip them when values are unchanged.
         #[cfg(target_os = "android")]
         {
-            return self.draw_android_inner(scene, frame, &frame_view, globals, path_globals, gamma_params);
+            return self.draw_android_inner(
+                scene,
+                frame,
+                &frame_view,
+                globals,
+                path_globals,
+                gamma_params,
+            );
         }
 
         #[cfg(not(target_os = "android"))]
@@ -2197,18 +2204,20 @@ impl WgpuRenderer {
     fn rebuild_bind_group_cache(&mut self) {
         let resources = self.resources_mut();
         resources.instances_bind_group =
-            resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("instances_bind_group_cached"),
-                layout: &resources.bind_group_layouts.instances,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &resources.instance_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                }],
-            });
+            resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("instances_bind_group_cached"),
+                    layout: &resources.bind_group_layouts.instances,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &resources.instance_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    }],
+                });
         resources.path_intermediate_bind_group = None;
         resources.texture_bind_groups.clear();
     }
@@ -2553,9 +2562,7 @@ impl WgpuRenderer {
         while start < surviving.len() {
             let head_opaque = quad_is_pipeline_opaque(&surviving[start]);
             let mut end = start + 1;
-            while end < surviving.len()
-                && quad_is_pipeline_opaque(&surviving[end]) == head_opaque
-            {
+            while end < surviving.len() && quad_is_pipeline_opaque(&surviving[end]) == head_opaque {
                 end += 1;
             }
             let pipeline = if head_opaque {

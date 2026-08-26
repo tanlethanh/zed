@@ -23,12 +23,12 @@ mod elements;
 mod executor;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
+#[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
+pub mod devtool;
 mod geometry;
 mod global;
 mod input;
 mod inspector;
-#[cfg(all(feature = "devtool", any(feature = "inspector", debug_assertions)))]
-pub mod devtool;
 mod interactive;
 mod key_dispatch;
 mod keymap;
