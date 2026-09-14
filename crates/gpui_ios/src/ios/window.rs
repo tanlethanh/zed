@@ -27,13 +27,14 @@ use core_graphics::{
     geometry::{CGRect, CGSize},
 };
 use gpui::{
-    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, PinchEvent,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformTextAutocapitalization, PlatformTextInputTrait, PlatformTextInputTraits,
     PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, ScrollDelta,
     ScrollWheelEvent, SelectableTextHitRegion, SelectionMenuPresentation, Size, TouchPhase,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
-    px, should_auto_request_soft_keyboard, should_show_keyboard_accessory, size,
+    TouchPinchArbitrator, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowParams, px, should_auto_request_soft_keyboard,
+    should_show_keyboard_accessory, size,
 };
 use objc::{
     Encode, Encoding, class,
@@ -1263,6 +1264,27 @@ fn register_metal_view_class() -> &'static Class {
             event: *mut Object,
         ) {
             handle_touches(this, touches, event);
+        }
+
+        extern "C" fn handle_pinch_gesture(
+            this: &mut Object,
+            _sel: Sel,
+            recognizer: *mut Object,
+        ) {
+            handle_pinch_gesture_action(this, recognizer);
+        }
+
+        extern "C" fn should_recognize_simultaneously(
+            _this: &Object,
+            _sel: Sel,
+            recognizer: *mut Object,
+            _other: *mut Object,
+        ) -> BOOL {
+            unsafe {
+                let recognizer_class: *mut Object = msg_send![recognizer, class];
+                let is_pinch: BOOL = msg_send![recognizer_class, isSubclassOfClass: class!(UIPinchGestureRecognizer)];
+                if is_pinch == YES { NO } else { YES }
+            }
         }
 
         extern "C" fn can_become_first_responder(this: &Object, _sel: Sel) -> bool {
@@ -2789,6 +2811,14 @@ fn register_metal_view_class() -> &'static Class {
                 sel!(touchesCancelled:withEvent:),
                 touches_cancelled as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
             );
+            decl.add_method(
+                sel!(handlePinchGesture:),
+                handle_pinch_gesture as extern "C" fn(&mut Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(gestureRecognizer:shouldRecognizeSimultaneouslyWithGestureRecognizer:),
+                should_recognize_simultaneously as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> BOOL,
+            );
 
             // Add keyboard handling methods
             decl.add_method(
@@ -3242,6 +3272,50 @@ fn handle_presses(view: &mut Object, presses: *mut Object, is_key_down: bool) {
     }
 }
 
+fn attach_pinch_recognizer(window: IosWindow) -> IosWindow {
+    unsafe {
+        let recognizer: *mut Object = msg_send![class!(UIPinchGestureRecognizer), alloc];
+        let recognizer: *mut Object =
+            msg_send![recognizer, initWithTarget: window.view action: sel!(handlePinchGesture:)];
+        let _: () = msg_send![recognizer, setCancelsTouchesInView: NO];
+        let _: () = msg_send![recognizer, setDelaysTouchesBegan: NO];
+        let _: () = msg_send![recognizer, setDelaysTouchesEnded: NO];
+        let _: () = msg_send![recognizer, setDelegate: window.view];
+        let _: () = msg_send![window.view, addGestureRecognizer: recognizer];
+        let retained: *mut Object = msg_send![recognizer, retain];
+        let mut window = window;
+        window.pinch_recognizer = retained;
+        window
+    }
+}
+
+fn pinch_recognizer_state(recognizer: *mut Object) -> i64 {
+    unsafe { msg_send![recognizer, state] }
+}
+
+fn pinch_recognizer_scale(recognizer: *mut Object) -> f64 {
+    unsafe { msg_send![recognizer, scale] }
+}
+
+fn pinch_recognizer_location(recognizer: *mut Object, view: *mut Object) -> Point<Pixels> {
+    unsafe {
+        let location: core_graphics::geometry::CGPoint =
+            msg_send![recognizer, locationInView: view];
+        Point::new(px(location.x as f32), px(location.y as f32))
+    }
+}
+
+fn handle_pinch_gesture_action(view: &mut Object, recognizer: *mut Object) {
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window.handle_pinch_recognizer(recognizer);
+    }
+}
+
 /// Returns true for key codes that do NOT generate `insertText` calls
 /// (non-printable keys). Only these should be handled in `pressesBegan`.
 fn is_non_printable_key(key_code: i64) -> bool {
@@ -3366,6 +3440,14 @@ pub(crate) struct IosWindow {
     /// Timestamp of the last dispatched Moved event (UITouch.timestamp, seconds since boot).
     /// Used to skip duplicate Moved callbacks that UIKit fires for the same touch sample.
     last_move_ts: Cell<f64>,
+    /// Host-compilable touch/pinch arbitration state machine.
+    touch_arbitrator: RefCell<TouchPinchArbitrator>,
+    /// Retained UIPinchGestureRecognizer attached to the Metal view.
+    pinch_recognizer: *mut Object,
+    /// Last cumulative UIPinchGestureRecognizer scale reported through the action.
+    pinch_last_scale: Cell<f64>,
+    /// True once a claimed pinch stream has started and survivor touches are quarantined.
+    pinch_claimed: Cell<bool>,
 }
 
 // Required for raw_window_handle
@@ -3515,7 +3597,13 @@ impl IosWindow {
                 touch_scroll_suppressed: Cell::new(false),
                 touch_selection_dismissal_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
+                touch_arbitrator: RefCell::new(TouchPinchArbitrator::new()),
+                pinch_recognizer: ptr::null_mut(),
+                pinch_last_scale: Cell::new(1.0),
+                pinch_claimed: Cell::new(false),
             };
+
+            let ios_window = attach_pinch_recognizer(ios_window);
 
             Ok(ios_window)
         }
@@ -3608,7 +3696,7 @@ impl IosWindow {
                 true,
             );
 
-            Ok(Self {
+            let ios_window = attach_pinch_recognizer(Self {
                 handle,
                 window: ptr::null_mut(),
                 view_controller,
@@ -3658,7 +3746,15 @@ impl IosWindow {
                 touch_scroll_suppressed: Cell::new(false),
                 touch_selection_dismissal_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
-            })
+                touch_arbitrator: RefCell::new(TouchPinchArbitrator::new()),
+                pinch_recognizer: ptr::null_mut(),
+                pinch_last_scale: Cell::new(1.0),
+                pinch_claimed: Cell::new(false),
+            });
+
+            let ios_window = attach_pinch_recognizer(ios_window);
+
+            Ok(ios_window)
         }
     }
 
@@ -3964,6 +4060,16 @@ impl IosWindow {
         let phase = touch_phase(touch);
         let modifiers = self.modifiers.get();
 
+        if self
+            .touch_arbitrator
+            .borrow()
+            .is_touch_quarantined(touch_ptr as u64)
+            || self.pinch_claimed.get()
+        {
+            self.dispatch_arbitrated_touch(touch_ptr as u64, position, phase, Point::default());
+            return;
+        }
+
         self.mouse_position.set(position);
 
         if phase == UITouchPhase::Stationary {
@@ -4017,16 +4123,18 @@ impl IosWindow {
                         None
                     }
                 } else {
-                    // Secondary finger down — cancel fling/velocity to prevent
-                    // cross-contamination with the primary finger's scroll state.
-                    *self.fling.borrow_mut() = None;
-                    self.touch_velocity_x.set(0.0);
-                    self.touch_velocity_y.set(0.0);
+                    self.dispatch_arbitrated_touch(
+                        touch_ptr as u64,
+                        position,
+                        UITouchPhase::Began,
+                        Point::default(),
+                    );
                     return;
                 }
             }
             UITouchPhase::Moved => {
                 if touch_ptr != self.primary_touch_ptr.get() {
+                    self.dispatch_arbitrated_touch(touch_ptr as u64, position, phase, delta);
                     return;
                 }
                 if self.touch_selection_dismissal_suppressed.get() {
@@ -4082,6 +4190,7 @@ impl IosWindow {
             }
             UITouchPhase::Ended | UITouchPhase::Cancelled => {
                 if touch_ptr != self.primary_touch_ptr.get() {
+                    self.dispatch_arbitrated_touch(touch_ptr as u64, position, phase, delta);
                     return;
                 }
                 self.primary_touch_ptr.set(0);
@@ -4136,6 +4245,155 @@ impl IosWindow {
             && let Some(callback) = self.input_callback.borrow_mut().as_mut()
         {
             callback(platform_input);
+        }
+    }
+
+    fn dispatch_arbitrated_touch(
+        &self,
+        touch_id: u64,
+        position: Point<Pixels>,
+        phase: UITouchPhase,
+        delta: Point<Pixels>,
+    ) {
+        let modifiers = self.modifiers.get();
+        self.mouse_position.set(position);
+        let mut arbitrator = self.touch_arbitrator.borrow_mut();
+        let events = match phase {
+            UITouchPhase::Began => arbitrator.touch_began(touch_id, position, modifiers),
+            UITouchPhase::Moved => arbitrator.touch_moved(touch_id, position, delta, modifiers),
+            UITouchPhase::Ended => arbitrator.touch_ended(touch_id, position, modifiers),
+            UITouchPhase::Cancelled => arbitrator.touch_cancelled(touch_id, position, modifiers),
+            UITouchPhase::Stationary => return,
+        };
+        drop(arbitrator);
+        for event in events {
+            match event {
+                gpui::ArbitratedEvent::CancelFling => {
+                    *self.fling.borrow_mut() = None;
+                }
+                gpui::ArbitratedEvent::PlatformInput(input) => {
+                    if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                        callback(input);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_pinch_recognizer(&self, recognizer: *mut Object) {
+        let state: i64 = pinch_recognizer_state(recognizer);
+        let center = pinch_recognizer_location(recognizer, self.view);
+        let scale = pinch_recognizer_scale(recognizer);
+        let modifiers = self.modifiers.get();
+        self.mouse_position.set(center);
+
+        let started = state == 1;
+        let changed = state == 2;
+        let ended = state == 3;
+        let cancelled = state == 4;
+        let failed = state == 5;
+
+        if started {
+            let valid_scale = if scale.is_finite() && scale > 0.0 {
+                scale as f32
+            } else {
+                1.0
+            };
+            self.pinch_last_scale.set(valid_scale as f64);
+            let pinch =
+                self.touch_arbitrator
+                    .borrow_mut()
+                    .pinch_began(center, valid_scale, modifiers);
+            if let Some(pinch) = pinch
+                && let Some(callback) = self.input_callback.borrow_mut().as_mut()
+            {
+                let result = callback(PlatformInput::Pinch(pinch));
+                let claim_events = self
+                    .touch_arbitrator
+                    .borrow_mut()
+                    .resolve_pinch_claim(result.default_prevented, modifiers);
+                self.pinch_claimed.set(result.default_prevented);
+                for event in claim_events {
+                    match event {
+                        gpui::ArbitratedEvent::CancelFling => {
+                            *self.fling.borrow_mut() = None;
+                            self.touch_velocity_x.set(0.0);
+                            self.touch_velocity_y.set(0.0);
+                        }
+                        gpui::ArbitratedEvent::PlatformInput(input) => {
+                            match &input {
+                                PlatformInput::PointerCancel(cancel) => {
+                                    if self.primary_touch_ptr.get() == cancel.pointer_id as usize {
+                                        self.primary_touch_ptr.set(0);
+                                        self.touch_pressed.set(false);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                                callback(input);
+                            }
+                        }
+                    }
+                }
+                if result.default_prevented {
+                    self.touch_scroll_suppressed.set(true);
+                    self.touch_velocity_x.set(0.0);
+                    self.touch_velocity_y.set(0.0);
+                }
+            }
+            return;
+        }
+
+        if changed {
+            if !self.pinch_claimed.get() {
+                return;
+            }
+            let valid_scale = if scale.is_finite() && scale > 0.0 {
+                scale as f32
+            } else {
+                self.pinch_last_scale.get() as f32
+            };
+            let pinch =
+                self.touch_arbitrator
+                    .borrow_mut()
+                    .pinch_changed(center, valid_scale, modifiers);
+            if let Some(pinch) = pinch {
+                self.pinch_last_scale.set(valid_scale as f64);
+                if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                    callback(PlatformInput::Pinch(PinchEvent {
+                        position: pinch.position,
+                        delta: pinch.delta,
+                        modifiers: pinch.modifiers,
+                        phase: TouchPhase::Moved,
+                    }));
+                }
+            }
+            return;
+        }
+
+        if ended || cancelled || failed {
+            if !self.pinch_claimed.get() {
+                let modifiers = self.modifiers.get();
+                self.touch_arbitrator
+                    .borrow_mut()
+                    .pinch_cancelled(modifiers);
+                return;
+            }
+            self.pinch_claimed.set(false);
+            self.pinch_last_scale.set(1.0);
+            let pinch = if cancelled || failed {
+                self.touch_arbitrator
+                    .borrow_mut()
+                    .pinch_cancelled(modifiers)
+            } else {
+                self.touch_arbitrator.borrow_mut().pinch_ended(modifiers)
+            };
+            if let Some(pinch) = pinch
+                && let Some(callback) = self.input_callback.borrow_mut().as_mut()
+            {
+                callback(PlatformInput::Pinch(pinch));
+            }
         }
     }
 
@@ -4490,6 +4748,16 @@ impl Drop for IosWindow {
             }
             if !self.noneditable_text_interaction.is_null() {
                 let _: () = msg_send![self.noneditable_text_interaction, release];
+            }
+            if !self.pinch_recognizer.is_null() {
+                if !self.view.is_null() {
+                    let _: () =
+                        msg_send![self.view, removeGestureRecognizer: self.pinch_recognizer];
+                }
+                let recognizer = self.pinch_recognizer;
+                self.pinch_recognizer = ptr::null_mut();
+                let _: () = msg_send![recognizer, removeTarget: ptr::null_mut::<c_void>() action: sel!(handlePinchGesture:)];
+                let _: () = msg_send![recognizer, release];
             }
         }
         super::ffi::unregister_window(self as *const Self);

@@ -61,6 +61,12 @@ mod util;
 mod view;
 mod window;
 
+pub mod touch_arbitration;
+pub use touch_arbitration::*;
+
+#[cfg(test)]
+mod pinch_arbitration_tests;
+
 #[cfg(any(test, feature = "test-support"))]
 pub use proptest;
 
